@@ -135,6 +135,8 @@ const ACTION_LABEL = {
   confirm: (r) => (r.status === 'confirmed' ? '✓ confidence raised' : r.status),
   approve: (r) => (r.status === 'created' || r.status === 'patched' ? `📝 saved: ${r.title}` : `${r.status}${r.reason ? ` — ${r.reason}` : ''}`),
   reject: () => 'rejected',
+  approve_many: (r) => `📝 saved ${r.saved} of ${r.total}${r.other ? ` (${r.other} skipped: duplicate or over budget)` : ''}`,
+  reject_many: (r) => `rejected ${r.rejected}`,
 };
 
 /** A small button that runs an action; `confirmText` asks for a second click first. */
@@ -379,7 +381,10 @@ function queueSection(queue) {
   return [
     h('div', { class: 'section-head' },
       h('div', {}, h('h2', {}, `Waiting for approval (${queue.length})`),
-        h('div', { class: 'muted small' }, 'Held by your autonomy setting. Approve to save through the curator, or reject.'))),
+        h('div', { class: 'muted small' }, 'Held by your autonomy setting or a learning backfill. Approve to save through the curator, or reject.')),
+      h('div', { class: 'actions' },
+        actionButton(`Approve all ${queue.length}`, 'approve_many', queue.map((q) => q.id), { confirmText: `Save all ${queue.length}?` }),
+        actionButton('Reject all', 'reject_many', queue.map((q) => q.id), { confirmText: `Reject all ${queue.length}?` }))),
     h('div', { class: 'cards' }, queue.map((q) => h('article', { class: 'card lcard' },
       h('div', { class: 'meta' },
         h('span', { class: `badge ${q.kind}` }, q.op === 'patch' ? `update · ${q.kind}` : q.kind === 'profile' ? `profile · ${q.block || ''}` : q.memory_type ? `${q.kind} · ${q.memory_type}` : q.kind),

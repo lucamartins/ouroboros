@@ -528,7 +528,54 @@ export function needsApproval(item, actor, autonomy) {
   return item.kind === 'skill' || item.confidence < 0.7;
 }
 
+/** Run one normalized item in its own transaction; a dry run undoes files and rows. */
+function runItem(db, item, settings, payload, actor, { dryRun = false } = {}) {
+  const batch = new Batch(db, { actor, sessionId: payload.session_id });
+  try {
+    db.exec('BEGIN IMMEDIATE');
+    let result;
+    if (item.op === 'patch') result = patchItem(db, batch, item, settings, payload);
+    else if (item.kind === 'profile') result = createProfile(db, batch, item, settings);
+    else if (item.kind === 'skill') result = createSkill(db, batch, item, settings);
+    else result = createMemory(db, batch, item, settings, payload);
+    if (dryRun) {
+      db.exec('ROLLBACK');
+      batch.rollback();
+    } else {
+      batch.commit();
+      db.exec('COMMIT');
+    }
+    return result;
+  } catch (err) {
+    try { db.exec('ROLLBACK'); } catch { /* not in a transaction */ }
+    batch.rollback();
+    logError(db, 'curator', err);
+    return { status: 'error', reason: String(err.message) };
+  }
+}
+
+/**
+ * Queue a proposal for approval. A similar proposal already waiting is replaced by
+ * the newer one (newer sessions know better), keeping the higher confidence.
+ */
 function enqueue(db, item, payload, actor) {
+  const keyText = (i) => [i.title, i.description, i.text].filter(Boolean).join(' ');
+  const waiting = db.prepare("SELECT id, payload FROM candidates WHERE outcome = 'queued' AND kind = ?").all(item.kind).map((w) => {
+    let queuedItem = {};
+    try { queuedItem = JSON.parse(w.payload || '{}').item || {}; } catch { /* ignore */ }
+    return { id: w.id, op: queuedItem.op, text: keyText(queuedItem) };
+  });
+  const dup = item.op === 'create' ? findSimilar(waiting.filter((w) => w.op !== 'patch'), keyText(item)) : null;
+  if (dup) {
+    db.prepare(`
+      UPDATE candidates SET title = ?, summary = ?, evidence = ?, confidence = MAX(COALESCE(confidence, 0), ?), payload = ?, cwd = ?, session_id = ?, ts = ?
+      WHERE id = ?`).run(
+      String(item.title || item.text || '').slice(0, 200), String(item.text || item.body || item.description || '').slice(0, 1500),
+      String(item.evidence || '').slice(0, 800), item.confidence,
+      JSON.stringify({ item: { ...item, projectDir: undefined, project_dir: item.projectDir }, cwd: payload.cwd, memory_dir: payload.memory_dir, trigger: payload.trigger, actor }),
+      payload.cwd || null, payload.session_id || actor, Date.now(), dup.id);
+    return { id: dup.id, replaced: true };
+  }
   const r = db.prepare(`
     INSERT INTO candidates (review_id, session_id, project, kind, scope, memory_type, title, summary, evidence, confidence, outcome, payload, cwd, ts)
     VALUES (0, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
@@ -537,7 +584,7 @@ function enqueue(db, item, payload, actor) {
     String(item.evidence || '').slice(0, 800), item.confidence,
     JSON.stringify({ item: { ...item, projectDir: undefined, project_dir: item.projectDir }, cwd: payload.cwd, memory_dir: payload.memory_dir, trigger: payload.trigger, actor }),
     payload.cwd || null, Date.now());
-  return Number(r.lastInsertRowid);
+  return { id: Number(r.lastInsertRowid), replaced: false };
 }
 
 /** Apply a batch of proposals. Each item succeeds or fails on its own. */
@@ -553,27 +600,21 @@ export function apply(db, payload, { actor = 'manual', autonomy = 'auto' } = {})
       continue;
     }
     if (needsApproval(item, actor, autonomy)) {
-      const candidateId = enqueue(db, item, payload || {}, actor);
-      results.push({ status: 'queued', title: item.title || item.text, candidateId, reason: `waiting for approval in the dashboard (autonomy: ${autonomy})` });
+      // Dry run first: only proposals that would actually be written are queued
+      // (duplicates of saved items, rejections and over-budget answers come back as is).
+      const pre = runItem(db, item, settings, payload || {}, actor, { dryRun: true });
+      if (pre.status !== 'created' && pre.status !== 'patched') {
+        results.push({ title: item.title, ...pre });
+        continue;
+      }
+      const q = enqueue(db, item, payload || {}, actor);
+      results.push({
+        status: 'queued', title: item.title || item.text, candidateId: q.id, replaced: q.replaced,
+        reason: q.replaced ? 'merged with a similar proposal already waiting for approval' : `waiting for approval in the dashboard (autonomy: ${autonomy})`,
+      });
       continue;
     }
-    const batch = new Batch(db, { actor, sessionId: payload.session_id });
-    let result;
-    try {
-      db.exec('BEGIN IMMEDIATE');
-      if (item.op === 'patch') result = patchItem(db, batch, item, settings, payload);
-      else if (item.kind === 'profile') result = createProfile(db, batch, item, settings);
-      else if (item.kind === 'skill') result = createSkill(db, batch, item, settings);
-      else result = createMemory(db, batch, item, settings, payload);
-      batch.commit();
-      db.exec('COMMIT');
-    } catch (err) {
-      try { db.exec('ROLLBACK'); } catch { /* not in a transaction */ }
-      batch.rollback();
-      logError(db, 'curator', err);
-      result = { status: 'error', reason: String(err.message) };
-    }
-    results.push({ title: item.title, ...result });
+    results.push({ title: item.title, ...runItem(db, item, settings, payload || {}, actor) });
   }
   if (results.some((r) => r.status === 'created' || r.status === 'patched')) setMetaOnce(db, 'learning_enabled_at', Date.now());
   return results;

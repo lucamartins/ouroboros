@@ -154,3 +154,33 @@ test('first use in a session reinforces a learning', () => {
   assert.equal(row.uses, 2);
   assert.equal(Math.round(row.confidence * 10) / 10, 0.6);
 });
+
+test('learning backfill: oldest first, into the approval queue, deduplicated, not counted twice', () => {
+  const proj = path.join(tmp, 'claude', 'projects', 'past');
+  fs.mkdirSync(proj, { recursive: true });
+  const fixture = fs.readFileSync(path.join(root, 'test', 'fixtures', 'session.jsonl'), 'utf8').replace(/"\/tmp\/proj"/g, JSON.stringify(cwdA));
+  const old = (Date.now() - 3 * 86_400_000) / 1000;
+  for (const [i, id] of ['past-a', 'past-b'].entries()) {
+    const file = path.join(proj, `${id}.jsonl`);
+    fs.writeFileSync(file, fixture);
+    fs.utimesSync(file, old + i * 60, old + i * 60);
+  }
+  const queuedBefore = db.prepare("SELECT COUNT(*) n FROM candidates WHERE outcome = 'queued'").get().n;
+  const r = spawnSync(process.execPath, ['--no-warnings', path.join(root, 'scripts', 'review-worker.mjs'), '--backfill', '--learn', '--days', '30', '--limit', '10'], {
+    env: process.env, encoding: 'utf8',
+  });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /\[1\/2\] past-a ok/);
+  assert.match(r.stdout, /\[2\/2\] past-b ok/);
+  const reviews = db.prepare("SELECT turns_reviewed, corrections FROM reviews WHERE trigger = 'backfill-learn'").all();
+  assert.equal(reviews.length, 2);
+  assert.ok(reviews.every((x) => x.turns_reviewed === 0 && x.corrections === 0));
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM corrections WHERE session_id IN ('past-a', 'past-b')").get().n, 0);
+  // Two sessions proposing the same two items leave two queued proposals, not four.
+  const queued = db.prepare("SELECT session_id FROM candidates WHERE outcome = 'queued'").all();
+  assert.equal(queued.length - queuedBefore, 2);
+  assert.ok(queued.slice(-2).every((q) => q.session_id === 'past-b'));
+  // Running it again finds nothing new to learn from.
+  const again = spawnSync(process.execPath, ['--no-warnings', path.join(root, 'scripts', 'review-worker.mjs'), '--backfill', '--learn', '--dry-run'], { env: process.env, encoding: 'utf8' });
+  assert.match(again.stdout, /"sessions":0/);
+});

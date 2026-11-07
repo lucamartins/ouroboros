@@ -20,6 +20,13 @@ function runAction(db, action, id) {
     case 'confirm': return confirm(db, id);
     case 'approve': return decideQueued(db, Number(id), true);
     case 'reject': return decideQueued(db, Number(id), false);
+    case 'approve_many':
+    case 'reject_many': {
+      const ids = Array.isArray(id) ? id.map(Number).filter(Number.isFinite).slice(0, 500) : [];
+      const results = ids.map((x) => decideQueued(db, x, action === 'approve_many'));
+      const count = (st) => results.filter((r) => r.status === st).length;
+      return { status: 'done', total: results.length, saved: count('created') + count('patched'), rejected: count('rejected_by_user'), other: results.length - count('created') - count('patched') - count('rejected_by_user') };
+    }
     default: return null;
   }
 }

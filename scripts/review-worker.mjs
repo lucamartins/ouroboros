@@ -11,6 +11,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { options } from './config.mjs';
 import { apply } from './curator.mjs';
+import { isExcluded } from './hook.mjs';
 import { logError, monthSpend, openDb } from './db.mjs';
 import { inventoryForPrompt } from './inventory.mjs';
 import { claudeDir, dataDir, projectKey } from './paths.mjs';
@@ -289,7 +290,7 @@ async function mergeDuplicate(db, session, item, target, opts) {
 }
 
 /** Write learn-mode proposals through the curator and record their outcome. */
-async function applyLearnings(db, session, reviewId, out, opts) {
+async function applyLearnings(db, session, reviewId, out, opts, { notices = true } = {}) {
   const payload = {
     cwd: session.cwd,
     session_id: session.id,
@@ -338,13 +339,13 @@ async function applyLearnings(db, session, reviewId, out, opts) {
     ...results.filter((r) => r.status === 'patched').map((r) => `📝 updated: ${r.title}`),
     ...results.filter((r) => r.status === 'queued').map((r) => `⏳ waiting for approval: ${r.title}`),
   ];
-  if (lines.length) db.prepare('INSERT INTO notices (ts, session_id, text) VALUES (?, ?, ?)').run(ts, session.id, lines.join('\n'));
+  if (notices && lines.length) db.prepare('INSERT INTO notices (ts, session_id, text) VALUES (?, ?, ?)').run(ts, session.id, lines.join('\n'));
   db.prepare('UPDATE reviews SET learned = ?, patched = ? WHERE id = ?').run(learned, patched, reviewId);
   return results;
 }
 
 /** Review one queued session. Returns a short status string. */
-export async function reviewSession(db, sessionId, trigger) {
+export async function reviewSession(db, sessionId, trigger, overrides = {}) {
   const now = Date.now();
   const claimed = db.prepare(`
     UPDATE sessions SET queue_state = 'running', last_event_at = ? WHERE id = ? AND queue_state = 'queued'
@@ -353,8 +354,11 @@ export async function reviewSession(db, sessionId, trigger) {
 
   const session = db.prepare('SELECT * FROM sessions WHERE id = ?').get(sessionId);
   const opts = options();
-  // Past sessions (backfill) are only measured; learning writes come from live sessions.
-  const mode = opts.learning && trigger !== 'backfill' ? 'background' : 'measure';
+  // Past sessions are measured by `backfill`; `backfill-learn` learns from them as if
+  // Ouroboros had been active, without counting their corrections a second time.
+  const learnBackfill = trigger === 'backfill-learn';
+  const mode = learnBackfill || (opts.learning && trigger !== 'backfill') ? 'background' : 'measure';
+  if (overrides.autonomy) opts.autonomy = overrides.autonomy;
   const base = { sessionId, mode, trigger, model: opts.reviewerModel, sessionStartedAt: session.started_at };
 
   if (opts.monthlyBudgetUsd <= 0 || monthSpend(db) >= opts.monthlyBudgetUsd) {
@@ -369,7 +373,7 @@ export async function reviewSession(db, sessionId, trigger) {
   }
 
   const entries = readTranscript(session.transcript_path);
-  const digest = buildDigest(entries, { fromLine: session.review_cursor || 0 });
+  const digest = buildDigest(entries, { fromLine: learnBackfill ? 0 : session.review_cursor || 0 });
   if (digest.humanTurns < MIN_HUMAN_TURNS) {
     insertReview(db, { ...base, status: 'skipped', detail: `only ${digest.humanTurns} user turn(s)`, turns: digest.humanTurns });
     finish(db, sessionId, 'skipped', digest.nextLine);
@@ -389,18 +393,19 @@ export async function reviewSession(db, sessionId, trigger) {
     reviewId = insertReview(db, {
       ...base,
       status: 'ok',
-      turns: digest.humanTurns,
-      corrections: out.corrections.length,
+      turns: learnBackfill ? 0 : digest.humanTurns,
+      corrections: learnBackfill ? 0 : out.corrections.length,
+      detail: learnBackfill ? `learned from a past session (${digest.humanTurns} turns, ${out.corrections.length} corrections already counted)` : null,
       usage: usageOf(result),
       durationMs: Date.now() - started,
     });
     const ts = Date.now();
-    for (const c of out.corrections) {
+    for (const c of learnBackfill ? [] : out.corrections) {
       db.prepare('INSERT INTO corrections (review_id, session_id, quote, kind, ts) VALUES (?, ?, ?, ?, ?)')
         .run(reviewId, sessionId, String(c.quote).slice(0, 500), c.kind, ts);
     }
     if (mode === 'background') {
-      await applyLearnings(db, session, reviewId, out, opts);
+      await applyLearnings(db, session, reviewId, out, opts, { notices: !learnBackfill });
       finish(db, sessionId, 'done', digest.nextLine);
       return 'ok';
     }
@@ -430,11 +435,14 @@ export async function reviewSession(db, sessionId, trigger) {
 }
 
 /** Past transcripts not yet recorded, newest first. */
-export function backfillCandidates(db, { days = 30, limit = 20 } = {}) {
+export function backfillCandidates(db, { days = 30, limit = 20, learn = false } = {}) {
   const root = path.join(claudeDir(), 'projects');
   const since = Date.now() - days * 86_400_000;
   const activeCutoff = Date.now() - 10 * 60 * 1000; // probably still running
-  const known = new Set(db.prepare("SELECT id FROM sessions WHERE queue_state IS NOT NULL").all().map((r) => r.id));
+  // Measuring skips sessions already recorded; learning skips sessions already learned from.
+  const known = new Set(learn
+    ? db.prepare("SELECT DISTINCT session_id id FROM reviews WHERE status = 'ok' AND mode = 'background'").all().map((r) => r.id)
+    : db.prepare('SELECT id FROM sessions WHERE queue_state IS NOT NULL').all().map((r) => r.id));
   const files = [];
   for (const proj of fs.readdirSync(root, { withFileTypes: true })) {
     if (!proj.isDirectory()) continue;
@@ -449,7 +457,8 @@ export function backfillCandidates(db, { days = 30, limit = 20 } = {}) {
       files.push({ id, file, mtime });
     }
   }
-  files.sort((a, b) => b.mtime - a.mtime);
+  // Learning goes oldest first, so newer sessions can correct older facts.
+  files.sort((a, b) => (learn ? a.mtime - b.mtime : b.mtime - a.mtime));
   const picked = [];
   for (const f of files) {
     if (picked.length >= limit) break;
@@ -458,31 +467,39 @@ export function backfillCandidates(db, { days = 30, limit = 20 } = {}) {
     const humanTurns = entries.filter(isHumanPrompt).length;
     if (humanTurns < MIN_HUMAN_TURNS) continue;
     const first = entries.find((e) => e && e.cwd && e.timestamp);
+    if (first?.cwd && isExcluded(first.cwd)) continue;
     picked.push({ ...f, humanTurns, cwd: first?.cwd || null, startedAt: first ? Date.parse(first.timestamp) : f.mtime });
   }
   return picked;
 }
 
-async function backfill(db, { days, limit, dryRun }) {
-  const list = backfillCandidates(db, { days, limit });
+async function backfill(db, { days, limit, dryRun, learn, autonomy }) {
+  const list = backfillCandidates(db, { days, limit, learn });
+  const trigger = learn ? 'backfill-learn' : 'backfill';
   if (dryRun) {
     console.log(JSON.stringify({ sessions: list.length, userTurns: list.reduce((n, s) => n + s.humanTurns, 0) }));
     return;
   }
   let done = 0;
+  const startedAt = Date.now();
   for (const s of list) {
     db.prepare(`
       INSERT INTO sessions (id, project, cwd, transcript_path, started_at, ended_at, turns, queue_state, last_event_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)
       ON CONFLICT(id) DO UPDATE SET queue_state = 'queued', transcript_path = excluded.transcript_path
     `).run(s.id, projectKey(s.cwd), s.cwd, s.file, s.startedAt, s.mtime, s.humanTurns, Date.now());
-    const status = await reviewSession(db, s.id, 'backfill');
+    const status = await reviewSession(db, s.id, trigger, { autonomy });
     done++;
     console.log(`[${done}/${list.length}] ${s.id} ${status}`);
     if (status === 'budget') break;
   }
-  const spent = db.prepare("SELECT COALESCE(SUM(cost_usd),0) c, COUNT(*) n FROM reviews WHERE trigger = 'backfill'").get();
-  console.log(`backfill total: ${spent.n} reviews, US$ ${spent.c.toFixed(4)}`);
+  const spent = db.prepare('SELECT COALESCE(SUM(cost_usd),0) c, COUNT(*) n FROM reviews WHERE trigger = ? OR (trigger = ? AND ts >= ?)').get(trigger, 'merge', startedAt);
+  console.log(`backfill total: ${spent.n} model calls, US$ ${spent.c.toFixed(4)}`);
+  if (learn) {
+    const out = db.prepare("SELECT outcome, COUNT(*) n FROM candidates WHERE ts >= ? GROUP BY outcome").all(startedAt);
+    console.log(`outcomes: ${out.map((o) => `${o.outcome}=${o.n}`).join(', ') || 'none'}`);
+    console.log(`waiting for approval now: ${db.prepare("SELECT COUNT(*) n FROM candidates WHERE outcome = 'queued'").get().n}`);
+  }
 }
 
 function parseArgs(argv) {
@@ -504,7 +521,11 @@ async function main() {
   const db = openDb();
   try {
     if (args.backfill) {
-      await backfill(db, { days: Number(args.days) || 30, limit: Number(args.limit) || 20, dryRun: !!args['dry-run'] });
+      await backfill(db, {
+        days: Number(args.days) || 30, limit: Number(args.limit) || 20, dryRun: !!args['dry-run'], learn: !!args.learn,
+        // Learning from the past defaults to the approval queue: many items at once, some possibly stale.
+        autonomy: args.learn ? (args.autonomy || 'queue') : undefined,
+      });
     } else if (args.session) {
       await reviewSession(db, args.session, args.trigger || 'session_end');
     } else if (args.maintain) {
