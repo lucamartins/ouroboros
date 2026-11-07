@@ -196,8 +196,12 @@ export function createApi(db) {
 
     queue() {
       return db.prepare(`
-        SELECT c.id, c.kind, c.scope, c.memory_type, c.title, c.summary, c.evidence, c.confidence, c.ts, c.cwd, c.project, c.payload
-        FROM candidates c WHERE c.outcome = 'queued' ORDER BY c.ts DESC LIMIT 200`).all().map((r) => {
+        SELECT c.id, c.kind, c.scope, c.memory_type, c.title, c.summary, c.evidence, c.confidence, c.ts, c.cwd, c.project, c.payload,
+               s.started_at session_started_at
+        FROM candidates c LEFT JOIN sessions s ON s.id = c.session_id
+        WHERE c.outcome = 'queued'
+        -- Natural order: by when the originating session happened, oldest first.
+        ORDER BY COALESCE(s.started_at, c.ts), c.id LIMIT 500`).all().map((r) => {
         let item = {};
         try { item = JSON.parse(r.payload || '{}').item || {}; } catch { /* ignore */ }
         const { payload, ...rest } = r;
