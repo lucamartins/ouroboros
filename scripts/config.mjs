@@ -6,10 +6,12 @@ import { dataDir } from './paths.mjs';
 
 const DEFAULTS = {
   learning: true,
-  measure_review: true,
+  inloop_review: true,
+  review_every_turns: 10,
+  long_turn_tool_calls: 15,
+  background_review: true,
   reviewer_model: 'haiku',
   monthly_budget_usd: 5,
-  long_turn_tool_calls: 15,
 };
 
 function raw(key) {
@@ -35,18 +37,25 @@ function snapshot() {
   }
 }
 
-export function options() {
-  const fromEnv = Object.keys(process.env).some((k) => k.startsWith('CLAUDE_PLUGIN_OPTION_'));
-  const snap = fromEnv ? null : snapshot();
-  if (snap) {
-    const { updatedAt, ...rest } = snap;
-    return { learning: DEFAULTS.learning, ...rest };
-  }
+function fromEnv() {
   return {
     learning: asBool(raw('learning'), DEFAULTS.learning),
-    measureReview: asBool(raw('measure_review'), DEFAULTS.measure_review),
+    inloopReview: asBool(raw('inloop_review'), DEFAULTS.inloop_review),
+    reviewEveryTurns: Math.max(1, asNumber(raw('review_every_turns'), DEFAULTS.review_every_turns)),
+    longTurnToolCalls: Math.max(1, asNumber(raw('long_turn_tool_calls'), DEFAULTS.long_turn_tool_calls)),
+    // `measure_review` was the phase 1 name of this option.
+    backgroundReview: asBool(raw('background_review') ?? raw('measure_review'), DEFAULTS.background_review),
     reviewerModel: raw('reviewer_model') || DEFAULTS.reviewer_model,
     monthlyBudgetUsd: asNumber(raw('monthly_budget_usd'), DEFAULTS.monthly_budget_usd),
-    longTurnToolCalls: asNumber(raw('long_turn_tool_calls'), DEFAULTS.long_turn_tool_calls),
   };
+}
+
+export function options() {
+  const hasEnv = Object.keys(process.env).some((k) => k.startsWith('CLAUDE_PLUGIN_OPTION_'));
+  const base = fromEnv();
+  if (hasEnv) return base;
+  const snap = snapshot();
+  if (!snap) return base;
+  const { updatedAt, measureReview, ...rest } = snap;
+  return { ...base, ...(measureReview !== undefined && rest.backgroundReview === undefined ? { backgroundReview: measureReview } : {}), ...rest };
 }

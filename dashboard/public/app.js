@@ -63,7 +63,11 @@ function projectName(p, cwd) {
 async function api(name, params = {}) {
   const q = new URLSearchParams(params).toString();
   const res = await fetch(`/api/${name}${q ? `?${q}` : ''}`);
-  if (!res.ok) throw new Error(`${name}: HTTP ${res.status}`);
+  if (!res.ok) {
+    let message = `${name}: HTTP ${res.status}`;
+    try { message = (await res.json()).message || message; } catch { /* not JSON */ }
+    throw new Error(message);
+  }
   return res.json();
 }
 
@@ -379,7 +383,7 @@ async function renderHealth() {
       h('div', { class: 'card' },
         h('h3', {}, 'Reviewer'),
         h('div', {}, `${fmt.int(queue.done || 0)} reviewed · ${fmt.int(queue.skipped || 0)} skipped · ${fmt.int((queue.queued || 0) + (queue.running || 0))} pending · ${fmt.int(queue.failed || 0)} failed`),
-        h('div', { class: 'muted small' }, hl.options ? `Model ${hl.options.reviewerModel} · measurement ${hl.options.measureReview ? 'on' : 'off'}` : 'Options are reported at the next session start.'),
+        h('div', { class: 'muted small' }, hl.options ? `Model ${hl.options.reviewerModel} · background review ${(hl.options.backgroundReview ?? hl.options.measureReview) ? 'on' : 'off'} · in-loop review ${hl.options.inloopReview === false ? 'off' : `every ${hl.options.reviewEveryTurns ?? 10} turns`}` : 'Options are reported at the next session start.'),
         hl.skippedReviews.length ? h('div', { class: 'faint small' }, `Skipped: ${hl.skippedReviews.map((r) => `${r.detail} (${r.n})`).join(', ')}`) : null)),
 
     h('section', { class: 'section' },

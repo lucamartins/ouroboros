@@ -115,7 +115,7 @@ const handlers = {
       )
       ORDER BY started_at DESC LIMIT 3
     `).all(input.session_id, stale, stale);
-    if (orphans.length && options().measureReview) {
+    if (orphans.length && options().backgroundReview) {
       for (const { id } of orphans) {
         db.prepare("UPDATE sessions SET queue_state = 'queued', last_event_at = ? WHERE id = ?").run(now, id);
         spawnWorker(['--session', id, '--trigger', 'orphan']);
@@ -204,7 +204,7 @@ const handlers = {
     ensureSession(db, input, now);
     db.prepare('UPDATE sessions SET ended_at = ?, end_reason = ? WHERE id = ?').run(now, input.reason || null, input.session_id);
     addEvent(db, input, now, 'session_end', input.reason || null);
-    if (!options().measureReview) return;
+    if (!options().backgroundReview) return;
     const res = db.prepare(`
       UPDATE sessions SET queue_state = 'queued'
       WHERE id = ? AND (queue_state IS NULL OR queue_state IN ('done', 'skipped', 'failed'))

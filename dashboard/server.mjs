@@ -2,6 +2,7 @@
 // (starting a detached one if needed), opens the browser and exits.
 // `--serve` runs the server itself. Binds to 127.0.0.1 only.
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -30,18 +31,47 @@ function parseArgs(argv) {
 
 const stateFile = () => path.join(dataDir(), 'dashboard.json');
 
+/**
+ * Fingerprint of the code a server runs (file names + modification times). A server
+ * started before the plugin was updated serves a stale API next to fresh static
+ * files; the fingerprint lets the launcher replace it and the server retire itself.
+ */
+export function codeVersion() {
+  const dirs = [here, publicDir, path.join(here, '..', 'scripts')];
+  const parts = [];
+  for (const dir of dirs) {
+    let names = [];
+    try { names = fs.readdirSync(dir).sort(); } catch { continue; }
+    for (const name of names) {
+      try {
+        const st = fs.statSync(path.join(dir, name));
+        if (st.isFile()) parts.push(`${name}:${Math.round(st.mtimeMs)}:${st.size}`);
+      } catch { /* vanished */ }
+    }
+  }
+  return crypto.createHash('sha1').update(parts.join('|')).digest('hex').slice(0, 12);
+}
+
 function ping(port) {
   return new Promise((resolve) => {
     const req = http.get({ host: '127.0.0.1', port, path: '/api/ping', timeout: 1000 }, (res) => {
       let body = '';
       res.on('data', (d) => (body += d));
       res.on('end', () => {
-        try { resolve(JSON.parse(body).app === 'ouroboros'); } catch { resolve(false); }
+        try {
+          const j = JSON.parse(body);
+          resolve(j.app === 'ouroboros' ? j : null);
+        } catch { resolve(null); }
       });
     });
-    req.on('error', () => resolve(false));
-    req.on('timeout', () => { req.destroy(); resolve(false); });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
   });
+}
+
+async function stopServer(state) {
+  try { process.kill(state.pid); } catch { /* already gone */ }
+  for (let i = 0; i < 30 && (await ping(state.port)); i++) await new Promise((r) => setTimeout(r, 100));
 }
 
 function openBrowser(url) {
@@ -56,8 +86,13 @@ function openBrowser(url) {
 async function launch(args) {
   const state = (() => { try { return JSON.parse(fs.readFileSync(stateFile(), 'utf8')); } catch { return null; } })();
   let port = state?.port;
-  if (!port || !(await ping(port))) {
-    const child = spawn(process.execPath, ['--no-warnings', fileURLToPath(import.meta.url), '--serve', '--data', dataDir(), '--port', String(args.port || DEFAULT_PORT)], {
+  const running = port ? await ping(port) : null;
+  if (running && running.version !== codeVersion()) {
+    await stopServer(state);
+    console.log('Restarted the dashboard server: the plugin code changed since it started.');
+  }
+  if (!running || running.version !== codeVersion()) {
+    const child = spawn(process.execPath, ['--no-warnings', fileURLToPath(import.meta.url), '--serve', '--data', dataDir(), '--port', String(args.port || state?.port || DEFAULT_PORT)], {
       detached: true, stdio: 'ignore', windowsHide: true,
     });
     child.unref();
@@ -95,8 +130,17 @@ function listen(server, port, attempts = 10) {
 async function serve(args) {
   const db = openDb();
   const api = createApi(db);
+  const version = codeVersion();
   let lastRequest = Date.now();
+  let lastVersionCheck = 0;
   let port;
+
+  /** True once the code on disk differs from what this process loaded. */
+  const isStale = () => {
+    if (Date.now() - lastVersionCheck < 3000) return false;
+    lastVersionCheck = Date.now();
+    return codeVersion() !== version;
+  };
 
   const server = http.createServer((req, res) => {
     lastRequest = Date.now();
@@ -112,6 +156,17 @@ async function serve(args) {
 
     if (url.pathname.startsWith('/api/')) {
       if (req.method !== 'GET') { res.writeHead(405).end(); return; }
+      if (url.pathname === '/api/ping') {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ app: 'ouroboros', version }));
+        return;
+      }
+      if (isStale()) {
+        res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'stale', message: 'Ouroboros was updated since this dashboard started. Run /ouroboros:dashboard again to restart it.' }));
+        setTimeout(() => { server.close(); db.close(); process.exit(0); }, 200);
+        return;
+      }
       try {
         const body = api(url.pathname.slice(5), url.searchParams);
         if (body === undefined) { res.writeHead(404).end(); return; }
