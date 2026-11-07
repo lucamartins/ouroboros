@@ -1,7 +1,7 @@
 {
   "name": "ouroboros",
   "displayName": "Ouroboros",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Self-learning for Claude Code: reviews your sessions, turns what is worth keeping into memories and skills, and shows usage, value and cost on a local dashboard.",
   "author": {
     "name": "Luca Martins",
@@ -11,6 +11,12 @@
   "license": "MIT",
   "keywords": ["memory", "skills", "self-learning", "continuous-learning", "dashboard"],
   "userConfig": {
+    "learning": {
+      "type": "boolean",
+      "title": "Learning",
+      "description": "Inject the learning protocol and your global profile into each session, so Claude saves what it learns through /ouroboros:learn.",
+      "default": true
+    },
     "measure_review": {
       "type": "boolean",
       "title": "End-of-session measurement",

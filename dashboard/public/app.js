@@ -90,9 +90,10 @@ function table(columns, rows, { empty = 'Nothing yet.' } = {}) {
     ));
 }
 
-function meter(value, limit) {
+/** Budget meter: turns warning at 80% and critical at 100%. `plain` for values that aren't budgets. */
+function meter(value, limit, { plain = false } = {}) {
   const ratio = limit ? value / limit : 0;
-  const cls = ratio >= 1 ? 'meter over' : ratio >= 0.8 ? 'meter warn' : 'meter';
+  const cls = plain ? 'meter' : ratio >= 1 ? 'meter over' : ratio >= 0.8 ? 'meter warn' : 'meter';
   return h('div', { class: cls, role: 'meter', 'aria-valuemin': 0, 'aria-valuemax': limit, 'aria-valuenow': value },
     h('span', { style: `width:${Math.min(100, ratio * 100).toFixed(1)}%` }));
 }
@@ -183,6 +184,10 @@ function niceMax(v) {
 async function renderOverview() {
   const o = await api('overview', { days: state.days });
   const t = o.totals;
+  const learningOn = o.options ? o.options.learning !== false : null;
+  const phase = document.getElementById('phase');
+  phase.textContent = learningOn === null ? '' : learningOn ? 'learning' : 'measuring only';
+  phase.title = learningOn ? 'Learning protocol is injected into sessions; writes go through /ouroboros:learn' : 'Learning is off: sessions are only measured';
   const reviewedNote = o.reviewed.n
     ? `${fmt.int(o.reviewed.corrections)} corrections in ${fmt.int(o.reviewed.turns)} reviewed turns (${o.reviewed.n} sessions). This is the baseline learning has to beat.`
     : 'No session reviewed yet. Reviews run when a session ends.';
@@ -195,7 +200,10 @@ async function renderOverview() {
 
   const tiles = h('div', { class: 'tiles' },
     tile('Sessions', fmt.int(t.sessions), `${fmt.int(t.turns)} user turns`),
-    tile('Tool calls', fmt.compact(t.tool_calls), `${fmt.int(t.tool_fails)} failed`),
+    tile('Learned', fmt.int((o.learned.memory || 0) + (o.learned.skill || 0) + (o.learned.profile || 0)),
+      o.learned.enabledAt
+        ? `${o.learned.profile || 0} profile · ${o.learned.memory || 0} memories · ${o.learned.skill || 0} skills${o.learned.patchedNative ? ` · ${o.learned.patchedNative} refined` : ''}`
+        : 'nothing written yet'),
     tile('Recoveries', fmt.int(t.recoveries), 'errors followed by a working path'),
     tile('Would learn', fmt.int((o.candidates.memory || 0) + (o.candidates.skill || 0)), `${o.candidates.memory || 0} memories · ${o.candidates.skill || 0} skills`),
     tile('Misses', fmt.int(o.misses), 'had to repeat something already saved'),
@@ -251,8 +259,37 @@ function reviewState(st) {
   return h('span', { class: 'small' }, h('span', { class: `status-dot ${cls}` }), label);
 }
 
+const KIND_LABEL = { profile: 'profile', memory: 'memory', skill: 'skill' };
+
+function learnedSection(learned, writes) {
+  const active = learned.filter((l) => l.status === 'active');
+  const table1 = table([
+    { label: 'Learning', render: (r) => h('div', {}, h('div', {}, r.title), h('div', { class: 'desc mono' }, r.path)) },
+    { label: 'Kind', render: (r) => h('span', { class: `badge ${r.kind}` }, r.kind === 'profile' ? `profile · ${r.block}` : r.memory_type ? `${KIND_LABEL[r.kind]} · ${r.memory_type}` : KIND_LABEL[r.kind]) },
+    { label: 'Origin', render: (r) => (r.origin_session === 'native' ? 'refined' : r.trigger || '—') },
+    { label: 'Uses', num: true, render: (r) => fmt.int(r.uses) },
+    { label: 'Last used', render: (r) => (r.last_used_at ? fmt.ago(r.last_used_at) : '—') },
+    { label: 'Confidence', render: (r) => h('span', { class: 'conf' }, meter(r.confidence || 0, 1, { plain: true }), fmt.pct((r.confidence || 0) * 100)) },
+    { label: 'Updated', render: (r) => fmt.date(r.updated_at) },
+  ], active, { empty: 'Nothing learned yet. Ask Claude to remember something, or run /ouroboros:learn after a session with corrections.' });
+
+  const opLabel = { create: 'learned', patch: 'updated', archive: 'archived' };
+  const log = writes.length
+    ? h('ul', { class: 'list' }, writes.map((w) => h('li', {},
+        h('div', {}, h('span', { class: `status-dot ${w.reverted_at ? '' : 'good'}` }), `${opLabel[w.op] || w.op}: `, w.title || '(unknown)', w.reverted_at ? h('span', { class: 'faint' }, ' — undone') : null),
+        h('div', { class: 'faint small' }, `${fmt.datetime(w.ts)} · ${w.actor} · ${w.learning_id || ''}`))))
+    : h('p', { class: 'muted small' }, 'No writes yet.');
+
+  return [
+    h('div', { class: 'section-head' },
+      h('div', {}, h('h2', {}, 'Learned'), h('div', { class: 'muted small' }, `${active.length} active · undo with /ouroboros:undo, archive with /ouroboros:forget`))),
+    h('div', { class: 'card' }, table1),
+    h('section', { class: 'section' }, h('div', { class: 'section-head' }, h('h2', {}, 'Write log')), h('div', { class: 'card' }, log)),
+  ];
+}
+
 async function renderLearnings() {
-  const { candidates, corrections } = await api('learnings');
+  const { learned, writes, candidates, corrections } = await api('learnings');
   const f = state.filters;
   const chipGroup = (key, options) => h('div', { class: 'chips', role: 'group' }, options.map(([value, label]) =>
     h('button', { class: 'chip', 'aria-pressed': String(f[key] === value), onclick: () => { f[key] = value; renderLearnings(); } }, label)));
@@ -264,7 +301,7 @@ async function renderLearnings() {
           h('span', { class: `badge ${c.kind}` }, c.kind === 'memory' && c.memory_type ? `memory · ${c.memory_type}` : c.kind),
           h('span', { class: 'badge' }, c.scope || '—'),
           h('span', {}, `${projectName(c.project, c.cwd)} · ${fmt.date(c.session_started_at)}`),
-          h('span', { class: 'conf', title: 'Reviewer confidence' }, meter(c.confidence || 0, 1), fmt.pct((c.confidence || 0) * 100))),
+          h('span', { class: 'conf', title: 'Reviewer confidence' }, meter(c.confidence || 0, 1, { plain: true }), fmt.pct((c.confidence || 0) * 100))),
         h('div', { class: 'title' }, c.title),
         h('div', { class: 'summary' }, c.summary),
         c.repeats ? h('div', { class: 'small' }, h('span', { class: 'status-dot warn' }), `Repeats existing: ${c.repeats}`) : null,
@@ -278,9 +315,10 @@ async function renderLearnings() {
     : h('p', { class: 'muted small' }, 'No corrections recorded.'));
 
   view.replaceChildren(
-    h('div', { class: 'section-head' },
-      h('div', {}, h('h2', {}, 'What it would have learned'), h('div', { class: 'muted small' }, `${shown.length} of ${candidates.length} candidates`)),
-      h('div', { class: 'chips' }, chipGroup('kind', [['all', 'All'], ['memory', 'Memories'], ['skill', 'Skills']]), chipGroup('scope', [['all', 'Any scope'], ['global', 'Global'], ['project', 'Project']]))),
+    ...learnedSection(learned, writes),
+    h('section', { class: 'section' }, h('div', { class: 'section-head' },
+      h('div', {}, h('h2', {}, 'Review candidates'), h('div', { class: 'muted small' }, `${shown.length} of ${candidates.length} — what end-of-session reviews found worth learning (recorded, not written)`)),
+      h('div', { class: 'chips' }, chipGroup('kind', [['all', 'All'], ['memory', 'Memories'], ['skill', 'Skills']]), chipGroup('scope', [['all', 'Any scope'], ['global', 'Global'], ['project', 'Project']])))),
     cards,
     h('section', { class: 'section' }, h('div', { class: 'section-head' }, h('h2', {}, 'Corrections'), h('span', { class: 'muted small' }, `${corrections.length} recorded`)), corr));
 }
@@ -354,13 +392,18 @@ async function renderHealth() {
           h('div', { class: 'faint small' }, `Personal and project skills only (plugin skills not counted). Reference: ${fmt.int(LISTING_REF)} tokens ≈ 1% of a 200K context; past the budget, Claude Code drops descriptions of rarely used skills.`)),
         h('div', { class: 'card' },
           h('h3', {}, 'Global profile (user.md)'),
-          hl.profile ? h('div', {}, `${fmt.int(hl.profile.chars)} characters`) : h('div', { class: 'muted' }, 'Not created yet — arrives in phase 2.'))),
+          ...[['User', hl.budgets.userBlock], ['Environment & lessons', hl.budgets.environmentBlock]].map(([label, b]) => h('div', { style: 'margin-bottom:10px' },
+            h('div', { class: 'small' }, `${label} — ${fmt.int(b.used)} / ${fmt.int(b.limit)} chars · ${b.items} facts`),
+            meter(b.used, b.limit))),
+          h('div', { class: 'small' }, `Learned skills — ${hl.budgets.learnedSkills.used} / ${hl.budgets.learnedSkills.limit}`),
+          meter(hl.budgets.learnedSkills.used, hl.budgets.learnedSkills.limit),
+          h('div', { class: 'faint small' }, 'Budgets live in ~/.ouroboros/config.json. Past 80%, consolidate.'))),
       h('div', { class: 'card', style: 'margin-top:16px' },
         h('h3', {}, 'MEMORY.md indexes'),
-        h('p', { class: 'faint small', style: 'margin-top:0' }, 'Claude Code loads only the first 200 lines (or 25 KB) of each index into a session.'),
+        h('p', { class: 'faint small', style: 'margin-top:0' }, `Claude Code loads only the first 200 lines (or 25 KB) of each index; Ouroboros stops adding at ${hl.budgets.memoryIndexLines}.`),
         hl.indexes.length ? h('div', {}, hl.indexes.map((ix) => h('div', { style: 'margin-bottom:10px' },
-          h('div', { class: 'small' }, h('span', { class: 'mono' }, ix.project), ` — ${ix.lines} / ${ix.lineLimit} lines`),
-          meter(ix.lines, ix.lineLimit)))) : h('p', { class: 'muted small' }, 'No memory indexes found.'))),
+          h('div', { class: 'small' }, h('span', { class: 'mono' }, ix.project), ` — ${ix.lines} / ${hl.budgets.memoryIndexLines} lines`),
+          meter(ix.lines, hl.budgets.memoryIndexLines)))) : h('p', { class: 'muted small' }, 'No memory indexes found.'))),
 
     h('section', { class: 'section' },
       h('div', { class: 'section-head' }, h('h2', {}, 'Problems')),

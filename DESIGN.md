@@ -2,7 +2,7 @@
 
 > A Claude Code plugin that learns from your sessions on its own: it saves memories and creates/refines skills without being asked, in the spirit of Nous Research's Hermes Agent, and shows on a local dashboard what it learned, how much that is being used and what it costs.
 
-Status: **design approved**, phase 1 in progress. Owner decisions in [§12](#12-decisions).
+Status: phases 1 (measure) and 2 (manual learning) implemented; phase 3 next. Owner decisions in [§12](#12-decisions).
 
 ---
 
@@ -126,7 +126,8 @@ No `bin/` folder (it blocks installation through claude.ai/Cowork). Every file i
 
 | Key | Type | Default | Use |
 |---|---|---|---|
-| `autonomy` | string (`auto`/`hybrid`/`queue`) | `auto` | Write policy (§7) |
+| `learning` | boolean | `true` | Inject the protocol and `user.md` at `SessionStart` (off = measure only) |
+| `autonomy` | string (`auto`/`hybrid`/`queue`) | `auto` | Write policy (§7) — phase 3 |
 | `reviewer_model` | string | `haiku` | Background reviewer model |
 | `inloop_review` | boolean | `true` | Toggles reflection A |
 | `background_review` | boolean | `true` | Toggles reflection B |
@@ -225,6 +226,12 @@ Cost is measured from transcript `usage` between the block and the next `Stop`. 
 - End with the result line (§6.2).
 
 ## 7. Curation and write policy
+
+**Single writer.** Every Ouroboros write goes through `scripts/curator.mjs` (`apply`, `undo`, `forget`, `inventory`). In-loop, Claude calls it from the `learn` skill (proposals as JSON on stdin); in phase 3 the background worker calls the same `apply` in-process. Claude's own direct writes to memory files (native auto memory) are still observed by the capture hooks, but only curator writes carry a ledger entry and can be undone.
+
+Proposal item: `{ op: create|patch, kind: profile|memory|skill, scope, memory_type, block, project_dir, name, title, description, body, text, target, old, new, confidence }`. A `memory` with `scope: global` becomes a `profile` fact (`user`/`feedback` → User block, otherwise Environment & lessons). A patch targets a learning id, an absolute memory/skill/profile path, or a name, and either replaces an exact `old` fragment with `new` or replaces the `description` (memory patches also update the `MEMORY.md` line). Native skills and memories can be patched (refined) too; they are then tracked with `origin_session = 'native'` and don't count against the learned-skill budget. Routing rules may set `linkInto` to create a directory link (junction on Windows) so skills kept in a separate repo load from `~/.claude/skills`, as the owner's `nisus-skills` setup does.
+
+Duplicates are **not** merged automatically: the curator answers `duplicate` with the existing target and Claude re-submits a patch — the model merges, the curator guards.
 
 Owner decision: **`autonomy = auto`** (like Hermes). Consequences:
 

@@ -1,7 +1,9 @@
 // Read-only JSON API for the dashboard.
 import fs from 'node:fs';
 import path from 'node:path';
-import { monthSpend, monthStart } from '../scripts/db.mjs';
+import { getMeta, monthSpend, monthStart } from '../scripts/db.mjs';
+import { blockChars, parseProfile, readProfileText } from '../scripts/profile.mjs';
+import { loadSettings } from '../scripts/settings.mjs';
 import { listInstructionFiles, listMemories, listSkills, userProfile } from '../scripts/inventory.mjs';
 import { dataDir, normalize } from '../scripts/paths.mjs';
 
@@ -48,6 +50,9 @@ export function createApi(db) {
         WHERE s.started_at >= ? AND c.repeats IS NOT NULL`).get(since).n;
       const recoveries = db.prepare("SELECT COUNT(*) n FROM events WHERE kind = 'recovery' AND ts >= ?").get(since).n;
       const opts = readOptions();
+      const learned = Object.fromEntries(db.prepare("SELECT kind, COUNT(*) n FROM learnings WHERE status = 'active' AND origin_session IS NOT 'native' GROUP BY kind").all().map((r) => [r.kind, r.n]));
+      const patchedNative = db.prepare("SELECT COUNT(*) n FROM learnings WHERE origin_session = 'native' AND status = 'active'").get().n;
+      const enabledAt = Number(getMeta(db, 'learning_enabled_at')) || null;
 
       // Daily series, attributed to the day the session started.
       const series = new Map();
@@ -80,6 +85,7 @@ export function createApi(db) {
         correctionRate: reviewed.turns ? (reviewed.corrections / reviewed.turns) * 100 : null,
         candidates: Object.fromEntries(candidates.map((c) => [c.kind, c.n])),
         misses,
+        learned: { ...learned, patchedNative, enabledAt },
         cost: { month: monthSpend(db), budget: opts?.monthlyBudgetUsd ?? null, monthStart: monthStart() },
         options: opts,
         series: [...series.values()],
@@ -88,13 +94,23 @@ export function createApi(db) {
     },
 
     learnings() {
+      const learned = db.prepare(`
+        SELECT id, kind, scope, memory_type, block, project, name, title, path, confidence, status, trigger,
+               created_at, updated_at, uses, last_used_at,
+               (SELECT COUNT(*) FROM writes w WHERE w.learning_id = l.id AND w.reverted_at IS NULL) writes
+        FROM learnings l ORDER BY updated_at DESC LIMIT 300`).all();
+      const writes = db.prepare(`
+        SELECT w.batch, MIN(w.ts) ts, w.op, w.actor, MAX(w.reverted_at) reverted_at, l.title, l.kind, l.id learning_id,
+               GROUP_CONCAT(w.file, '\n') files
+        FROM writes w LEFT JOIN learnings l ON l.id = w.learning_id
+        GROUP BY w.batch ORDER BY MIN(w.id) DESC LIMIT 50`).all();
       const candidates = db.prepare(`
         SELECT c.*, s.started_at session_started_at, s.cwd FROM candidates c
         JOIN sessions s ON s.id = c.session_id ORDER BY s.started_at DESC, c.id LIMIT 300`).all();
       const corrections = db.prepare(`
         SELECT c.quote, c.kind, c.session_id, s.started_at session_started_at, s.project, s.cwd FROM corrections c
         JOIN sessions s ON s.id = c.session_id ORDER BY s.started_at DESC, c.id LIMIT 300`).all();
-      return { candidates, corrections };
+      return { learned, writes, candidates, corrections };
     },
 
     inventory() {
@@ -133,7 +149,16 @@ export function createApi(db) {
       const skippedReviews = db.prepare("SELECT detail, COUNT(*) n FROM reviews WHERE status = 'skipped' GROUP BY detail ORDER BY n DESC LIMIT 10").all();
       const errors = db.prepare('SELECT ts, source, substr(message, 1, 400) message FROM errors ORDER BY ts DESC LIMIT 20').all();
       const capture = db.prepare("SELECT MAX(ts) last, SUM(CASE WHEN ts >= ? THEN 1 ELSE 0 END) day FROM events").get(Date.now() - DAY);
+      const settings = loadSettings();
+      const blocks = parseProfile(readProfileText() ?? '');
+      const learnedSkills = db.prepare("SELECT COUNT(*) n FROM learnings WHERE kind = 'skill' AND status = 'active' AND origin_session IS NOT 'native'").get().n;
       return {
+        budgets: {
+          userBlock: { used: blockChars(blocks.user), limit: settings.limits.userBlockChars, items: blocks.user.length },
+          environmentBlock: { used: blockChars(blocks.environment), limit: settings.limits.environmentBlockChars, items: blocks.environment.length },
+          learnedSkills: { used: learnedSkills, limit: settings.limits.learnedSkills },
+          memoryIndexLines: settings.limits.memoryIndexLines,
+        },
         indexes,
         skillListing: { skills: skills.length, chars: listingChars, tokens: Math.round(listingChars / 4) },
         queue, failedReviews, skippedReviews, errors,

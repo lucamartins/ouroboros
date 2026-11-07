@@ -7,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { options } from './config.mjs';
 import { classifyPath, dataDir, projectKey, skillNameFromPath } from './paths.mjs';
+import { profileForContext, readProfileText } from './profile.mjs';
 
 const MIN_NODE = [22, 13];
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -57,6 +58,30 @@ function addEvent(db, input, now, kind, target = null, payload = null) {
     .run(input.session_id, input.agent_id || null, now, kind, target, payload ? JSON.stringify(payload) : null);
 }
 
+function countSkillUse(db, name, now) {
+  const bare = String(name).split(':').pop();
+  db.prepare("UPDATE learnings SET uses = uses + 1, last_used_at = ? WHERE status = 'active' AND kind = 'skill' AND name = ?")
+    .run(now, bare);
+}
+
+export const PROTOCOL = `Ouroboros (self-learning) is active. Without being asked, save what you learn through the \`ouroboros:learn\` skill — it deduplicates, routes and can be undone:
+- a user preference or way of working, a correction of your approach, a project convention, an environment fact;
+- when the user explicitly asks you to remember something, save it right away;
+- create or patch a skill when you worked out a reusable multi-step workflow, found the working path after errors, or the user corrected your approach.
+Prefer patching what exists over creating new. Don't save what is derivable from the code or CLAUDE.md, ephemeral task details, or secrets. After saving, tell the user in one line: "📝 learned: …".`;
+
+/** Context injected at session start: the protocol plus the global profile. */
+export function sessionContext() {
+  const text = readProfileText();
+  const profile = text ? profileForContext(text) : '';
+  return [
+    '<ouroboros>',
+    PROTOCOL,
+    profile ? `\nWhat you already know about the user and their environment (from ~/.ouroboros/user.md):\n${profile}` : '',
+    '</ouroboros>',
+  ].filter(Boolean).join('\n');
+}
+
 export function spawnWorker(args, env = process.env) {
   const child = spawn(process.execPath, ['--no-warnings', path.join(here, 'review-worker.mjs'), ...args], {
     detached: true,
@@ -73,6 +98,12 @@ const handlers = {
     addEvent(db, input, now, 'session_start', input.source || null);
     // The dashboard runs outside hooks and can't see plugin options; leave a snapshot.
     fs.writeFileSync(path.join(dataDir(), 'options.json'), JSON.stringify({ ...options(), updatedAt: now }));
+    if (options().learning) {
+      // Synchronous hook: stdout becomes session context.
+      process.stdout.write(JSON.stringify({
+        hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: sessionContext() },
+      }));
+    }
     // Sessions whose SessionEnd never ran a worker (crash, killed terminal) or whose
     // worker died: queue them again, at most a few per start.
     const stale = now - 10 * 60 * 1000;
@@ -102,6 +133,7 @@ const handlers = {
     ensureSession(db, input, now);
     if (input.expansion_type === 'slash_command' && input.command_name) {
       addEvent(db, input, now, 'skill_used', input.command_name, { via: 'typed', source: input.command_source || null });
+      countSkillUse(db, input.command_name, now);
     }
   },
 
@@ -114,11 +146,14 @@ const handlers = {
 
     if (tool === 'Skill' && ti.skill) {
       addEvent(db, input, now, 'skill_used', ti.skill, { via: 'tool' });
+      countSkillUse(db, ti.skill, now);
     }
     if (ti.file_path) {
       const cls = classifyPath(ti.file_path);
       if (cls && tool === 'Read') {
         addEvent(db, input, now, `${cls}_read`, ti.file_path);
+        db.prepare("UPDATE learnings SET uses = uses + 1, last_used_at = ? WHERE status = 'active' AND lower(path) = lower(?)")
+          .run(now, ti.file_path);
       } else if (cls && /^(Write|Edit|MultiEdit)$/.test(tool)) {
         addEvent(db, input, now, `${cls}_write`, ti.file_path, {
           tool,

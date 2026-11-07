@@ -1,0 +1,154 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { after, before, beforeEach, test } from 'node:test';
+
+let tmp;
+let db;
+let curator;
+let cwd;
+
+before(async () => {
+  tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ouroboros-curator-'));
+  process.env.CLAUDE_CONFIG_DIR = path.join(tmp, 'claude');
+  process.env.OUROBOROS_HOME = path.join(tmp, 'ouroboros');
+  process.env.CLAUDE_PLUGIN_DATA = path.join(tmp, 'data');
+  cwd = path.join(tmp, 'work', 'app');
+  fs.mkdirSync(path.join(cwd, '.git'), { recursive: true });
+  curator = await import('../scripts/curator.mjs');
+  const { openDb } = await import('../scripts/db.mjs');
+  db = openDb();
+});
+
+after(() => {
+  db.close();
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+beforeEach(() => {
+  fs.mkdirSync(process.env.OUROBOROS_HOME, { recursive: true });
+  fs.writeFileSync(path.join(process.env.OUROBOROS_HOME, 'config.json'), JSON.stringify({
+    routing: [{ match: '**/routed-*', skillsDir: path.join(tmp, 'skills-repo'), linkInto: path.join(tmp, 'claude', 'skills') }],
+    limits: { userBlockChars: 200 },
+  }));
+});
+
+const apply = (items, extra = {}) => curator.apply(db, { cwd, items, ...extra });
+const memoryDir = () => path.join(tmp, 'claude', 'projects', cwd.replace(/[^a-zA-Z0-9]/g, '-'), 'memory');
+const read = (f) => fs.readFileSync(f, 'utf8');
+
+test('profile facts land in user.md blocks and are deduplicated', async () => {
+  const [r] = apply([{ kind: 'profile', block: 'user', text: 'Prefers concise answers in Portuguese' }]);
+  assert.equal(r.status, 'created');
+  const text = read(path.join(process.env.OUROBOROS_HOME, 'user.md'));
+  assert.match(text, /## User\n\n- Prefers concise answers in Portuguese <!-- lrn_/);
+  const [dup] = apply([{ kind: 'profile', block: 'user', text: 'prefers concise answers in portuguese!' }]);
+  assert.equal(dup.status, 'duplicate');
+  const { sessionContext } = await import('../scripts/hook.mjs');
+  const ctx = sessionContext();
+  assert.match(ctx, /- Prefers concise answers in Portuguese/);
+  assert.doesNotMatch(ctx, /lrn_/);
+});
+
+test('a global memory becomes a profile fact; profile budget is enforced', () => {
+  const [r] = apply([{ kind: 'memory', scope: 'global', memory_type: 'reference', title: 'gh is authenticated as lucamartins' }]);
+  assert.equal(r.status, 'created');
+  assert.equal(r.kind, 'profile');
+  assert.match(read(r.path), /## Environment & lessons\n\n- gh is authenticated as lucamartins/);
+  const long = 'x'.repeat(150);
+  const [over] = apply([{ kind: 'profile', block: 'user', text: `Long fact ${long}` }]);
+  assert.equal(over.status, 'over_budget');
+});
+
+test('project memories go to the native memory dir with an index line', () => {
+  const [r] = apply([{ kind: 'memory', memory_type: 'feedback', title: 'Use pnpm, not npm', description: 'This repo uses pnpm workspaces', body: 'Use pnpm.\n\n**Why:** lockfile.' }]);
+  assert.equal(r.status, 'created', r.reason);
+  assert.equal(r.path, path.join(memoryDir(), 'use-pnpm-not-npm.md'));
+  const file = read(r.path);
+  assert.match(file, /^---\nname: use-pnpm-not-npm\ndescription: This repo uses pnpm workspaces\nmetadata:\n {2}type: feedback\n {2}origin: ouroboros/);
+  assert.match(read(path.join(memoryDir(), 'MEMORY.md')), /^- \[Use pnpm, not npm\]\(use-pnpm-not-npm\.md\) — This repo uses pnpm workspaces\n$/);
+  const [dup] = apply([{ kind: 'memory', title: 'Use pnpm not npm', description: 'this repo uses pnpm workspaces' }]);
+  assert.equal(dup.status, 'duplicate');
+});
+
+test('secrets are rejected', () => {
+  const [r] = apply([{ kind: 'memory', title: 'Stripe key', body: 'key is sk_live_abcdefghijklmnop' }]);
+  assert.equal(r.status, 'rejected');
+  assert.match(r.reason, /secret/);
+});
+
+test('skills: global ones get the learned- prefix; project ones follow routing and links', () => {
+  const [g] = apply([{ kind: 'skill', scope: 'global', name: 'zip deploy', title: 'Zip deploy', description: 'Build a Linux zip on Windows. Use when packaging a deploy.', body: '## Steps\n1. python' }]);
+  assert.equal(g.status, 'created', g.reason);
+  assert.equal(g.path, path.join(tmp, 'claude', 'skills', 'learned-zip-deploy', 'SKILL.md'));
+
+  const routedCwd = path.join(tmp, 'work', 'routed-api');
+  fs.mkdirSync(routedCwd, { recursive: true });
+  const [p] = apply([{ kind: 'skill', scope: 'project', project_dir: routedCwd, name: 'seed-db', title: 'Seed the database', description: 'Seed the local database. Use before E2E runs.', body: 'Run the seeder.' }]);
+  assert.equal(p.status, 'created', p.reason);
+  assert.equal(p.path, path.join(tmp, 'skills-repo', 'seed-db', 'SKILL.md'));
+  const link = path.join(tmp, 'claude', 'skills', 'seed-db');
+  assert.ok(fs.lstatSync(link).isSymbolicLink());
+  assert.ok(fs.existsSync(path.join(link, 'SKILL.md')));
+
+  const [tooLong] = apply([{ kind: 'skill', scope: 'global', title: 'X', description: 'd'.repeat(300), body: 'b' }]);
+  assert.equal(tooLong.status, 'rejected');
+});
+
+test('patch, undo, conflict, forget and undo of forget', () => {
+  const file = path.join(memoryDir(), 'use-pnpm-not-npm.md');
+  const [p] = apply([{ op: 'patch', kind: 'memory', target: 'use-pnpm-not-npm', old: 'Use pnpm.', new: 'Use pnpm 9.', description: 'This repo uses pnpm 9 workspaces' }]);
+  assert.equal(p.status, 'patched', p.reason);
+  assert.match(read(file), /Use pnpm 9\./);
+  assert.match(read(path.join(memoryDir(), 'MEMORY.md')), /— This repo uses pnpm 9 workspaces/);
+
+  const u = curator.undo(db, { last: true });
+  assert.equal(u.status, 'undone');
+  assert.match(read(file), /Use pnpm\.\n/);
+  assert.match(read(path.join(memoryDir(), 'MEMORY.md')), /— This repo uses pnpm workspaces/);
+
+  // Undo the skill link created earlier? No: the last remaining write is the routed skill.
+  const [p2] = apply([{ op: 'patch', kind: 'memory', target: 'use-pnpm-not-npm', old: 'Use pnpm.', new: 'Use pnpm!' }]);
+  assert.equal(p2.status, 'patched');
+  fs.appendFileSync(file, 'hand edit\n');
+  assert.equal(curator.undo(db, { last: true }).status, 'conflict');
+
+  const f = curator.forget(db, { match: 'use-pnpm-not-npm' });
+  assert.equal(f.status, 'archived', f.reason);
+  assert.equal(fs.existsSync(file), false);
+  assert.doesNotMatch(read(path.join(memoryDir(), 'MEMORY.md')), /use-pnpm-not-npm/);
+  assert.equal(fs.readdirSync(path.join(process.env.OUROBOROS_HOME, 'archive')).length, 1);
+
+  const back = curator.undo(db, { last: true });
+  assert.equal(back.status, 'undone');
+  assert.ok(fs.existsSync(file));
+  assert.equal(db.prepare('SELECT status FROM learnings WHERE path = ?').get(file).status, 'active');
+});
+
+test('undo of a created skill removes the file, its folder and its link', () => {
+  const link = path.join(tmp, 'claude', 'skills', 'seed-db');
+  const id = db.prepare("SELECT id FROM learnings WHERE name = 'seed-db'").get().id;
+  const r = curator.undo(db, { id });
+  assert.equal(r.status, 'undone', r.reason);
+  assert.equal(fs.existsSync(path.join(tmp, 'skills-repo', 'seed-db')), false);
+  assert.throws(() => fs.lstatSync(link));
+  assert.equal(db.prepare('SELECT status FROM learnings WHERE id = ?').get(id).status, 'reverted');
+});
+
+test('patching a native skill is allowed and does not count as a learned skill', () => {
+  const dir = path.join(tmp, 'claude', 'skills', 'native-one');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'SKILL.md'), '---\nname: native-one\ndescription: Native.\n---\n\nStep A\n');
+  const [r] = apply([{ op: 'patch', kind: 'skill', target: 'native-one', old: 'Step A', new: 'Step A, then B' }]);
+  assert.equal(r.status, 'patched', r.reason);
+  assert.match(read(path.join(dir, 'SKILL.md')), /Step A, then B/);
+  const inv = curator.inventoryText(db, { cwd });
+  assert.match(inv, /learned\)/);
+  assert.match(inv, /native-one/);
+});
+
+test('patch targets outside memories, skills and the profile are refused', () => {
+  const [r] = apply([{ op: 'patch', target: path.join(cwd, 'package.json'), old: 'a', new: 'b' }]);
+  assert.equal(r.status, 'rejected');
+});

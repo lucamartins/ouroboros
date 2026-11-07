@@ -54,7 +54,9 @@ async function waitFor(fn, ms = 10_000) {
 }
 
 test('capture: turns, skills, memory writes, recovery and long turns', () => {
-  assert.equal(hook('SessionStart', { source: 'startup' }), '');
+  const start = JSON.parse(hook('SessionStart', { source: 'startup' }));
+  assert.equal(start.hookSpecificOutput.hookEventName, 'SessionStart');
+  assert.match(start.hookSpecificOutput.additionalContext, /ouroboros:learn/);
   hook('UserPromptSubmit', { prompt: 'install the deps' });
   hook('PostToolUseFailure', { tool_name: 'Bash', tool_input: { command: 'npm install' }, error: 'Exit code 1' });
   hook('PostToolUseFailure', { tool_name: 'Bash', tool_input: { command: 'cd x && npm install --force' }, error: 'Exit code 1' });
@@ -105,6 +107,24 @@ test('SessionEnd queues a measure review that records corrections and candidates
   assert.ok(s.review_cursor > 0);
   assert.equal(d.prepare('SELECT title FROM candidates').get().title, 'Use pnpm');
   d.close();
+});
+
+test('learning can be turned off; reads of learned items count as uses', () => {
+  const off = spawnSync(process.execPath, ['--no-warnings', path.join(root, 'scripts', 'hook.mjs'), 'SessionStart'], {
+    input: JSON.stringify({ session_id: 's2', cwd: '/tmp/proj', hook_event_name: 'SessionStart', source: 'startup' }),
+    env: { ...env, CLAUDE_PLUGIN_OPTION_LEARNING: 'false' },
+    encoding: 'utf8',
+  });
+  assert.equal(off.stdout, '');
+
+  const file = path.join(tmp, 'claude', 'projects', 'p', 'memory', 'pnpm.md');
+  const d = db();
+  d.prepare("INSERT INTO learnings (id, kind, scope, name, title, path, status, created_at, updated_at) VALUES ('lrn_t', 'memory', 'project', 'pnpm', 'pnpm', ?, 'active', 0, 0)").run(file);
+  d.close();
+  hook('PostToolUse', { tool_name: 'Read', tool_input: { file_path: file }, tool_response: {} });
+  const d2 = db();
+  assert.equal(d2.prepare("SELECT uses FROM learnings WHERE id = 'lrn_t'").get().uses, 1);
+  d2.close();
 });
 
 test('reviewer sessions and malformed input are ignored', () => {

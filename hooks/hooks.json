@@ -1,52 +1,115 @@
 {
-  "description": "Ouroboros capture hooks: record session activity for learning reviews and the dashboard. They only measure; they never block or change anything.",
+  "description": "Ouroboros hooks: SessionStart injects the learning protocol and the global profile; the others record session activity for reviews and the dashboard. None of them blocks anything.",
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
-          { "type": "command", "command": "node", "args": ["--no-warnings", "${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs", "SessionStart"], "async": true }
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "--no-warnings",
+              "${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs",
+              "SessionStart"
+            ],
+            "timeout": 10
+          }
         ]
       }
     ],
     "UserPromptSubmit": [
       {
         "hooks": [
-          { "type": "command", "command": "node", "args": ["--no-warnings", "${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs", "UserPromptSubmit"], "async": true }
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "--no-warnings",
+              "${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs",
+              "UserPromptSubmit"
+            ],
+            "async": true
+          }
         ]
       }
     ],
     "UserPromptExpansion": [
       {
         "hooks": [
-          { "type": "command", "command": "node", "args": ["--no-warnings", "${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs", "UserPromptExpansion"], "async": true }
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "--no-warnings",
+              "${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs",
+              "UserPromptExpansion"
+            ],
+            "async": true
+          }
         ]
       }
     ],
     "PostToolUse": [
       {
         "hooks": [
-          { "type": "command", "command": "node", "args": ["--no-warnings", "${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs", "PostToolUse"], "async": true }
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "--no-warnings",
+              "${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs",
+              "PostToolUse"
+            ],
+            "async": true
+          }
         ]
       }
     ],
     "PostToolUseFailure": [
       {
         "hooks": [
-          { "type": "command", "command": "node", "args": ["--no-warnings", "${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs", "PostToolUseFailure"], "async": true }
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "--no-warnings",
+              "${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs",
+              "PostToolUseFailure"
+            ],
+            "async": true
+          }
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "node", "args": ["--no-warnings", "${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs", "Stop"], "async": true }
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "--no-warnings",
+              "${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs",
+              "Stop"
+            ],
+            "async": true
+          }
         ]
       }
     ],
     "SessionEnd": [
       {
         "hooks": [
-          { "type": "command", "command": "node", "args": ["--no-warnings", "${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs", "SessionEnd"], "timeout": 5 }
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "--no-warnings",
+              "${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs",
+              "SessionEnd"
+            ],
+            "timeout": 5
+          }
         ]
       }
     ]

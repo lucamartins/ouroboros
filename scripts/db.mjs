@@ -110,6 +110,52 @@ const MIGRATIONS = [
     message  TEXT
   );
   `,
+  // 2 — phase 2: learnings written by the curator, with a ledger for undo
+  `
+  CREATE TABLE learnings (
+    id             TEXT PRIMARY KEY,          -- lrn_<time><rand>
+    kind           TEXT NOT NULL,             -- memory | skill | profile
+    scope          TEXT NOT NULL,             -- global | project
+    memory_type    TEXT,
+    block          TEXT,                      -- profile block: user | environment
+    project        TEXT,
+    name           TEXT NOT NULL,
+    title          TEXT NOT NULL,
+    path           TEXT NOT NULL,
+    confidence     REAL,
+    status         TEXT NOT NULL,             -- active | archived | reverted
+    trigger        TEXT,
+    origin_session TEXT,
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL,
+    uses           INTEGER NOT NULL DEFAULT 0,
+    last_used_at   INTEGER
+  );
+  CREATE INDEX learnings_path ON learnings(path);
+  CREATE INDEX learnings_status ON learnings(status);
+
+  -- One row per file touched; a batch groups the files of one operation.
+  CREATE TABLE writes (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch        TEXT NOT NULL,
+    learning_id  TEXT,
+    ts           INTEGER NOT NULL,
+    op           TEXT NOT NULL,               -- create | patch | archive | revert
+    actor        TEXT NOT NULL,               -- manual | inloop | background
+    session_id   TEXT,
+    file         TEXT NOT NULL,
+    before       TEXT,                        -- NULL: file did not exist
+    after        TEXT,                        -- NULL: file removed
+    reverted_at  INTEGER
+  );
+  CREATE INDEX writes_batch ON writes(batch);
+  CREATE INDEX writes_learning ON writes(learning_id);
+
+  CREATE TABLE meta (
+    key    TEXT PRIMARY KEY,
+    value  TEXT
+  );
+  `,
 ];
 
 export function openDb(explicitDir) {
@@ -144,6 +190,14 @@ export function logError(db, source, err) {
   } catch {
     // Never let error logging break a hook.
   }
+}
+
+export function getMeta(db, key) {
+  return db.prepare('SELECT value FROM meta WHERE key = ?').get(key)?.value ?? null;
+}
+
+export function setMetaOnce(db, key, value) {
+  db.prepare('INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)').run(key, String(value));
 }
 
 /** Start of the current calendar month (local time), epoch ms. */

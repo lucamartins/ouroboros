@@ -5,6 +5,7 @@ import path from 'node:path';
 import { dataDir } from './paths.mjs';
 
 const DEFAULTS = {
+  learning: true,
   measure_review: true,
   reviewer_model: 'haiku',
   monthly_budget_usd: 5,
@@ -39,9 +40,10 @@ export function options() {
   const snap = fromEnv ? null : snapshot();
   if (snap) {
     const { updatedAt, ...rest } = snap;
-    return rest;
+    return { learning: DEFAULTS.learning, ...rest };
   }
   return {
+    learning: asBool(raw('learning'), DEFAULTS.learning),
     measureReview: asBool(raw('measure_review'), DEFAULTS.measure_review),
     reviewerModel: raw('reviewer_model') || DEFAULTS.reviewer_model,
     monthlyBudgetUsd: asNumber(raw('monthly_budget_usd'), DEFAULTS.monthly_budget_usd),
