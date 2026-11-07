@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { options } from './config.mjs';
 import { getMeta, logError, openDb, setMetaOnce } from './db.mjs';
 import { listMemories, listSkills, parseFrontmatter } from './inventory.mjs';
+import { knowledgeKind, PATCHABLE } from './knowledge.mjs';
 import { claudeDir, classifyPath, normalize, ouroborosDir, projectKey } from './paths.mjs';
 import { BLOCKS, blockChars, parseProfile, profileFile, renderProfile } from './profile.mjs';
 import { ensureSettingsFile, expandHome, loadSettings, routeFor } from './settings.mjs';
@@ -440,9 +441,9 @@ function resolvePatchTarget(db, item, settings, payload) {
   }
   if (path.isAbsolute(expandHome(target))) {
     const file = path.resolve(expandHome(target));
-    const cls = classifyPath(file);
-    if (!['memory', 'skill', 'profile'].includes(cls)) return { error: 'only memory, skill and profile files can be patched' };
-    return { file, kind: cls === 'profile' ? 'profile' : cls };
+    const kind = knowledgeKind(file);
+    if (!PATCHABLE.has(kind)) return { error: 'only memory, skill, profile, rule and CLAUDE.md files can be patched' };
+    return { file, kind };
   }
   if (item.kind === 'profile') return { file: profileFile(), kind: 'profile' };
   if (item.kind === 'skill') {
@@ -452,6 +453,44 @@ function resolvePatchTarget(db, item, settings, payload) {
   const dir = memoryDirFor({ memoryDir: payload.memory_dir, cwd: item.projectDir });
   const file = path.join(dir, target.endsWith('.md') ? target : `${slug(target)}.md`);
   return fs.existsSync(file) ? { file, kind: 'memory' } : null;
+}
+
+/**
+ * Add text at the end of a section: a markdown heading (until the next heading of the
+ * same or higher level) or a bold bullet ("- **Topic**", until the next sibling bullet).
+ * Without a matching section, append at the end of the file.
+ */
+export function appendToSection(text, section, addition) {
+  const add = String(addition || '').trim();
+  if (!add) return text;
+  const eol = text.includes('\r\n') ? '\r\n' : '\n';
+  const lines = text.split(/\r?\n/);
+  const want = String(section || '').toLowerCase().replace(/[*`#]/g, '').trim();
+  const norm = (l) => l.toLowerCase().replace(/[*`#]/g, '').replace(/^\s*[-*]\s+/, '').trim();
+  let start = -1;
+  let level = 0;
+  let bullet = null;
+  if (want) {
+    for (let i = 0; i < lines.length; i++) {
+      const h = /^(#{1,6})\s+(.*)$/.exec(lines[i]);
+      if (h && norm(h[2]).startsWith(want)) { start = i; level = h[1].length; break; }
+      const b = /^(\s*)[-*]\s+\*\*(.+?)\*\*/.exec(lines[i]);
+      if (b && norm(b[2]).startsWith(want)) { start = i; bullet = b[1]; break; }
+    }
+  }
+  let end = lines.length;
+  if (start >= 0) {
+    for (let i = start + 1; i < lines.length; i++) {
+      const h = /^(#{1,6})\s/.exec(lines[i]);
+      if (h && (bullet !== null || h[1].length <= level)) { end = i; break; }
+      if (bullet !== null && lines[i].startsWith(bullet) && /^[-*]\s/.test(lines[i].slice(bullet.length))) { end = i; break; }
+    }
+  }
+  while (end > start + 1 && end > 0 && !lines[end - 1].trim()) end--;
+  const block = bullet !== null && !/^\s*[-*]\s/.test(add) ? `${bullet}- ${add}` : add;
+  const insert = start < 0 && lines[lines.length - 1] !== '' ? ['', block] : [block];
+  lines.splice(end, 0, ...insert);
+  return lines.join(eol);
 }
 
 function patchItem(db, batch, item, settings, payload) {
@@ -481,7 +520,9 @@ function patchItem(db, batch, item, settings, payload) {
   }
 
   let after = before;
-  if (item.old !== undefined) {
+  if (item.append !== undefined) {
+    after = appendToSection(before, item.section, item.append);
+  } else if (item.old !== undefined) {
     const count = before.split(item.old).length - 1;
     if (count !== 1) return { status: 'rejected', reason: `"old" must appear exactly once in ${t.file} (found ${count})` };
     after = before.replace(item.old, () => item.new ?? '');
@@ -522,7 +563,12 @@ function patchItem(db, batch, item, settings, payload) {
  * Explicit user requests (actor `manual`) are always written.
  */
 export function needsApproval(item, actor, autonomy) {
-  if (actor === 'manual' || autonomy === 'auto') return false;
+  if (actor === 'manual') return false;
+  // Corrections of existing knowledge, and changes to rule files or CLAUDE.md (written
+  // by people, versioned with the project), always wait for the user.
+  if (item.corrects) return true;
+  if (item.op === 'patch' && item.target && path.isAbsolute(String(item.target)) && ['rules', 'instructions'].includes(knowledgeKind(item.target))) return true;
+  if (autonomy === 'auto') return false;
   if (autonomy === 'queue') return true;
   // hybrid: confident facts go in; skills and tentative items wait.
   return item.kind === 'skill' || item.confidence < 0.7;

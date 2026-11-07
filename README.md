@@ -45,6 +45,7 @@ Everything else is automatic: capture hooks record turns, tool calls, error → 
 ## Lifecycle
 
 - **Reinforcement:** each first use in a session, each rediscovery and each **Confirm** in the dashboard raises a learning's confidence.
+- **One rubric:** every path that saves anything (in-session `learn`, end-of-session reviewer, knowledge check) applies the same eight rules — would it change behavior, is it a standing rule, is it not derivable, is it verified against what the project executes, will it last, does it go to the owner, does it correct stale knowledge, is it trusted. See `scripts/rubric.mjs`.
 - **Knowledge check:** before anything from a review is written or queued, it is checked against your CLAUDE.md files, `.claude/rules`, skill bodies and memories: what is already documented is dropped (with the reason, restorable), duplicates are merged, and additions to a procedure become an update to the skill that owns it.
 - **Merge:** when a review finds something already saved, new details are folded into the existing note instead of creating a copy.
 - **Promotion:** a working rule saved in one project that shows up in another becomes a global profile fact.

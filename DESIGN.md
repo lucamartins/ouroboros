@@ -252,6 +252,21 @@ Curator steps (`curator.mjs`, deterministic):
 5. **Write** atomically (temp file + rename) and record it in `writes` with the diff.
 6. **Notice** queued for the next session.
 
+### 7.00 The learning rubric
+
+A healthy self-learning loop needs one, explicit definition of "worth remembering", applied the same way by every path that writes, for every user and project. It lives in `scripts/rubric.mjs` and is injected verbatim into the end-of-session reviewer, the knowledge check, and the `learn` skill (`test/rubric.test.mjs` fails if the skill drifts); the session protocol carries a one-line version. The eight rules:
+
+1. **Behavior change** — would the assistant act differently next time without it? (drop default behavior, generic practice, preferences already configured, alternatives to guidance that already handles the case)
+2. **Standing** — a rule the user stated as lasting, repeated, or a recorded decision; not a one-time request.
+3. **Not derivable** — absent from code, config, tests, git history and docs.
+4. **Verified** — worked or stated by the user; what the project executes (triggers, commands, parameters, config) is ground truth, comments are not, and an observed outcome beats a comment.
+5. **Durable** — no status, to-dos, counts, timings, issue numbers, finished work.
+6. **Owner** — add to the skill/rule/doc that owns the topic, else a project memory, else a global fact; never a second copy.
+7. **Correct the stale** — ground truth or an explicit change of rule fixes the outdated text; a one-off request never overturns a standing rule.
+8. **Trusted, no secrets.**
+
+These came from reviewing real proposals by hand, item by item, and turning every judgment into a rule. The rubric is project-agnostic; everything user- or project-specific comes from the indexed knowledge.
+
 ### 7.0 Knowledge check (triage)
 
 Lesson from the first learning backfill (60 proposals from 30 past sessions): about a third were already documented in the owner's skills, repo CLAUDE.md files or `.claude/rules`, several were the same lesson in two languages or two kinds, and a few were one-off instructions or finished work. The reviewer had only seen *names and descriptions* of memories and personal skills — never skill bodies, CLAUDE.md or rules.
@@ -261,6 +276,10 @@ So every proposal from Claude-less paths (end-of-session reviewer, learning back
 1. `scripts/knowledge.mjs` indexes what Claude already knows for the project: global and project CLAUDE.md, `.claude/rules/*.md`, project and personal skill bodies, memories and the profile — for the session's directory and its direct child repos (worktrees skipped). Markdown is chunked by heading/paragraph and searched with BM25 (no dependencies; ~400 chunks index in ~15 ms).
 2. One isolated call per batch of 12 proposals (`TRIAGE_SCHEMA`) sees each proposal with its top excerpts and the titles of all other proposals, and answers per proposal: **keep** (with a rewrite: right kind, human title, target language, no stale details), **drop** (covered / one-off / stale / derivable / low value, with the file that covers it), **merge** into another proposal, or **patch** an existing skill/memory/profile file (exact `old` fragment, verified before use; otherwise kept as new). Contradictions with existing knowledge are kept and flagged for the owner.
 3. A final pass over everything kept (`DEDUPE_SCHEMA`) merges duplicates that landed in different batches.
+
+Since the rubric, triage also gets: the **owners map** (every skill and rule file with its description and sections) so a learning goes to its owner even without shared words, with **append-to-section** patches that need no exact fragment; **sources of truth** (CI workflows, package manifests, deploy config) to verify claims; **past rejections** (proposals the user rejected or undid) so they are not proposed again; a **correct** verdict that fixes outdated knowledge. Changes to rule files and CLAUDE.md, and all corrections, always wait for approval. Extra clones and leftover copies of a repo are excluded from the index (they carry stale docs).
+
+On the same 60 real proposals: 60 → 26 (7 new memories, 19 additions to the skills and rules that own the topic), US$ 0.06 per full pass. Known gap: when a proposal is dropped because a source of truth covers it, a stale owner elsewhere is not always corrected in the same pass.
 
 Dropped and merged items stay visible in the dashboard with their reason and can be restored. Measured on the real queue: 60 → 39 (20 dropped, 1 merged, 8 turned into skill updates), about US$ 0.02–0.04 per pass. The in-session `learn` skill gets the same rule as an instruction: search the full text of CLAUDE.md, rules and skills before saving, and patch the skill that owns a procedure.
 

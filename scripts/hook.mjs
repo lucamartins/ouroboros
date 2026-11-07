@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { options } from './config.mjs';
 import { classifyPath, dataDir, projectKey, skillNameFromPath } from './paths.mjs';
 import { profileForContext, readProfileText } from './profile.mjs';
+import { RUBRIC_SHORT } from './rubric.mjs';
 import { globMatch, loadSettings } from './settings.mjs';
 import { countLines, readTranscript, usageSince } from './transcript.mjs';
 
@@ -85,7 +86,7 @@ export const PROTOCOL = `Ouroboros (self-learning) is active. Without being aske
 - a user preference or way of working, a correction of your approach, a project convention, an environment fact;
 - when the user explicitly asks you to remember something, save it right away;
 - create or patch a skill when you worked out a reusable multi-step workflow, found the working path after errors, or the user corrected your approach.
-Prefer patching what exists over creating new. Don't save what is derivable from the code or CLAUDE.md, ephemeral task details, or secrets. After saving, tell the user in one line: "📝 learned: …".`;
+${RUBRIC_SHORT} No secrets. After saving, tell the user in one line: "📝 learned: …".`;
 
 /** Projects listed in ~/.ouroboros/config.json `excludeProjects` are left alone entirely. */
 export function isExcluded(cwd) {

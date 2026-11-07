@@ -14,6 +14,9 @@ process.stdin.on('end', () => {
     structured = {
       verdicts: props.map((p) => (p.text.includes('DROPME')
         ? { id: p.id, verdict: 'drop', drop_kind: 'covered', reason: 'already documented', covered_by: 'CLAUDE.md' }
+        : p.text.includes('APPENDME:')
+          ? { id: p.id, verdict: 'patch', reason: 'owner exists', rule: 'owner', rewrite: { title: 'Deploy script' },
+              patch: { file: /APPENDME:(\S+)/.exec(p.text)[1], mode: 'append', section: 'Deploy', text: 'Use the deploy script.' } }
         : p.text.includes('MERGEME')
           ? { id: p.id, verdict: 'merge', merge_into: props[0].id, reason: 'same rule' }
           : { id: p.id, verdict: 'keep', reason: 'new' })),

@@ -217,3 +217,23 @@ test('queue tidy drops covered proposals, merges duplicates, keeps the rest; pat
   assert.equal(ok.op, 'patch');
   assert.equal(ok.kind, 'skill');
 });
+
+test('a proposal owned by an existing doc becomes an append patch that waits for approval', async () => {
+  const { tidyQueue } = await import('../scripts/triage.mjs');
+  const claudeMd = path.join(cwdA, 'CLAUDE.md');
+  curator.apply(db, { cwd: cwdA, items: [
+    { kind: 'memory', memory_type: 'project', title: 'Deploy with the script', description: `APPENDME:${claudeMd}`, confidence: 0.8 },
+  ] }, { actor: 'background', autonomy: 'queue' });
+  await tidyQueue(db);
+  const c = db.prepare("SELECT id, note, payload FROM candidates WHERE outcome = 'queued' ORDER BY id DESC").get();
+  const item = JSON.parse(c.payload).item;
+  assert.equal(item.op, 'patch');
+  assert.equal(item.append, 'Use the deploy script.');
+  assert.match(c.note, /adds to .*CLAUDE\.md › Deploy/);
+  // Rule files and CLAUDE.md are only changed through approval, even in auto mode.
+  const auto = curator.apply(db, { cwd: cwdA, items: [{ ...item }] }, { actor: 'background', autonomy: 'auto' });
+  assert.equal(auto[0].status, 'queued');
+  const r = curator.decideQueued(db, c.id, true);
+  assert.equal(r.status, 'patched', r.reason);
+  assert.match(fs.readFileSync(claudeMd, 'utf8'), /## Deploy\n\nZip with Python: [^\n]*\nUse the deploy script\.\n\n## Tests/);
+});

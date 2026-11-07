@@ -259,6 +259,34 @@ export function createApi(db) {
       return { memories, skills, instructions: listInstructionFiles(cwds), profile: userProfile() };
     },
 
+    quality(params) {
+      const days = Math.min(Math.max(Number(params.get('days')) || 30, 1), 365);
+      const since = Date.now() - days * DAY;
+      const outcomes = db.prepare('SELECT outcome, note FROM candidates WHERE ts >= ? AND outcome IS NOT NULL').all(since);
+      const count = (o) => outcomes.filter((x) => x.outcome === o).length;
+      const dropReasons = {};
+      for (const x of outcomes.filter((o) => o.outcome === 'dropped')) {
+        const reason = String(x.note || 'dropped').split(/[:[]/)[0].trim() || 'dropped';
+        dropReasons[reason] = (dropReasons[reason] || 0) + 1;
+      }
+      const writes = db.prepare('SELECT COUNT(DISTINCT batch) n, COUNT(DISTINCT CASE WHEN reverted_at IS NOT NULL THEN batch END) undone FROM writes WHERE ts >= ?').get(since);
+      const decided = db.prepare("SELECT outcome FROM candidates WHERE decided_at >= ? AND outcome IN ('created', 'patched', 'rejected_by_user') OR (decided_at >= ? AND outcome LIKE 'approved_%')").all(since, since);
+      const approved = decided.filter((d) => d.outcome !== 'rejected_by_user').length;
+      return {
+        days,
+        proposed: outcomes.length,
+        saved: count('created') + count('patched'),
+        queued: count('queued'),
+        dropped: count('dropped'),
+        merged: count('merged'),
+        rejectedByUser: count('rejected_by_user'),
+        dropReasons,
+        approvalRate: decided.length ? approved / decided.length : null,
+        undoRate: writes.n ? writes.undone / writes.n : null,
+        writes: writes.n,
+      };
+    },
+
     health() {
       const cwds = knownCwds(db);
       const indexes = listMemories().filter((m) => m.index).map((m) => ({

@@ -586,8 +586,24 @@ async function renderCost() {
       ], c.recent, { empty: 'No reviews yet.' }))));
 }
 
+function qualityCard(q) {
+  const pct = (x) => (x === null || x === undefined ? '—' : fmt.pct(x * 100));
+  const reasons = Object.entries(q.dropReasons).sort((a, b) => b[1] - a[1]);
+  const signals = [];
+  if (q.proposed >= 10 && q.dropped / q.proposed > 0.5) signals.push('Most proposals are dropped by the knowledge check: reviews are proposing things that are already documented or fail the rubric.');
+  if (q.undoRate !== null && q.writes >= 5 && q.undoRate > 0.2) signals.push('More than 1 in 5 writes was undone: learnings are being saved that you do not want.');
+  if (q.approvalRate !== null && q.approvalRate < 0.5) signals.push('You reject most queued proposals: consider a stricter autonomy or reviewing the rubric results.');
+  return h('div', { class: 'card' },
+    h('h3', {}, `Learning quality (last ${q.days} days)`),
+    h('div', {}, `${fmt.int(q.proposed)} proposed · ${fmt.int(q.saved)} saved · ${fmt.int(q.queued)} waiting · ${fmt.int(q.dropped)} dropped · ${fmt.int(q.merged)} merged · ${fmt.int(q.rejectedByUser)} rejected by you`),
+    h('div', { class: 'muted small' }, `Approval rate ${pct(q.approvalRate)} · undo rate ${pct(q.undoRate)} of ${fmt.int(q.writes)} writes`),
+    reasons.length ? h('div', { class: 'faint small', style: 'margin-top:6px' }, `Dropped because: ${reasons.map(([r, n]) => `${r} (${n})`).join(', ')}`) : null,
+    ...signals.map((s) => h('div', { class: 'small warn-text', style: 'margin-top:6px' }, s)),
+    signals.length ? null : h('div', { class: 'small', style: 'margin-top:6px' }, h('span', { class: 'status-dot good' }), 'No quality warnings'));
+}
+
 async function renderHealth() {
-  const hl = await api('health');
+  const [hl, q] = await Promise.all([api('health'), api('quality', { days: 30 })]);
   const LISTING_REF = 2000; // ~1% of a 200K-token context
   const queue = Object.fromEntries(hl.queue.map((q) => [q.state, q.n]));
   const alive = hl.capture.lastEventAt && Date.now() - hl.capture.lastEventAt < 7 * 86_400_000;
@@ -604,6 +620,7 @@ async function renderHealth() {
         h('div', { class: 'muted small' }, hl.options ? `Model ${hl.options.reviewerModel} · background review ${(hl.options.backgroundReview ?? hl.options.measureReview) ? 'on' : 'off'} · in-loop review ${hl.options.inloopReview === false ? 'off' : `every ${hl.options.reviewEveryTurns ?? 10} turns`}` : 'Options are reported at the next session start.'),
         hl.skippedReviews.length ? h('div', { class: 'faint small' }, `Skipped: ${hl.skippedReviews.map((r) => `${r.detail} (${r.n})`).join(', ')}`) : null)),
 
+    h('section', { class: 'section' }, qualityCard(q)),
     h('section', { class: 'section' },
       h('div', { class: 'section-head' }, h('h2', {}, 'Context budgets')),
       h('div', { class: 'grid-2' },
