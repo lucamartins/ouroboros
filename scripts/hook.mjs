@@ -145,9 +145,11 @@ function finishInloopReview(db, input, s, now) {
 export function sessionContext(learnedSinceLastSession = '') {
   const text = readProfileText();
   const profile = text ? profileForContext(text) : '';
+  const lang = options().learningLanguage;
   return [
     '<ouroboros>',
     PROTOCOL,
+    lang === 'auto' ? '' : `Write learnings in ${lang === 'pt-BR' ? 'Brazilian Portuguese' : 'English'}.`,
     profile ? `\nWhat you already know about the user and their environment (from ~/.ouroboros/user.md):\n${profile}` : '',
     learnedSinceLastSession ? `\nLearned by the end-of-session review since the last session (already saved):\n${learnedSinceLastSession}` : '',
     '</ouroboros>',

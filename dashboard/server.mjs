@@ -13,8 +13,16 @@ import { createApi } from './api.mjs';
 import { confirm, decideQueued, forget, undo } from '../scripts/curator.mjs';
 
 /** Write actions available from the dashboard; all go through the curator (undoable). */
-function runAction(db, action, id) {
+async function runAction(db, action, id) {
   switch (action) {
+    case 'triage_queue': {
+      const { tidyQueue } = await import('../scripts/triage.mjs');
+      return { status: 'done', ...(await tidyQueue(db, { force: !!id })) };
+    }
+    case 'restore': {
+      const r = db.prepare("UPDATE candidates SET outcome = 'queued', decided_at = NULL, note = COALESCE(note, '') || ' (restored by you)' WHERE id = ? AND outcome IN ('dropped', 'merged')").run(Number(id));
+      return r.changes ? { status: 'restored' } : { status: 'not_found' };
+    }
     case 'undo': return undo(db, { id });
     case 'forget': return forget(db, { match: id });
     case 'confirm': return confirm(db, id);
@@ -168,10 +176,10 @@ async function serve(args) {
     if (isStale()) return sendJson(res, 503, { error: 'stale', message: 'Ouroboros was updated since this dashboard started. Run /ouroboros:dashboard again to restart it.' });
     let body = '';
     req.on('data', (d) => { body += d; if (body.length > 10_000) req.destroy(); });
-    req.on('end', () => {
+    req.on('end', async () => {
       try {
         const { action, id } = JSON.parse(body || '{}');
-        const result = runAction(db, action, id);
+        const result = await runAction(db, action, id);
         sendJson(res, result ? 200 : 400, result || { error: `unknown action ${action}` });
       } catch (err) {
         sendJson(res, 500, { error: String(err.message) });

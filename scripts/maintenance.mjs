@@ -138,6 +138,15 @@ export async function maintain(db, { force = false, now = Date.now() } = {}) {
   const settings = loadSettings();
   const opts = options();
   const decayed = decay(db, settings, now);
+  let tidied = null;
+  if (db.prepare("SELECT COUNT(*) n FROM candidates WHERE outcome = 'queued' AND triaged_at IS NULL").get().n && opts.monthlyBudgetUsd > monthSpend(db)) {
+    try {
+      const { tidyQueue } = await import('./triage.mjs');
+      tidied = await tidyQueue(db);
+    } catch (err) {
+      logError(db, 'maintenance:triage', err);
+    }
+  }
   const cons = await consolidate(db, settings, opts);
   const archived = [...decayed, ...cons.archived];
   const merged = cons.profile.filter((p) => p.status === 'consolidated');
@@ -150,5 +159,5 @@ export async function maintain(db, { force = false, now = Date.now() } = {}) {
     ...(cons.archived.length ? [`🧹 archived ${cons.archived.length} to stay within budget: ${cons.archived.slice(0, 5).join('; ')}`] : []),
   ];
   if (lines.length) db.prepare('INSERT INTO notices (ts, session_id, text) VALUES (?, ?, ?)').run(now, 'maintenance', lines.join('\n'));
-  return { status: 'ok', decayed, consolidated: cons.profile, trimmed: cons.archived, cost: cons.cost };
+  return { status: 'ok', decayed, consolidated: cons.profile, trimmed: cons.archived, tidied, cost: cons.cost + (tidied?.cost || 0) };
 }

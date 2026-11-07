@@ -187,6 +187,11 @@ const MIGRATIONS = [
     cost_usd  REAL NOT NULL DEFAULT 0
   );
   `,
+  // 5 — triage against existing knowledge
+  `
+  ALTER TABLE candidates ADD COLUMN note TEXT;
+  ALTER TABLE candidates ADD COLUMN triaged_at INTEGER;
+  `,
 ];
 
 export function openDb(explicitDir) {

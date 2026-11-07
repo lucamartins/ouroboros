@@ -8,7 +8,19 @@ process.stdin.on('end', () => {
   const ok = args.includes('--safe-mode') && args.includes('--json-schema');
   const corrections = [{ user_turn: 2, quote: 'no, use pnpm', kind: 'explicit' }];
   let structured;
-  if (schema.includes('"bullets"')) {
+  if (schema.includes('"verdicts"')) {
+    // Triage: DROPME -> covered, MERGEME -> merged into the first proposal, else keep.
+    const props = [...prompt.matchAll(/<proposal id="(\d+)">([\s\S]*?)<\/proposal>/g)].map((m) => ({ id: Number(m[1]), text: m[2] }));
+    structured = {
+      verdicts: props.map((p) => (p.text.includes('DROPME')
+        ? { id: p.id, verdict: 'drop', drop_kind: 'covered', reason: 'already documented', covered_by: 'CLAUDE.md' }
+        : p.text.includes('MERGEME')
+          ? { id: p.id, verdict: 'merge', merge_into: props[0].id, reason: 'same rule' }
+          : { id: p.id, verdict: 'keep', reason: 'new' })),
+    };
+  } else if (schema.includes('"groups"')) {
+    structured = { groups: [] };
+  } else if (schema.includes('"bullets"')) {
     // Consolidation: merge the first two bullets, keep the rest.
     const bullets = [...prompt.matchAll(/^- \[(lrn_[a-z0-9]+)\] (.*)$/gm)].map((m) => ({ id: m[1], text: m[2] }));
     structured = {
@@ -40,7 +52,7 @@ process.stdin.on('end', () => {
       }],
     };
   }
-  const valid = ok && (schema.includes('"bullets"') || schema.includes('"action"') || prompt.includes('<digest>'));
+  const valid = ok && (schema.includes('"bullets"') || schema.includes('"action"') || schema.includes('"verdicts"') || schema.includes('"groups"') || prompt.includes('<digest>'));
   process.stdout.write(JSON.stringify({
     type: 'result',
     is_error: !valid,

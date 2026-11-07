@@ -1,7 +1,7 @@
 {
   "name": "ouroboros",
   "displayName": "Ouroboros",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Self-learning for Claude Code: reviews your sessions, turns what is worth keeping into memories and skills, and shows usage, value and cost on a local dashboard.",
   "author": {
     "name": "Luca Martins",
@@ -23,6 +23,13 @@
       "description": "auto: learnings are written right away (undoable). hybrid: only high-confidence facts are written; skills and the rest wait for approval in the dashboard. queue: everything Claude or the reviewer proposes waits for approval. Explicit requests (\"remember that…\") are always written.",
       "options": ["auto", "hybrid", "queue"],
       "default": "auto"
+    },
+    "learning_language": {
+      "type": "string",
+      "title": "Language of learnings",
+      "description": "Language memories, profile facts and skills are written in. en: English (recommended: matches most repo conventions and works in every session). pt-BR: Brazilian Portuguese. auto: the language of the conversation.",
+      "options": ["en", "pt-BR", "auto"],
+      "default": "en"
     },
     "inloop_review": {
       "type": "boolean",

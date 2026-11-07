@@ -196,7 +196,7 @@ export function createApi(db) {
 
     queue() {
       return db.prepare(`
-        SELECT c.id, c.kind, c.scope, c.memory_type, c.title, c.summary, c.evidence, c.confidence, c.ts, c.cwd, c.project, c.payload,
+        SELECT c.id, c.kind, c.scope, c.memory_type, c.title, c.summary, c.evidence, c.confidence, c.ts, c.cwd, c.project, c.payload, c.note, c.triaged_at,
                s.started_at session_started_at
         FROM candidates c LEFT JOIN sessions s ON s.id = c.session_id
         WHERE c.outcome = 'queued'
@@ -207,6 +207,13 @@ export function createApi(db) {
         const { payload, ...rest } = r;
         return { ...rest, op: item.op || 'create', target: item.target || null, block: item.block || null, description: item.description || null };
       });
+    },
+
+    dropped() {
+      return db.prepare(`
+        SELECT c.id, c.kind, c.title, c.summary, c.outcome, c.note, c.decided_at, s.started_at session_started_at, c.cwd, c.project
+        FROM candidates c LEFT JOIN sessions s ON s.id = c.session_id
+        WHERE c.outcome IN ('dropped', 'merged') ORDER BY c.decided_at DESC, c.id LIMIT 200`).all();
     },
 
     learnings() {

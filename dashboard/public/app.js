@@ -135,6 +135,8 @@ const ACTION_LABEL = {
   confirm: (r) => (r.status === 'confirmed' ? '✓ confidence raised' : r.status),
   approve: (r) => (r.status === 'created' || r.status === 'patched' ? `📝 saved: ${r.title}` : `${r.status}${r.reason ? ` — ${r.reason}` : ''}`),
   reject: () => 'rejected',
+  triage_queue: (r) => `checked ${r.total}: ${r.kept} kept, ${r.patched} as updates, ${r.dropped} dropped, ${r.merged} merged (${fmt.usd(r.cost)})`,
+  restore: () => 'back in the queue',
   approve_many: (r) => `📝 saved ${r.saved} of ${r.total}${r.other ? ` (${r.other} skipped: duplicate or over budget)` : ''}`,
   reject_many: (r) => `rejected ${r.rejected}`,
 };
@@ -372,6 +374,7 @@ function learnedSection(learned, writes) {
 }
 
 const OUTCOME_LABEL = {
+  dropped: 'dropped by triage', merged: 'merged by triage',
   created: 'saved', patched: 'merged into existing', duplicate: 'already known', rejected: 'rejected',
   over_budget: 'over budget', queued: 'waiting for approval', rejected_by_user: 'rejected by you', error: 'error',
 };
@@ -383,6 +386,9 @@ function queueSection(queue) {
       h('div', {}, h('h2', {}, `Waiting for approval (${queue.length})`),
         h('div', { class: 'muted small' }, 'Held by your autonomy setting or a learning backfill, in the order the sessions happened (oldest first). Approve to save through the curator, or reject.')),
       h('div', { class: 'actions' },
+        queue.some((q) => !q.triaged_at)
+          ? actionButton(`Check ${queue.filter((q) => !q.triaged_at).length} against knowledge`, 'triage_queue', false, { title: 'Drop what your memories, CLAUDE.md, rules and skills already say; merge duplicates; turn additions into skill updates' })
+          : actionButton('Re-check all', 'triage_queue', true, { confirmText: 'Re-check everything?', title: 'Run the knowledge check again on every queued item' }),
         actionButton(`Approve all ${queue.length}`, 'approve_many', queue.map((q) => q.id), { confirmText: `Save all ${queue.length}?` }),
         actionButton('Reject all', 'reject_many', queue.map((q) => q.id), { confirmText: `Reject all ${queue.length}?` }))),
     h('div', { class: 'cards' }, queue.map((q) => h('article', { class: 'card lcard' },
@@ -392,6 +398,7 @@ function queueSection(queue) {
         h('span', { class: 'conf' }, meter(q.confidence || 0, 1, { plain: true }), fmt.pct((q.confidence || 0) * 100))),
       h('div', { class: 'title' }, q.title || q.target || '(untitled)'),
       q.description ? h('div', { class: 'muted small' }, q.description) : null,
+      q.note ? h('div', { class: `small ${q.note.startsWith('⚠') ? 'warn-text' : 'faint'}` }, q.note) : null,
       h('div', { class: 'summary' }, q.summary),
       q.evidence ? h('div', { class: 'evidence' }, q.evidence) : null,
       h('div', { class: 'actions' }, actionButton('Approve', 'approve', q.id), actionButton('Reject', 'reject', q.id, { confirmText: 'Reject it?' }))))),
@@ -399,8 +406,20 @@ function queueSection(queue) {
   ];
 }
 
+function droppedSection(dropped) {
+  if (!dropped.length) return [];
+  return [
+    h('details', { class: 'card dropped' },
+      h('summary', {}, `Dropped by the knowledge check (${dropped.length}) — already documented, one-off, stale or duplicate`),
+      h('ul', { class: 'list' }, dropped.map((d) => h('li', {},
+        h('div', { class: 'row' }, h('span', {}, d.title), actionButton('Restore', 'restore', d.id, { title: 'Put it back in the approval queue' })),
+        h('div', { class: 'faint small' }, d.note || OUTCOME_LABEL[d.outcome]))))),
+    h('div', { style: 'height:28px' }),
+  ];
+}
+
 async function renderLearnings() {
-  const [{ learned, writes, candidates, corrections }, queue] = await Promise.all([api('learnings'), api('queue')]);
+  const [{ learned, writes, candidates, corrections }, queue, dropped] = await Promise.all([api('learnings'), api('queue'), api('dropped')]);
   const f = state.filters;
   const chipGroup = (key, options) => h('div', { class: 'chips', role: 'group' }, options.map(([value, label]) =>
     h('button', { class: 'chip', 'aria-pressed': String(f[key] === value), onclick: () => { f[key] = value; renderLearnings(); } }, label)));
@@ -428,6 +447,7 @@ async function renderLearnings() {
 
   view.replaceChildren(
     ...queueSection(queue),
+    ...droppedSection(dropped),
     ...learnedSection(learned, writes),
     h('section', { class: 'section' }, h('div', { class: 'section-head' },
       h('div', {}, h('h2', {}, 'Review candidates'), h('div', { class: 'muted small' }, `${shown.length} of ${candidates.length} — what end-of-session reviews found worth learning, and what happened to each`)),

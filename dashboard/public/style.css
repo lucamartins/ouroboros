@@ -220,3 +220,7 @@ td .desc { color: var(--text-2); font-size: 12px; max-width: 60ch; }
 }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
 .toast.bad { border-color: var(--critical); }
+
+.warn-text { color: var(--text); border-left: 2px solid var(--warning); padding-left: 8px; }
+details.dropped summary { cursor: pointer; color: var(--text-2); }
+details.dropped .row { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }

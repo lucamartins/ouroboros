@@ -252,6 +252,20 @@ Curator steps (`curator.mjs`, deterministic):
 5. **Write** atomically (temp file + rename) and record it in `writes` with the diff.
 6. **Notice** queued for the next session.
 
+### 7.0 Knowledge check (triage)
+
+Lesson from the first learning backfill (60 proposals from 30 past sessions): about a third were already documented in the owner's skills, repo CLAUDE.md files or `.claude/rules`, several were the same lesson in two languages or two kinds, and a few were one-off instructions or finished work. The reviewer had only seen *names and descriptions* of memories and personal skills — never skill bodies, CLAUDE.md or rules.
+
+So every proposal from Claude-less paths (end-of-session reviewer, learning backfill, approval queue) now goes through `scripts/triage.mjs` before it is written or queued:
+
+1. `scripts/knowledge.mjs` indexes what Claude already knows for the project: global and project CLAUDE.md, `.claude/rules/*.md`, project and personal skill bodies, memories and the profile — for the session's directory and its direct child repos (worktrees skipped). Markdown is chunked by heading/paragraph and searched with BM25 (no dependencies; ~400 chunks index in ~15 ms).
+2. One isolated call per batch of 12 proposals (`TRIAGE_SCHEMA`) sees each proposal with its top excerpts and the titles of all other proposals, and answers per proposal: **keep** (with a rewrite: right kind, human title, target language, no stale details), **drop** (covered / one-off / stale / derivable / low value, with the file that covers it), **merge** into another proposal, or **patch** an existing skill/memory/profile file (exact `old` fragment, verified before use; otherwise kept as new). Contradictions with existing knowledge are kept and flagged for the owner.
+3. A final pass over everything kept (`DEDUPE_SCHEMA`) merges duplicates that landed in different batches.
+
+Dropped and merged items stay visible in the dashboard with their reason and can be restored. Measured on the real queue: 60 → 39 (20 dropped, 1 merged, 8 turned into skill updates), about US$ 0.02–0.04 per pass. The in-session `learn` skill gets the same rule as an instruction: search the full text of CLAUDE.md, rules and skills before saving, and patch the skill that owns a procedure.
+
+Learnings are written in `learning_language` (`en` by default, `pt-BR` or `auto`), so files on disk follow one language regardless of the conversation's.
+
 ### 7.1 Lifecycle
 
 ```

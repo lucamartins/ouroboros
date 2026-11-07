@@ -15,6 +15,8 @@ Focus: `$ARGUMENTS` — if empty, review the conversation since the last learnin
 node --no-warnings "${CLAUDE_PLUGIN_ROOT}/scripts/curator.mjs" inventory --data "${CLAUDE_PLUGIN_DATA}" --cwd "<current working directory>" --memory-dir "<your auto-memory directory, if your instructions name one>"
 ```
 
+The inventory lists names and descriptions only. Before saving anything, **search the full text** of what the project already documents — CLAUDE.md files, `.claude/rules/`, skill bodies and memories — for the key terms of each item (tool names, commands, identifiers), e.g. `grep -ril "<term>" CLAUDE.md */CLAUDE.md */.claude/rules ~/.claude/skills/*/SKILL.md`. Most lessons from a project end up in its rules or skills; if it is already there, do not save it again, and if the skill that owns the procedure lacks a detail, **patch that skill** instead of creating a memory.
+
 ## 2. Decide what is worth keeping
 
 Keep an item only if **all** hold:
@@ -65,7 +67,7 @@ node --no-warnings "${CLAUDE_PLUGIN_ROOT}/scripts/curator.mjs" apply --data "${C
 JSON
 ```
 
-Fields: `title` (short), `description` (one line; ≤ 250 chars for skills — say *when to use it*), `body` (memories: the fact plus **Why** / **How to apply**; skills: steps and pitfalls), `confidence` 0.3 tentative … 0.9 near-certain, `project_dir` (the repo the item is about; defaults to `cwd`). Write learnings in the language the user writes in.
+Fields: `title` (short), `description` (one line; ≤ 250 chars for skills — say *when to use it*), `body` (memories: the fact plus **Why** / **How to apply**; skills: steps and pitfalls), `confidence` 0.3 tentative … 0.9 near-certain, `project_dir` (the repo the item is about; defaults to `cwd`). Write learnings in the language your Ouroboros session context asks for (English by default), with short human-readable titles.
 
 ## 5. Handle the results
 

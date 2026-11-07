@@ -184,3 +184,36 @@ test('learning backfill: oldest first, into the approval queue, deduplicated, no
   const again = spawnSync(process.execPath, ['--no-warnings', path.join(root, 'scripts', 'review-worker.mjs'), '--backfill', '--learn', '--dry-run'], { env: process.env, encoding: 'utf8' });
   assert.match(again.stdout, /"sessions":0/);
 });
+
+test('knowledge index finds existing documentation by keywords', async () => {
+  const { buildIndex, chunkMarkdown } = await import('../scripts/knowledge.mjs');
+  fs.writeFileSync(path.join(cwdA, 'CLAUDE.md'), '# Repo\n\n## Deploy\n\nZip with Python: Compress-Archive writes backslashes and breaks Linux App Service.\n\n## Tests\n\nRun pnpm test.\n');
+  assert.equal(chunkMarkdown(fs.readFileSync(path.join(cwdA, 'CLAUDE.md'), 'utf8')).length, 2);
+  const hits = buildIndex(cwdA).search('Compress-Archive zip Linux deploy', 2);
+  assert.match(hits[0].file, /CLAUDE\.md$/);
+  assert.equal(hits[0].heading, 'Deploy');
+});
+
+test('queue tidy drops covered proposals, merges duplicates, keeps the rest; patch verdicts are verified', async () => {
+  const { tidyQueue, patchItemFromVerdict } = await import('../scripts/triage.mjs');
+  for (const c of db.prepare("SELECT id FROM candidates WHERE outcome = 'queued'").all()) curator.decideQueued(db, c.id, false);
+  const r = curator.apply(db, { cwd: cwdA, items: [
+    { kind: 'memory', memory_type: 'project', title: 'Release checklist owner', description: 'Releases are cut by the backend lead', confidence: 0.8 },
+    { kind: 'memory', memory_type: 'project', title: 'Zip deploys', description: 'DROPME zip with python', confidence: 0.8 },
+    { kind: 'memory', memory_type: 'project', title: 'Who cuts releases', description: 'MERGEME the backend lead cuts releases', confidence: 0.8 },
+  ] }, { actor: 'background', autonomy: 'queue' });
+  assert.deepEqual(r.map((x) => x.status), ['queued', 'queued', 'queued']);
+  const report = await tidyQueue(db);
+  assert.deepEqual([report.kept, report.dropped, report.merged], [1, 1, 1]);
+  const rows = db.prepare('SELECT title, outcome, note FROM candidates WHERE triaged_at IS NOT NULL ORDER BY id').all();
+  assert.equal(rows.find((x) => x.title === 'Zip deploys').outcome, 'dropped');
+  assert.match(rows.find((x) => x.title === 'Zip deploys').note, /covered: already documented \(CLAUDE\.md\)/);
+  assert.equal(rows.find((x) => x.title === 'Who cuts releases').outcome, 'merged');
+  assert.equal((await tidyQueue(db)).total, 0, 'already triaged items are not checked again');
+
+  const skill = path.join(tmp, 'claude', 'skills', 'learned-bisect-flaky-tests', 'SKILL.md');
+  assert.equal(patchItemFromVerdict({ patch: { file: skill, old: 'not in the file', new: 'x' } }), null);
+  const ok = patchItemFromVerdict({ patch: { file: skill, old: '# Bisect flaky tests', new: '# Bisect flaky tests\n\nAlso check retries.' } });
+  assert.equal(ok.op, 'patch');
+  assert.equal(ok.kind, 'skill');
+});
