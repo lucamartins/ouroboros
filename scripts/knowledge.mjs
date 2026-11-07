@@ -4,6 +4,7 @@
 //   - past rejections: proposals the user rejected or undid
 // Used to check proposals before anything is queued or written, and to find the
 // skill or rule file that owns a topic.
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { classifyPath, claudeDir, projectKey } from './paths.mjs';
@@ -90,7 +91,30 @@ export function projectRoots(cwd) {
 export function knowledgeKind(file) {
   const cls = classifyPath(file);
   if (cls) return cls;
+  // Reference files a skill points to (skills/<name>/reference/x.md) belong to the skill.
+  if (/[\\/]skills[\\/][^\\/]+[\\/].+\.md$/i.test(file)) return 'skill';
   return /[\\/]\.claude[\\/]rules[\\/][^\\/]+\.md$/i.test(file) ? 'rules' : 'source';
+}
+
+/** SKILL.md plus the markdown reference files next to it (one folder deep). */
+function skillFiles(skillDir) {
+  const out = [path.join(skillDir, 'SKILL.md')];
+  for (const e of safeList(skillDir)) {
+    if (e.isFile() && /\.md$/i.test(e.name) && e.name.toLowerCase() !== 'skill.md') out.push(path.join(skillDir, e.name));
+    if (e.isDirectory() && !e.name.startsWith('.')) {
+      for (const f of safeList(path.join(skillDir, e.name))) if (f.isFile() && /\.md$/i.test(f.name)) out.push(path.join(skillDir, e.name, f.name));
+    }
+  }
+  return out;
+}
+
+/** Display name of a skill file: the skill's name, or "<skill>/<relative path>" for a reference file. */
+function skillFileName(file, data) {
+  const parts = file.split(/[\\/]/);
+  const i = parts.map((p) => p.toLowerCase()).lastIndexOf('skills');
+  const skill = i >= 0 ? parts[i + 1] : path.basename(path.dirname(file));
+  if (/^skill\.md$/i.test(path.basename(file))) return data.name || skill;
+  return `${skill}/${parts.slice(i + 2).join('/')}`;
 }
 
 /** Kinds Ouroboros may add to or correct (rules and instructions only with approval). */
@@ -108,13 +132,16 @@ export function knowledgeFiles(cwd) {
     add(path.join(root, 'CLAUDE.local.md'));
     add(path.join(root, '.claude', 'CLAUDE.md'));
     for (const f of safeList(path.join(root, '.claude', 'rules'))) if (f.name.endsWith('.md')) add(path.join(root, '.claude', 'rules', f.name));
-    for (const d of safeList(path.join(root, '.claude', 'skills'))) add(path.join(root, '.claude', 'skills', d.name, 'SKILL.md'));
+    for (const d of safeList(path.join(root, '.claude', 'skills'))) if (d.isDirectory()) skillFiles(path.join(root, '.claude', 'skills', d.name)).forEach(add);
     // Sources of truth.
     for (const f of safeList(path.join(root, '.github', 'workflows'))) if (/\.ya?ml$/i.test(f.name)) add(path.join(root, '.github', 'workflows', f.name));
     for (const name of SOURCE_FILES) add(path.join(root, name));
   }
   const personal = path.join(claudeDir(), 'skills');
-  for (const d of safeList(personal)) add(path.join(personal, d.name, 'SKILL.md'));
+  for (const d of safeList(personal)) {
+    // Skills installed as junctions/symlinks report as links, not directories.
+    if (d.isDirectory() || d.isSymbolicLink()) skillFiles(path.join(personal, d.name)).forEach(add);
+  }
   return files;
 }
 
@@ -239,9 +266,22 @@ export function buildIndex(cwd, { extra = [] } = {}) {
  */
 export function ownersMap(cwd) {
   const owners = [];
-  for (const file of knowledgeFiles(cwd)) {
+  const files = knowledgeFiles(cwd);
+  // Reference files are listed by name under their skill, not as owners of their own:
+  // a skill like a design system can ship dozens of them.
+  const refsBySkillDir = new Map();
+  for (const file of files) {
+    if (knowledgeKind(file) !== 'skill' || /^skill\.md$/i.test(path.basename(file))) continue;
+    const parts = file.split(/[\\/]/);
+    const i = parts.map((p) => p.toLowerCase()).lastIndexOf('skills');
+    const dir = parts.slice(0, i + 2).join(path.sep);
+    if (!refsBySkillDir.has(dir)) refsBySkillDir.set(dir, []);
+    refsBySkillDir.get(dir).push(parts.slice(i + 2).join('/'));
+  }
+  for (const file of files) {
     const kind = knowledgeKind(file);
     if (kind !== 'skill' && kind !== 'rules') continue;
+    if (kind === 'skill' && !/^skill\.md$/i.test(path.basename(file))) continue;
     let text;
     try { text = fs.readFileSync(file, 'utf8'); } catch { continue; }
     const { data, body } = parseFrontmatter(text);
@@ -249,12 +289,94 @@ export function ownersMap(cwd) {
     let headings = [...body.matchAll(/^#{2,3}\s+(.+)$/gm)].map((m) => m[1].trim());
     if (headings.length < 3) headings = headings.concat([...body.matchAll(/^\s*[-*]\s+\*\*([^*]{3,80})\*\*/gm)].map((m) => m[1].trim()));
     headings = headings.slice(0, 14);
-    const name = kind === 'skill' ? (data.name || path.basename(path.dirname(file))) : path.basename(file, '.md');
+    const name = kind === 'skill' ? skillFileName(file, data) : path.basename(file, '.md');
     const paths = [...text.matchAll(/^\s+-\s+"?([^"\n]+)"?\s*$/gm)].slice(0, 3).map((m) => m[1]);
     const firstLine = body.split(/\r?\n/).find((l) => l.trim() && !l.startsWith('#')) || '';
     const description = (typeof data.description === 'string' ? data.description : `${firstLine}${paths.length ? ` (applies to ${paths.join(', ')})` : ''}`)
       .replace(/\s+/g, ' ').slice(0, 220);
-    owners.push({ kind, name, file, description, headings });
+    const references = (refsBySkillDir.get(path.dirname(file)) || []).slice(0, 16);
+    owners.push({ kind, name, file, description, headings, references });
   }
   return owners;
+}
+
+/**
+ * Resolve an owner path a model wrote to a real knowledge file: the exact path, or the
+ * one knowledge file whose path ends with it (models shorten or re-slash paths).
+ */
+export function resolveOwner(owner, cwd) {
+  const raw = String(owner || '').trim();
+  if (!raw) return null;
+  if (path.isAbsolute(raw) && isFile(raw)) return path.resolve(raw);
+  const norm = (p) => p.replace(/\\/g, '/').toLowerCase();
+  const want = norm(raw).replace(/^\.?\//, '');
+  const hits = knowledgeFiles(cwd).filter((f) => norm(f).endsWith(`/${want}`) || norm(f) === want);
+  return hits.length === 1 ? hits[0] : null;
+}
+
+// ---------- grounding: what the project itself says about a claim ----------
+
+const MAX_IDENTIFIERS = 10;
+const HITS_PER_IDENTIFIER = 3;
+const GREP_TIMEOUT_MS = 8000;
+
+/**
+ * Concrete things a claim names that the project can confirm or refute: code spans,
+ * file paths, dotted identifiers, CONSTANT_NAMES, --flags and env-style variables.
+ */
+export function identifiersIn(text) {
+  const s = String(text || '');
+  const found = [];
+  const push = (x) => {
+    const v = String(x).trim().replace(/[.,;:)]+$/, '');
+    if (v.length < 4 || v.length > 80 || /\s{2,}/.test(v) || found.includes(v)) return;
+    found.push(v);
+  };
+  for (const m of s.matchAll(/`([^`\n]{4,80})`/g)) {
+    const span = m[1].trim();
+    // Long commands: keep their most specific word (a flag, path or identifier).
+    if (/\s/.test(span)) {
+      for (const w of span.split(/\s+/)) if (/[./_-]/.test(w) && w.length >= 7 && !/^<.*>$/.test(w)) push(w.replace(/^["']|["']$/g, ''));
+    } else {
+      push(span);
+    }
+  }
+  for (const m of s.matchAll(/(?:^|[\s(])((?:[\w.-]+[\\/])+[\w.-]+\.\w{1,6})(?![\w\\/])/g)) push(m[1]);
+  for (const m of s.matchAll(/\b([A-Z][A-Za-z0-9]+\.[A-Z][A-Za-z0-9]+(?:\.[A-Z][A-Za-z0-9]+)*)\b/g)) push(m[1]);
+  for (const m of s.matchAll(/\b([A-Z][A-Z0-9]+(?:_[A-Z0-9]+){1,})\b/g)) push(m[1]);
+  for (const m of s.matchAll(/\b([a-z]+[A-Z][A-Za-z0-9]{3,})\b/g)) push(m[1]);
+  for (const m of s.matchAll(/\b([A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+){2,})\b/g)) push(m[1]);
+  for (const m of s.matchAll(/(?:^|\s)(--[a-z][a-z0-9-]{4,})/g)) push(m[1]);
+  return found.slice(0, MAX_IDENTIFIERS);
+}
+
+/**
+ * Look the identifiers up in the project's git repos (tracked files, respecting
+ * .gitignore). Returns [{ id, hits: [{ file, line, text }], exists }]; a path that is
+ * found nowhere is reported too, since that is evidence against the claim.
+ */
+export function groundIdentifiers(ids, cwd) {
+  const out = ids.map((id) => ({ id, hits: [], exists: false }));
+  if (!ids.length || !cwd) return out;
+  const roots = projectRoots(cwd).filter((r) => fs.existsSync(path.join(r, '.git')));
+  for (const root of roots) {
+    const pending = out.filter((o) => o.hits.length < HITS_PER_IDENTIFIER);
+    if (!pending.length) break;
+    for (const o of pending) {
+      if (/[\\/]/.test(o.id) && !path.isAbsolute(o.id) && isFile(path.join(root, o.id))) o.exists = true;
+    }
+    const args = ['-C', root, 'grep', '-n', '-I', '-F', '--max-count=2', ...pending.flatMap((o) => ['-e', o.id]), '--', '.', ':!*.lock', ':!*lock.json', ':!*lock.yaml', ':!*.min.*', ':!*.md'];
+    const r = spawnSync('git', args, { encoding: 'utf8', timeout: GREP_TIMEOUT_MS, windowsHide: true, maxBuffer: 4 * 1024 * 1024 });
+    if (r.status !== 0 || !r.stdout) continue;
+    for (const line of r.stdout.split(/\r?\n/)) {
+      const m = /^([^:]+):(\d+):(.*)$/.exec(line);
+      if (!m) continue;
+      for (const o of pending) {
+        if (o.hits.length >= HITS_PER_IDENTIFIER || !m[3].includes(o.id)) continue;
+        o.exists = true;
+        o.hits.push({ file: path.join(root, m[1]), line: Number(m[2]), text: m[3].trim().slice(0, 220) });
+      }
+    }
+  }
+  return out;
 }

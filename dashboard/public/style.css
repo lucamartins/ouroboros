@@ -224,3 +224,17 @@ td .desc { color: var(--text-2); font-size: 12px; max-width: 60ch; }
 .warn-text { color: var(--text); border-left: 2px solid var(--warning); padding-left: 8px; }
 details.dropped summary { cursor: pointer; color: var(--text-2); }
 details.dropped .row { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+
+/* Changes to a file (changesets): the diff of each edit and the learnings behind it. */
+.lcard .file { font-family: var(--mono); font-size: 12px; color: var(--text-2); overflow-wrap: anywhere; }
+.diff { font-family: var(--mono); font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere;
+  background: var(--page); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; margin: 0; }
+.diff .ctx { color: var(--text-2); }
+.diff ins { text-decoration: none; background: color-mix(in srgb, var(--good) 18%, transparent); border-radius: 2px; }
+.diff del { text-decoration: line-through; background: color-mix(in srgb, var(--critical) 16%, transparent); border-radius: 2px; }
+.claims { margin: 0; padding-left: 18px; display: grid; gap: 6px; }
+.claims li { font-size: 13px; }
+.claims .row { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+.lcard.wide { grid-column: 1 / -1; }
+.claims .row > span { flex: 1; min-width: 0; }
+.claims .row > button { flex-shrink: 0; }

@@ -211,7 +211,7 @@ Cost is measured from transcript `usage` between the request and the next `Stop`
 3. **Digest**: `transcript.mjs` reduces the tail to user turns, assistant text, tool names and errors; plus the `recovery` snippets recorded inside subagents (never full subagent transcripts; workflow agents are excluded entirely). Capped at ~20k tokens.
 4. **Inventory**: titles + descriptions of the existing memories/skills in scope (so the model picks `patch` over `create`).
 5. **Call**: `claude -p --safe-mode --model <reviewer_model> --output-format json --json-schema <schema> --tools "" --no-session-persistence --max-budget-usd 0.5 --system-prompt <short>`, `cwd` at `${CLAUDE_PLUGIN_DATA}/reviewer`, `OUROBOROS_REVIEWER=1`. Isolation is essential: a plain `claude -p` loads the user's whole environment (MCP servers, plugins, skills, CLAUDE.md) and a trivial call measured **US$ 0.78**; with `--safe-mode` and a custom system prompt the same call costs **US$ 0.0003**, and real session reviews cost US$ 0.002–0.008. `--safe-mode` also disables hooks, so the reviewer can't trigger the plugin; `--no-session-persistence` keeps its transcripts out of the user's projects.
-6. **Output**: `{corrections, items: [{kind: profile|memory|skill, block?, scope?, memory_type?, title, text?, description?, body?, confidence, evidence, repeats?}]}`, applied through the curator as `create` items (the reviewer sees only names and descriptions of what exists, not contents, so it never patches). A `duplicate` answer reinforces the existing learning (+0.1 confidence, max 0.9). `repeats` means "the user had to repeat something already saved" → *miss* metric (§9). Every item is recorded in `candidates` with its curator `outcome`.
+6. **Output**: `{corrections, items: [{kind: profile|memory|skill, block?, scope?, memory_type?, title, text?, description?, body?, confidence, evidence, repeats?}]}`. Every item is recorded in `candidates` and goes through the **learning evaluation** (§7.0) before anything is written or queued; the reviewer sees only names and descriptions of what exists, so it never writes edits itself. A `duplicate` reinforces the existing learning (+0.1 confidence, max 0.9). `repeats` means "the user had to repeat something already saved" → *miss* metric (§9). If the evaluation fails (model error, budget), nothing is written: the items wait in the queue and the next queue check evaluates them.
 7. **Notices**: created items become a notice; the next `SessionStart` shows it to the user (`systemMessage`) and tells Claude (context), then marks it delivered.
 8. **Cost**: `total_cost_usd` and tokens from the result go to `reviews`. If the month's total ≥ `monthly_budget_usd`, the worker doesn't run. Measured end to end: a 23-turn session tail produced 3 corrections and 4 well-formed memories for US$ 0.008.
 
@@ -254,7 +254,7 @@ Curator steps (`curator.mjs`, deterministic):
 
 ### 7.00 The learning rubric
 
-A healthy self-learning loop needs one, explicit definition of "worth remembering", applied the same way by every path that writes, for every user and project. It lives in `scripts/rubric.mjs` and is injected verbatim into the end-of-session reviewer, the knowledge check, and the `learn` skill (`test/rubric.test.mjs` fails if the skill drifts); the session protocol carries a one-line version. The eight rules:
+A healthy self-learning loop needs one, explicit definition of "worth remembering", applied the same way by every path that writes, for every user and project. It lives in `scripts/rubric.mjs` and is injected verbatim into the end-of-session reviewer, the knowledge check, and the `learn` skill (`test/rubric.test.mjs` fails if the skill drifts); the session protocol carries a one-line version. The nine rules:
 
 1. **Behavior change** — would the assistant act differently next time without it? (drop default behavior, generic practice, preferences already configured, alternatives to guidance that already handles the case)
 2. **Standing** — a rule the user stated as lasting, repeated, or a recorded decision; not a one-time request.
@@ -263,27 +263,37 @@ A healthy self-learning loop needs one, explicit definition of "worth rememberin
 5. **Durable** — no status, to-dos, counts, timings, issue numbers, finished work.
 6. **Owner** — add to the skill/rule/doc that owns the topic, else a project memory, else a global fact; never a second copy.
 7. **Correct the stale** — ground truth or an explicit change of rule fixes the outdated text; a one-off request never overturns a standing rule.
-8. **Trusted, no secrets.**
+8. **Fix at the source** — a workaround for a fixable defect (a generated file not ignored, a broken script, a missing config line) becomes a suggested fix for the user, not knowledge.
+9. **Trusted, no secrets.**
 
 These came from reviewing real proposals by hand, item by item, and turning every judgment into a rule. The rubric is project-agnostic; everything user- or project-specific comes from the indexed knowledge.
 
-### 7.0 Knowledge check (triage)
+### 7.0 Learning evaluation
 
-Lesson from the first learning backfill (60 proposals from 30 past sessions): about a third were already documented in the owner's skills, repo CLAUDE.md files or `.claude/rules`, several were the same lesson in two languages or two kinds, and a few were one-off instructions or finished work. The reviewer had only seen *names and descriptions* of memories and personal skills — never skill bodies, CLAUDE.md or rules.
+Every proposal from a Claude-less path (end-of-session reviewer, learning backfill, approval queue) is evaluated before it is written or queued (`scripts/evaluate.mjs`). A learning is written only when two independent judgments agree: the **screen** and the **editor**.
 
-So every proposal from Claude-less paths (end-of-session reviewer, learning backfill, approval queue) now goes through `scripts/triage.mjs` before it is written or queued:
+**Why it is built this way.** The first learning backfill (60 proposals from 30 past sessions) and two rounds of hand review showed where single-pass judgment fails: a third of the proposals were already documented; the same fact arrived in two languages, or aimed at two different owners; one-off requests looked like rules; and, most of all, a proposal judged from *excerpts* of a file can repeat what the rest of the file already says, contradict another line of it, or contradict the code. Each proposal was also resolved alone, so two learnings could make conflicting edits to the same file, and an edit computed on one day was applied blindly days later.
 
-1. `scripts/knowledge.mjs` indexes what Claude already knows for the project: global and project CLAUDE.md, `.claude/rules/*.md`, project and personal skill bodies, memories and the profile — for the session's directory and its direct child repos (worktrees skipped). Markdown is chunked by heading/paragraph and searched with BM25 (no dependencies; ~400 chunks index in ~15 ms).
-2. One isolated call per batch of 12 proposals (`TRIAGE_SCHEMA`) sees each proposal with its top excerpts and the titles of all other proposals, and answers per proposal: **keep** (with a rewrite: right kind, human title, target language, no stale details), **drop** (covered / one-off / stale / derivable / low value, with the file that covers it), **merge** into another proposal, or **patch** an existing skill/memory/profile file (exact `old` fragment, verified before use; otherwise kept as new). Contradictions with existing knowledge are kept and flagged for the owner.
-3. A final pass over everything kept (`DEDUPE_SCHEMA`) merges duplicates that landed in different batches.
+**Stages:**
 
-Since the rubric, triage also gets: the **owners map** (every skill and rule file with its description and sections) so a learning goes to its owner even without shared words, with **append-to-section** patches that need no exact fragment; **sources of truth** (CI workflows, package manifests, deploy config) to verify claims; **past rejections** (proposals the user rejected or undid) so they are not proposed again; a **correct** verdict that fixes outdated knowledge. Changes to rule files and CLAUDE.md, and all corrections, always wait for approval. Extra clones and leftover copies of a repo are excluded from the index (they carry stale docs).
+1. **Screen** (`scripts/triage.mjs`, one isolated call per 12 proposals). Inputs: the rubric; BM25 excerpts of what Claude already knows (`scripts/knowledge.mjs`: global and project CLAUDE.md, `.claude/rules`, skill bodies **and their reference files**, memories, profile); sources of truth (CI workflows, manifests, deploy config); past rejections; and the **owners map** (every skill and rule file with description, sections and reference files). Verdicts: `drop` (with a rubric reason), `merge`, `keep` (new item, rewritten), `route` (the topic has an owner file: return the owner and the knowledge as one self-contained *claim*; the screen never writes edits), `fix` (a fixable defect: becomes a **suggested fix**, nothing is learned). Any verdict can flag a **stale owner** a source of truth contradicts, which becomes a correction claim for that file. A final pass merges duplicates across batches *by fact, not by target*, so the same fact sent to two owners is kept once.
+2. **Ground** (no model). Identifiers the claims name — code spans, paths, dotted names, CONSTANTS, camelCase, `--flags` — are looked up with `git grep` in the tracked code and config of the project's repos (markdown excluded). "Not found" is evidence too.
+3. **Edit** (one isolated call per owner file). The editor reads the **whole file** (outline plus related blocks, verbatim, when it is over 40k chars), **every learning pending for that file** (the new ones and those already waiting in a changeset) and the grounding. Per claim: `covered`, `contradicted` (by the project), `adds`, `corrects` (the file is wrong; backed by evidence or the user), `conflict` (with another claim or the file, unsettled). Then **one coherent set of edits**: exact `old` fragments copied from the file, replaced by `new`; additions anchored after the line where they belong, in the file's style and language; only `corrects` edits may remove text; text elsewhere in the file that says the opposite must be fixed in the same set. Disagreements are settled by project evidence, then recency.
+4. **Validate** (`scripts/changesets.mjs`, code, never the model). Each edit applies only if its fragment occurs exactly once, it does not remove text unless a correcting learning backs it (≤ 800 chars), it leaves the frontmatter and headings intact and adds no secret; the whole set grows the file by at most 6,000 chars; an edit that no `adds`/`corrects` learning justifies is dropped. Learnings whose edits all fail are dropped with the reason.
 
-On the same 60 real proposals: 60 → 26 (7 new memories, 19 additions to the skills and rules that own the topic), US$ 0.06 per full pass. Known gap: when a proposal is dropped because a source of truth covers it, a stale owner elsewhere is not always corrected in the same pass.
+**Changesets.** The result is at most one pending **changeset per file**: the validated edits, the learnings they implement, and the hash of the text they were composed against. A new learning for that file recomposes the changeset with everything pending, so changes never conflict. Approval (dashboard, `approve`) re-applies the edits to the *current* file: if the file changed but the fragments still fit, the change lands on top of the newer version; otherwise the changeset goes **stale** and the next queue check composes it again. Rejecting one learning of a multi-learning changeset recomposes the rest without it. Applying goes through the curator's ledger, so `undo` works as for any write. New items (`keep`) still go through the curator's create path (dedupe, budgets, routing); a create that turns out to duplicate an existing memory or skill becomes a claim for that file, so the editor folds in only what is new.
 
-Dropped and merged items stay visible in the dashboard with their reason and can be restored. Measured on the real queue: 60 → 39 (20 dropped, 1 merged, 8 turned into skill updates), about US$ 0.02–0.04 per pass. The in-session `learn` skill gets the same rule as an instruction: search the full text of CLAUDE.md, rules and skills before saving, and patch the skill that owns a procedure.
+**Patches Claude writes in session** (the `learn` skill, which reads the files itself) skip the screen and editor; when they need approval they join the file's pending changeset if the edits still apply together.
 
-Learnings are written in `learning_language` (`en` by default, `pt-BR` or `auto`), so files on disk follow one language regardless of the conversation's.
+**Why the model writes the edits but code applies them.** A model rewriting whole files would silently lose content, drift in style and, edit after edit, degrade the text. A model is still the right author for *where* and *how* a fact belongs in a document, and for noticing that a line elsewhere now contradicts it. Exact-fragment edits keep both: the model decides and writes, the code guarantees what can change, the user sees a diff, and the ledger undoes it.
+
+**Approval rules** (unchanged): corrections, and any change to `.claude/rules` or CLAUDE.md, always wait for the user, whatever the autonomy.
+
+**Measured** on the same 60 real proposals: 26 dropped, 1 merged, 4 suggested fixes, 6 new items and 10 changesets (17 learnings) waiting, among them 1 correction and 3 conflicts detected and left out; US$ 0.09 per full pass. By hand review, about 4 of the ~23 survivors are debatable (v0.6: about 10 of 26). Known gap: a stale line elsewhere in an owner that no claim names is not noticed (e.g. a skill saying a page has no route guard after one was added); a periodic audit of owners against sources of truth is the next step.
+
+**Measuring it.** `node scripts/eval.mjs --synthetic` runs the evaluation with the real model on a fake project with known right answers (`test/eval/synthetic.json`: covered, contradicted by code, stale owner, duplicates across owners, one-off, skill reference owner, fix at source, conflict pair, derivable, new memory) and prints a score (11/11, about US$ 0.01 per run). `--replay` re-evaluates the proposals the user approved or rejected, on a copy of the database, and reports agreement. Run both after changing the rubric or a prompt.
+
+Dropped, merged and suggested items stay visible in the dashboard with their reason and can be restored. Learnings are written in `learning_language` (`en` by default, `pt-BR` or `auto`); edits to existing files follow that file's language.
 
 ### 7.1 Lifecycle
 
@@ -299,13 +309,13 @@ Archive = move to `~/.ouroboros/archive/` (out of context), never delete.
 How each transition happens (phase 4):
 
 - **Reinforcement**: the first read of a learned memory or use of a learned skill in a session adds +0.1 (hooks); a background review that rediscovers an existing item adds +0.1; **Confirm** in the dashboard adds +0.2. Cap 0.9.
-- **Merge on rediscovery**: when the background reviewer's item is a `duplicate` of a memory or skill file, a second small call (`MERGE_SCHEMA`) decides `skip` or a `patch` that folds the new detail in (max 3 per review).
+- **Merge on rediscovery**: when the background reviewer's item is a `duplicate` of a memory or skill file, it becomes a claim for that file and the editor (§7.0) folds in only what is new (usually nothing: `covered`).
 - **Promotion**: a `feedback`/`user` memory similar to one already saved in *another* project becomes a profile fact instead of a copy.
 - **Daily maintenance** (`review-worker.mjs --maintain`, started by `SessionStart` at most every 20 h, results shown as notices):
   - *decay* — archive Ouroboros memories/skills unused for `archiveAfterDaysUnused` days whose confidence is below 0.7 (profile facts are always in context, so they never decay; native items are never touched);
   - *consolidate the profile* — a block past `consolidateAt` is rewritten by one isolated call (`CONSOLIDATE_SCHEMA`: merged bullets with their source ids) down to 70% of its budget; one ledger batch, so `undo` restores the old block and reactivates the merged facts (measured: 6 facts → 3, US$ 0.001);
   - *trim* — memory indexes and learned skills past `consolidateAt` archive their weakest items (`confidence × log2(1 + uses)`) down to 70%.
-- **Autonomy** (`auto` | `hybrid` | `queue`): proposals from Claude (`actor: inloop`) or the reviewer (`background`) that need approval are stored as `queued` candidates with their full payload; explicit user requests (`actor: manual`) are always written. `hybrid` writes facts with confidence ≥ 0.7 and queues skills and tentative items. Approve/Reject in the dashboard runs the stored proposal through the curator.
+- **Autonomy** (`auto` | `hybrid` | `queue`): proposals from Claude (`actor: inloop`) or the reviewer (`background`) that need approval are stored as `queued` candidates with their full payload; explicit user requests (`actor: manual`) are always written. `hybrid` writes facts with confidence ≥ 0.7 and queues skills and tentative items. Changes to existing files wait as changesets (§7.0), shown as diffs. Approve/Reject in the dashboard runs the stored proposal through the curator, or applies/rejects the changeset.
 - **Exclusions**: hooks do nothing at all in projects matching `excludeProjects`.
 
 ## 8. Data model (`events.db`)
@@ -324,6 +334,12 @@ writes    (id, learning_id, ts, op, actor, session_id, diff)
 reviews   (id, session_id, mode, trigger, model, turns_reviewed, corrections, learned, patched,
            input_tokens, output_tokens, cache_tokens, cost_usd, ts)
           -- mode: inloop | background | measure | manual
+candidates (id, review_id, session_id, kind, title, summary, evidence, confidence, outcome, payload,
+            note, claim, target, changeset_id, triaged_at, decided_at, ...)
+          -- outcome: queued | created | patched | duplicate | dropped | merged | suggested
+          --          | dismissed | rejected_by_user | over_budget | error
+changesets (id, file, kind, base_hash, edits, corrects, status, note, cost_usd, created_at, decided_at, learning_id)
+          -- status: pending | applied | rejected | superseded | stale
 ```
 
 WAL + `busy_timeout` for concurrent sessions. Versioned migrations in `db.mjs`.
@@ -392,6 +408,8 @@ WAL + `busy_timeout` for concurrent sessions. Versioned migrations in `db.mjs`.
 | Skill destination | Automatic routing (global vs project, with a per-repo map) |
 | Repository | Private GitHub for now; every file in English |
 | Runtime | Node ≥ 22.13, zero dependencies |
+| Judging learnings | One rubric everywhere; screen + editor must both agree before anything is written |
+| Changes to existing files | One changeset per file, composed with every pending learning; the model writes exact-fragment edits, code validates and applies them; re-applied to the current file on approval |
 
 ## 13. Phases
 
@@ -401,3 +419,4 @@ WAL + `busy_timeout` for concurrent sessions. Versioned migrations in `db.mjs`.
 | **2. Manual learning** | `learn` skill, curator, ledger, `undo`/`forget`, `user.md` + protocol at `SessionStart` | `/ouroboros:learn` writes, dedupes, routes and undoes correctly |
 | **3. Self-learning** | Periodic in-loop review, background review of the tail, notices, Value and Cost screens | Correction rate drops vs baseline with cost under the cap |
 | **4. Lifecycle and distribution** | Confidence/decay, automatic consolidation, merge on rediscovery, promotion, autonomy queue, dashboard actions (confirm/undo/archive/approve/reject, token-protected), `excludeProjects`, CI (tests on Ubuntu + Windows, macOS on demand; `validate --strict`), README | Someone else installs it from scratch on Windows and macOS |
+| **v0.7 Evaluation** | Screen → ground → edit → validate; changesets per file with diffs in the dashboard; suggested fixes; skill reference files as owners; `eval.mjs` (synthetic + replay) | The same 60 real proposals give fewer, coherent changes, and the synthetic score holds |

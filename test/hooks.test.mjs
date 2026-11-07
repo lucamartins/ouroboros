@@ -118,18 +118,18 @@ test('SessionEnd runs a background review that writes learnings and leaves a not
   assert.equal(second.systemMessage, undefined);
 });
 
-test('a repeated finding is folded into the existing memory instead of duplicated', async () => {
+test('a repeated finding reinforces what was saved; the editor finds nothing new to add', async () => {
+  const d = db();
+  const before = d.prepare("SELECT confidence FROM learnings WHERE path LIKE '%use-pnpm.md'").get().confidence;
   hook('UserPromptSubmit', { session_id: 's6' });
   hook('SessionEnd', { session_id: 's6', reason: 'other' });
-  const d = db();
-  const rows = await waitFor(() => {
-    const r = d.prepare("SELECT kind, outcome FROM candidates WHERE session_id = 's6' ORDER BY id").all();
-    return r.length === 2 && r;
-  });
-  assert.deepEqual(rows.map((r) => r.outcome), ['patched', 'duplicate']);
+  await waitFor(() => d.prepare("SELECT queue_state FROM sessions WHERE id = 's6'").get()?.queue_state === 'done');
+  const rows = d.prepare("SELECT kind, outcome, note FROM candidates WHERE session_id = 's6' ORDER BY id").all();
+  assert.deepEqual(rows.map((r) => r.outcome), ['duplicate', 'duplicate']);
+  assert.match(rows[0].note, /covered \[editor\]/);
+  assert.ok(d.prepare("SELECT confidence FROM learnings WHERE path LIKE '%use-pnpm.md'").get().confidence > before);
+  assert.equal(d.prepare("SELECT COUNT(*) n FROM reviews WHERE session_id = 's6' AND trigger = 'editor'").get().n, 1);
   d.close();
-  const memory = fs.readFileSync(path.join(tmp, 'claude', 'projects', '-tmp-proj', 'memory', 'use-pnpm.md'), 'utf8');
-  assert.match(memory, /\(with lockfile v9\)/);
 });
 
 test('with learning off the end-of-session review only measures', async () => {

@@ -1,5 +1,5 @@
 // Stand-in for `claude -p` in tests: reads the prompt and returns a canned result
-// shaped by the requested JSON schema (measure, learn, merge or consolidate).
+// shaped by the requested JSON schema (measure, learn, screen, edit or consolidate).
 let prompt = '';
 process.stdin.on('data', (d) => (prompt += d));
 process.stdin.on('end', () => {
@@ -8,15 +8,40 @@ process.stdin.on('end', () => {
   const ok = args.includes('--safe-mode') && args.includes('--json-schema');
   const corrections = [{ user_turn: 2, quote: 'no, use pnpm', kind: 'explicit' }];
   let structured;
-  if (schema.includes('"verdicts"')) {
-    // Triage: DROPME -> covered, MERGEME -> merged into the first proposal, else keep.
+  if (schema.includes('"edits"')) {
+    // Editor: a claim whose first line is already in the file is covered; CONTRADICT ->
+    // contradicted; "FIX:<old>=><new>" -> corrects; anything else is added after the
+    // file's last line, all additions in one edit.
+    const file = /<file>\n([\s\S]*?)\n<\/file>/.exec(prompt)?.[1] || '';
+    const claims = [...prompt.matchAll(/<claim id="(\d+)"[^>]*>\n([\s\S]*?)\n<\/claim>/g)].map((m) => ({ id: Number(m[1]), text: m[2].split('\nevidence:')[0].trim() }));
+    const status = [];
+    const edits = [];
+    const adds = [];
+    for (const c of claims) {
+      const first = c.text.split('\n')[0].trim();
+      const fix = /FIX:(.+?)=>(.+)$/.exec(first);
+      if (fix) {
+        status.push({ id: c.id, status: 'corrects', reason: 'outdated' });
+        edits.push({ old: fix[1], new: fix[2], claims: [c.id] });
+      } else if (first.includes('CONTRADICT')) status.push({ id: c.id, status: 'contradicted', reason: 'the code says otherwise' });
+      else if (file.includes(first)) status.push({ id: c.id, status: 'covered', reason: 'already there' });
+      else { status.push({ id: c.id, status: 'adds', reason: 'new detail' }); adds.push(c); }
+    }
+    const last = file.split('\n').filter((l) => l.trim() && !l.startsWith('---')).pop();
+    if (adds.length && last) edits.push({ old: last, new: `${last}\n${adds.map((c) => c.text.split('\n')[0].trim()).join('\n')}`, claims: adds.map((c) => c.id) });
+    structured = { claims: status, edits };
+  } else if (schema.includes('"verdicts"')) {
+    // Screen: DROPME -> covered, MERGEME -> merged into the first proposal,
+    // ROUTEME:<file> -> routed to that owner, FIXME -> a fix suggestion, else keep.
     const props = [...prompt.matchAll(/<proposal id="(\d+)">([\s\S]*?)<\/proposal>/g)].map((m) => ({ id: Number(m[1]), text: m[2] }));
     structured = {
       verdicts: props.map((p) => (p.text.includes('DROPME')
         ? { id: p.id, verdict: 'drop', drop_kind: 'covered', reason: 'already documented', covered_by: 'CLAUDE.md' }
-        : p.text.includes('APPENDME:')
-          ? { id: p.id, verdict: 'patch', reason: 'owner exists', rule: 'owner', rewrite: { title: 'Deploy script' },
-              patch: { file: /APPENDME:(\S+)/.exec(p.text)[1], mode: 'append', section: 'Deploy', text: 'Use the deploy script.' } }
+        : p.text.includes('ROUTEME:')
+          ? { id: p.id, verdict: 'route', reason: 'owner exists', rule: 'owner', owner: /ROUTEME:(\S+)/.exec(p.text)[1],
+              claim: /CLAIM:(.+)/.exec(p.text)?.[1].trim() || 'Use the deploy script.' }
+        : p.text.includes('FIXME')
+          ? { id: p.id, verdict: 'fix', reason: 'fixable', rule: 'fix-at-source', fix: 'Add the generated file to .gitignore.' }
         : p.text.includes('MERGEME')
           ? { id: p.id, verdict: 'merge', merge_into: props[0].id, reason: 'same rule' }
           : { id: p.id, verdict: 'keep', reason: 'new' })),
@@ -32,11 +57,6 @@ process.stdin.on('end', () => {
         ...bullets.slice(2).map((b) => ({ text: b.text, sources: [b.id] })),
       ],
     };
-  } else if (schema.includes('"action"')) {
-    // Merge: append to the last body line of the note.
-    const note = /<note>\n([\s\S]*?)\n<\/note>/.exec(prompt)?.[1] || '';
-    const line = note.split('\n').filter((l) => l.trim() && !l.startsWith('---') && !l.includes(':')).pop();
-    structured = line ? { action: 'patch', old: line, new: `${line} (with lockfile v9)` } : { action: 'skip' };
   } else if (!schema.includes('"candidates"')) {
     structured = {
       corrections,
@@ -55,7 +75,7 @@ process.stdin.on('end', () => {
       }],
     };
   }
-  const valid = ok && (schema.includes('"bullets"') || schema.includes('"action"') || schema.includes('"verdicts"') || schema.includes('"groups"') || prompt.includes('<digest>'));
+  const valid = ok && (schema.includes('"bullets"') || schema.includes('"edits"') || schema.includes('"verdicts"') || schema.includes('"groups"') || prompt.includes('<digest>'));
   process.stdout.write(JSON.stringify({
     type: 'result',
     is_error: !valid,

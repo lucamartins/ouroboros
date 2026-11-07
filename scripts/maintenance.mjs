@@ -139,9 +139,11 @@ export async function maintain(db, { force = false, now = Date.now() } = {}) {
   const opts = options();
   const decayed = decay(db, settings, now);
   let tidied = null;
-  if (db.prepare("SELECT COUNT(*) n FROM candidates WHERE outcome = 'queued' AND triaged_at IS NULL").get().n && opts.monthlyBudgetUsd > monthSpend(db)) {
+  const waiting = db.prepare("SELECT COUNT(*) n FROM candidates WHERE outcome = 'queued' AND triaged_at IS NULL").get().n
+    + db.prepare("SELECT COUNT(*) n FROM changesets WHERE status = 'stale'").get().n;
+  if (waiting && opts.monthlyBudgetUsd > monthSpend(db)) {
     try {
-      const { tidyQueue } = await import('./triage.mjs');
+      const { tidyQueue } = await import('./evaluate.mjs');
       tidied = await tidyQueue(db);
     } catch (err) {
       logError(db, 'maintenance:triage', err);

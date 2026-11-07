@@ -10,28 +10,50 @@ import { fileURLToPath } from 'node:url';
 import { openDb } from '../scripts/db.mjs';
 import { dataDir } from '../scripts/paths.mjs';
 import { createApi } from './api.mjs';
+import { applyChangeset, rejectChangeset } from '../scripts/changesets.mjs';
 import { confirm, decideQueued, forget, undo } from '../scripts/curator.mjs';
+
+/** Approve or reject one queue entry: "cs:<id>" is a change to a file, a number one proposal. */
+function decide(db, key, approve) {
+  const m = /^cs:(\d+)$/.exec(String(key));
+  if (m) return approve ? applyChangeset(db, Number(m[1]), { actor: 'manual' }) : rejectChangeset(db, Number(m[1]));
+  return decideQueued(db, Number(key), approve);
+}
 
 /** Write actions available from the dashboard; all go through the curator (undoable). */
 async function runAction(db, action, id) {
   switch (action) {
     case 'triage_queue': {
-      const { tidyQueue } = await import('../scripts/triage.mjs');
+      const { tidyQueue } = await import('../scripts/evaluate.mjs');
       return { status: 'done', ...(await tidyQueue(db, { force: !!id })) };
     }
     case 'restore': {
-      const r = db.prepare("UPDATE candidates SET outcome = 'queued', decided_at = NULL, note = COALESCE(note, '') || ' (restored by you)' WHERE id = ? AND outcome IN ('dropped', 'merged')").run(Number(id));
+      const r = db.prepare(`
+        UPDATE candidates SET outcome = 'queued', decided_at = NULL, triaged_at = NULL, changeset_id = NULL, note = COALESCE(note, '') || ' (restored by you)'
+        WHERE id = ? AND outcome IN ('dropped', 'merged', 'suggested', 'duplicate')`).run(Number(id));
       return r.changes ? { status: 'restored' } : { status: 'not_found' };
+    }
+    case 'dismiss': {
+      const r = db.prepare("UPDATE candidates SET outcome = 'dismissed', decided_at = ? WHERE id = ? AND outcome = 'suggested'").run(Date.now(), Number(id));
+      return r.changes ? { status: 'dismissed' } : { status: 'not_found' };
     }
     case 'undo': return undo(db, { id });
     case 'forget': return forget(db, { match: id });
     case 'confirm': return confirm(db, id);
-    case 'approve': return decideQueued(db, Number(id), true);
-    case 'reject': return decideQueued(db, Number(id), false);
+    case 'approve': return decide(db, id, true);
+    case 'reject': {
+      const r = decide(db, id, false);
+      // Removing one learning from a change to a file: compose the rest again now.
+      if (r.recompose) {
+        const { tidyQueue } = await import('../scripts/evaluate.mjs');
+        await tidyQueue(db);
+      }
+      return r;
+    }
     case 'approve_many':
     case 'reject_many': {
-      const ids = Array.isArray(id) ? id.map(Number).filter(Number.isFinite).slice(0, 500) : [];
-      const results = ids.map((x) => decideQueued(db, x, action === 'approve_many'));
+      const keys = Array.isArray(id) ? id.map(String).filter((x) => /^(cs:)?\d+$/.test(x)).slice(0, 500) : [];
+      const results = keys.map((x) => decide(db, x, action === 'approve_many'));
       const count = (st) => results.filter((r) => r.status === st).length;
       return { status: 'done', total: results.length, saved: count('created') + count('patched'), rejected: count('rejected_by_user'), other: results.length - count('created') - count('patched') - count('rejected_by_user') };
     }
@@ -145,11 +167,17 @@ async function launch(args) {
 function listen(server, port, attempts = 10) {
   return new Promise((resolve, reject) => {
     const tryPort = (p, left) => {
-      server.once('error', (err) => {
+      // One listener pair per attempt: a failed attempt's "listening" callback must not
+      // resolve with its port when a later attempt succeeds.
+      const onListening = () => { server.off('error', onError); resolve(p); };
+      const onError = (err) => {
+        server.off('listening', onListening);
         if (err.code === 'EADDRINUSE' && left > 0) tryPort(p + 1, left - 1);
         else reject(err);
-      });
-      server.listen(p, '127.0.0.1', () => resolve(p));
+      };
+      server.once('error', onError);
+      server.once('listening', onListening);
+      server.listen(p, '127.0.0.1');
     };
     tryPort(port, attempts);
   });

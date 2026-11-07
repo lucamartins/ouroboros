@@ -12,6 +12,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { options } from './config.mjs';
+import { applyChangeset, claimsOf, queueEdit, rejectChangeset } from './changesets.mjs';
 import { getMeta, logError, openDb, setMetaOnce } from './db.mjs';
 import { listMemories, listSkills, parseFrontmatter } from './inventory.mjs';
 import { knowledgeKind, PATCHABLE } from './knowledge.mjs';
@@ -535,7 +536,11 @@ function patchItem(db, batch, item, settings, payload) {
   }
   if (after === before) return { status: 'rejected', reason: 'patch changes nothing (give "old"/"new" or "description")' };
   if (containsSecret(after) && !containsSecret(before)) return { status: 'rejected', reason: 'patch would add something that looks like a secret' };
+  return commitText(db, batch, t, after, item);
+}
 
+/** Write new content to a patchable file through the ledger and record it as a learning. */
+function commitText(db, batch, t, after, item) {
   const existing = learningForPath(db, t.file);
   const id = existing?.id || newId();
   batch.write(t.file, after, { learningId: id, op: 'patch' });
@@ -574,6 +579,32 @@ export function needsApproval(item, actor, autonomy) {
   return item.kind === 'skill' || item.confidence < 0.7;
 }
 
+/**
+ * Write a validated changeset result (the whole new text of one knowledge file) in
+ * its own transaction, through the ledger so it can be undone.
+ */
+export function writeText(db, { file, after, title, confidence = 0.6, trigger = 'session_end', actor = 'background', sessionId = null }) {
+  const kind = knowledgeKind(file);
+  if (!PATCHABLE.has(kind)) return { status: 'rejected', reason: 'only memory, skill, profile, rule and CLAUDE.md files can be changed' };
+  const before = readOrNull(file);
+  if (before === null) return { status: 'rejected', reason: `file not found: ${file}` };
+  if (after === before) return { status: 'rejected', reason: 'changes nothing' };
+  if (containsSecret(after) && !containsSecret(before)) return { status: 'rejected', reason: 'would add something that looks like a secret' };
+  const batch = new Batch(db, { actor, sessionId });
+  try {
+    db.exec('BEGIN IMMEDIATE');
+    const result = commitText(db, batch, { file, kind }, after, { title, confidence, trigger });
+    batch.commit();
+    db.exec('COMMIT');
+    return result;
+  } catch (err) {
+    try { db.exec('ROLLBACK'); } catch { /* not in a transaction */ }
+    batch.rollback();
+    logError(db, 'curator:writeText', err);
+    return { status: 'error', reason: String(err.message) };
+  }
+}
+
 /** Run one normalized item in its own transaction; a dry run undoes files and rows. */
 function runItem(db, item, settings, payload, actor, { dryRun = false } = {}) {
   const batch = new Batch(db, { actor, sessionId: payload.session_id });
@@ -602,11 +633,15 @@ function runItem(db, item, settings, payload, actor, { dryRun = false } = {}) {
 
 /**
  * Queue a proposal for approval. A similar proposal already waiting is replaced by
- * the newer one (newer sessions know better), keeping the higher confidence.
+ * the newer one (newer sessions know better), keeping the higher confidence. When the
+ * proposal already has a candidate row (`candidateId`, from the evaluation), that row
+ * becomes the queued one.
  */
-function enqueue(db, item, payload, actor) {
+function enqueue(db, rawItem, payload, actor) {
+  const { candidateId, ...item } = rawItem;
   const keyText = (i) => [i.title, i.description, i.text].filter(Boolean).join(' ');
-  const waiting = db.prepare("SELECT id, payload FROM candidates WHERE outcome = 'queued' AND kind = ?").all(item.kind).map((w) => {
+  const stored = JSON.stringify({ item: { ...item, projectDir: undefined, project_dir: item.projectDir }, cwd: payload.cwd, memory_dir: payload.memory_dir, trigger: payload.trigger, actor });
+  const waiting = db.prepare("SELECT id, payload FROM candidates WHERE outcome = 'queued' AND changeset_id IS NULL AND kind = ? AND id != ?").all(item.kind, candidateId ?? -1).map((w) => {
     let queuedItem = {};
     try { queuedItem = JSON.parse(w.payload || '{}').item || {}; } catch { /* ignore */ }
     return { id: w.id, op: queuedItem.op, text: keyText(queuedItem) };
@@ -617,19 +652,24 @@ function enqueue(db, item, payload, actor) {
       UPDATE candidates SET title = ?, summary = ?, evidence = ?, confidence = MAX(COALESCE(confidence, 0), ?), payload = ?, cwd = ?, session_id = ?, ts = ?
       WHERE id = ?`).run(
       String(item.title || item.text || '').slice(0, 200), String(item.text || item.body || item.description || '').slice(0, 1500),
-      String(item.evidence || '').slice(0, 800), item.confidence,
-      JSON.stringify({ item: { ...item, projectDir: undefined, project_dir: item.projectDir }, cwd: payload.cwd, memory_dir: payload.memory_dir, trigger: payload.trigger, actor }),
-      payload.cwd || null, payload.session_id || actor, Date.now(), dup.id);
+      String(item.evidence || '').slice(0, 800), item.confidence, stored, payload.cwd || null, payload.session_id || actor, Date.now(), dup.id);
+    if (candidateId) db.prepare("UPDATE candidates SET outcome = 'merged', note = ?, decided_at = ? WHERE id = ?").run(`merged into #${dup.id}: a similar proposal was already waiting`, Date.now(), candidateId);
     return { id: dup.id, replaced: true };
+  }
+  if (candidateId) {
+    db.prepare(`
+      UPDATE candidates SET kind = ?, scope = ?, memory_type = ?, title = ?, summary = ?, confidence = ?, outcome = 'queued', payload = ?, cwd = COALESCE(cwd, ?)
+      WHERE id = ?`).run(item.kind, item.scope, item.memory_type ?? null,
+      String(item.title || item.text || '').slice(0, 200), String(item.text || item.body || item.description || '').slice(0, 1500),
+      item.confidence, stored, payload.cwd || null, candidateId);
+    return { id: candidateId, replaced: false };
   }
   const r = db.prepare(`
     INSERT INTO candidates (review_id, session_id, project, kind, scope, memory_type, title, summary, evidence, confidence, outcome, payload, cwd, ts)
     VALUES (0, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
   `).run(payload.session_id || actor, projectKey(item.projectDir), item.kind, item.scope, item.memory_type ?? null,
     String(item.title || item.text || item.target || '').slice(0, 200), String(item.text || item.body || item.new || item.description || '').slice(0, 1500),
-    String(item.evidence || '').slice(0, 800), item.confidence,
-    JSON.stringify({ item: { ...item, projectDir: undefined, project_dir: item.projectDir }, cwd: payload.cwd, memory_dir: payload.memory_dir, trigger: payload.trigger, actor }),
-    payload.cwd || null, Date.now());
+    String(item.evidence || '').slice(0, 800), item.confidence, stored, payload.cwd || null, Date.now());
   return { id: Number(r.lastInsertRowid), replaced: false };
 }
 
@@ -651,6 +691,12 @@ export function apply(db, payload, { actor = 'manual', autonomy = 'auto' } = {})
       const pre = runItem(db, item, settings, payload || {}, actor, { dryRun: true });
       if (pre.status !== 'created' && pre.status !== 'patched') {
         results.push({ title: item.title, ...pre });
+        continue;
+      }
+      if (item.op === 'patch' && !item.description && path.isAbsolute(String(item.target || '')) && item.kind !== 'profile') {
+        // A change to an existing file joins that file's pending changeset.
+        const q = queueEdit(db, item, payload || {}, actor);
+        results.push({ status: 'queued', title: item.title || path.basename(item.target), candidateId: q.id, changesetId: q.changesetId, reason: `waiting for approval in the dashboard (autonomy: ${autonomy})` });
         continue;
       }
       const q = enqueue(db, item, payload || {}, actor);
@@ -716,6 +762,16 @@ export function rewriteProfileBlock(db, block, bullets, { actor = 'background' }
 export function decideQueued(db, candidateId, approve) {
   const c = db.prepare("SELECT * FROM candidates WHERE id = ? AND outcome = 'queued'").get(candidateId);
   if (!c) return { status: 'not_found', reason: 'no queued proposal with that id' };
+  if (c.changeset_id) {
+    // Part of a change to a file: approving approves the whole change; rejecting removes
+    // this learning, and the rest of the change is composed again without it.
+    if (approve) return applyChangeset(db, c.changeset_id, { actor: 'manual' });
+    db.prepare("UPDATE candidates SET outcome = 'rejected_by_user', decided_at = ? WHERE id = ?").run(Date.now(), candidateId);
+    const left = claimsOf(db, c.changeset_id).length;
+    if (!left) rejectChangeset(db, c.changeset_id);
+    else db.prepare("UPDATE changesets SET status = 'stale', note = ? WHERE id = ? AND status = 'pending'").run('a learning was removed; composing again', c.changeset_id);
+    return { status: 'rejected_by_user', title: c.title, recompose: left > 0 };
+  }
   if (!approve) {
     db.prepare("UPDATE candidates SET outcome = 'rejected_by_user', decided_at = ? WHERE id = ?").run(Date.now(), candidateId);
     return { status: 'rejected_by_user', title: c.title };

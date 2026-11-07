@@ -192,6 +192,30 @@ const MIGRATIONS = [
   ALTER TABLE candidates ADD COLUMN note TEXT;
   ALTER TABLE candidates ADD COLUMN triaged_at INTEGER;
   `,
+  // 6 — v0.7: changes are composed per file (changesets) and grounded in the project
+  `
+  CREATE TABLE changesets (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    file        TEXT NOT NULL,                     -- the one knowledge file it changes
+    kind        TEXT NOT NULL,                     -- memory | skill | profile | rules | instructions
+    cwd         TEXT,
+    project     TEXT,
+    base_hash   TEXT NOT NULL,                     -- the file's content it was composed against
+    edits       TEXT NOT NULL,                     -- JSON [{ old, new | append, section, claims, why, corrects }]
+    corrects    INTEGER NOT NULL DEFAULT 0,
+    status      TEXT NOT NULL,                     -- pending | applied | rejected | superseded | stale
+    note        TEXT,
+    cost_usd    REAL NOT NULL DEFAULT 0,
+    created_at  INTEGER NOT NULL,
+    decided_at  INTEGER,
+    learning_id TEXT
+  );
+  CREATE INDEX changesets_status ON changesets(status);
+  ALTER TABLE candidates ADD COLUMN changeset_id INTEGER;
+  ALTER TABLE candidates ADD COLUMN claim TEXT;      -- what the learning says, as one statement for the editor
+  ALTER TABLE candidates ADD COLUMN target TEXT;     -- the knowledge file that owns it
+  CREATE INDEX candidates_changeset ON candidates(changeset_id);
+  `,
 ];
 
 export function openDb(explicitDir) {

@@ -1,6 +1,7 @@
 // Read-only JSON API for the dashboard.
 import fs from 'node:fs';
 import path from 'node:path';
+import { changesetView } from '../scripts/changesets.mjs';
 import { getMeta, monthSpend, monthStart } from '../scripts/db.mjs';
 import { blockChars, parseProfile, readProfileText } from '../scripts/profile.mjs';
 import { loadSettings } from '../scripts/settings.mjs';
@@ -195,18 +196,29 @@ export function createApi(db) {
     },
 
     queue() {
-      return db.prepare(`
+      // Two kinds of entries: new items (memories, skills, profile facts) and changes to
+      // an existing file (changesets, each with the learnings it implements).
+      const items = db.prepare(`
         SELECT c.id, c.kind, c.scope, c.memory_type, c.title, c.summary, c.evidence, c.confidence, c.ts, c.cwd, c.project, c.payload, c.note, c.triaged_at,
                s.started_at session_started_at
         FROM candidates c LEFT JOIN sessions s ON s.id = c.session_id
-        WHERE c.outcome = 'queued'
-        -- Natural order: by when the originating session happened, oldest first.
+        WHERE c.outcome = 'queued' AND c.changeset_id IS NULL
         ORDER BY COALESCE(s.started_at, c.ts), c.id LIMIT 500`).all().map((r) => {
         let item = {};
         try { item = JSON.parse(r.payload || '{}').item || {}; } catch { /* ignore */ }
         const { payload, ...rest } = r;
-        return { ...rest, op: item.op || 'create', target: item.target || null, block: item.block || null, description: item.description || null };
+        return { ...rest, key: String(r.id), type: 'item', op: item.op || 'create', target: item.target || null, block: item.block || null, description: item.description || null };
       });
+      const changes = db.prepare("SELECT * FROM changesets WHERE status IN ('pending', 'stale') ORDER BY id").all().map((cs) => changesetView(db, cs));
+      // Natural order: by when the originating session happened, oldest first.
+      return [...items, ...changes].sort((a, b) => (a.session_started_at || a.ts || a.created_at || 0) - (b.session_started_at || b.ts || b.created_at || 0));
+    },
+
+    suggestions() {
+      return db.prepare(`
+        SELECT c.id, c.title, c.summary, c.note, c.cwd, c.project, s.started_at session_started_at
+        FROM candidates c LEFT JOIN sessions s ON s.id = c.session_id
+        WHERE c.outcome = 'suggested' ORDER BY COALESCE(s.started_at, c.ts) DESC, c.id LIMIT 100`).all();
     },
 
     dropped() {
@@ -280,6 +292,9 @@ export function createApi(db) {
         dropped: count('dropped'),
         merged: count('merged'),
         rejectedByUser: count('rejected_by_user'),
+        suggested: count('suggested') + count('dismissed'),
+        duplicates: count('duplicate'),
+        changes: db.prepare("SELECT status, COUNT(*) n FROM changesets WHERE created_at >= ? GROUP BY status").all(since),
         dropReasons,
         approvalRate: decided.length ? approved / decided.length : null,
         undoRate: writes.n ? writes.undone / writes.n : null,

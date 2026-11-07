@@ -10,7 +10,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { options } from './config.mjs';
-import { apply } from './curator.mjs';
 import { rubricText } from './rubric.mjs';
 import { isExcluded } from './hook.mjs';
 import { logError, monthSpend, openDb } from './db.mjs';
@@ -165,6 +164,20 @@ function claudeCommand() {
   return ['claude'];
 }
 
+/**
+ * Environment of the reviewer call. The eval tool points CLAUDE_CONFIG_DIR at a fake
+ * home for the knowledge files but keeps the real one (its login) for the model call.
+ */
+function reviewerEnv() {
+  const env = { ...process.env, OUROBOROS_REVIEWER: '1' };
+  const real = process.env.OUROBOROS_REVIEWER_CONFIG_DIR;
+  if (real !== undefined) {
+    if (real) env.CLAUDE_CONFIG_DIR = real;
+    else delete env.CLAUDE_CONFIG_DIR;
+  }
+  return env;
+}
+
 /** One isolated, tool-less, hook-less model call with structured output. */
 export function runModel({ prompt, schema, model }) {
   const [cmd, ...pre] = claudeCommand();
@@ -186,7 +199,7 @@ export function runModel({ prompt, schema, model }) {
     const child = spawn(cmd, args, {
       cwd,
       windowsHide: true,
-      env: { ...process.env, OUROBOROS_REVIEWER: '1' },
+      env: reviewerEnv(),
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let out = '';
@@ -212,7 +225,7 @@ export function runModel({ prompt, schema, model }) {
   });
 }
 
-function usageOf(result) {
+export function usageOf(result) {
   const u = result?.usage || {};
   return {
     input: u.input_tokens || 0,
@@ -223,7 +236,7 @@ function usageOf(result) {
   };
 }
 
-function insertReview(db, row) {
+export function insertReview(db, row) {
   const r = db.prepare(`
     INSERT INTO reviews (session_id, mode, trigger, model, status, detail, turns_reviewed, corrections,
       input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, duration_ms, session_started_at, ts)
@@ -245,133 +258,49 @@ function finish(db, sessionId, state, cursor) {
   `).run(state, Date.now(), cursor ?? null, Date.now(), sessionId);
 }
 
-export const MERGE_SCHEMA = {
-  type: 'object',
-  additionalProperties: false,
-  required: ['action'],
-  properties: {
-    action: { type: 'string', enum: ['skip', 'patch'] },
-    old: { type: 'string' },
-    new: { type: 'string' },
-  },
-};
-
-export function mergePrompt({ existing, proposal }) {
-  return `An existing saved note and a new finding cover the same topic. Decide whether the finding adds information worth keeping.
-
-- "skip" if the note already says it (or the finding is weaker).
-- "patch" to fold the new information in: "old" must be an exact, unique fragment copied from the note (a sentence or a line), and "new" its replacement that keeps what was there and adds the new information. Keep the note's language, format and length roughly the same.
-
-Existing note:
-<note>
-${existing}
-</note>
-
-New finding:
-<finding>
-${proposal}
-</finding>`;
-}
-
-const MAX_MERGES_PER_REVIEW = 3;
-
-/** Fold new information into an existing memory or skill the reviewer duplicated. */
-async function mergeDuplicate(db, session, item, target, opts) {
-  const existing = target && fs.existsSync(target) ? fs.readFileSync(target, 'utf8') : null;
-  if (!existing || !/\.md$/i.test(target)) return { status: 'skipped' };
-  const result = await runModel({
-    prompt: mergePrompt({ existing: existing.slice(0, 12_000), proposal: [item.title, item.description, item.body || item.text].filter(Boolean).join('\n') }),
-    schema: MERGE_SCHEMA,
-    model: opts.reviewerModel,
-  });
-  const usage = usageOf(result);
-  insertReview(db, { sessionId: session.id, mode: 'background', trigger: 'merge', model: opts.reviewerModel, status: 'ok', usage, sessionStartedAt: session.started_at });
-  const out = result.structured_output;
-  if (out.action !== 'patch' || !out.old || out.new === undefined) return { status: 'skipped' };
-  const [r] = apply(db, { cwd: session.cwd, session_id: session.id, trigger: 'session_end', items: [{ op: 'patch', kind: item.kind, target, old: out.old, new: out.new, confidence: item.confidence, title: item.title }] },
-    { actor: 'background', autonomy: opts.autonomy });
-  return r;
-}
-
-/** Write learn-mode proposals through the curator and record their outcome. */
+/**
+ * Record learn-mode proposals and run them through the learning evaluation
+ * (evaluate.mjs): screen, ground, compose per file, validate, write or queue.
+ */
 async function applyLearnings(db, session, reviewId, out, opts, { notices = true } = {}) {
-  // Check the reviewer's items against what is already known, and against each other.
-  const ts0 = Date.now();
-  let items = out.items.map((i, idx) => ({ id: idx + 1, op: 'create', ...i, scope: i.kind === 'profile' ? 'global' : i.scope || 'project' }));
-  if (items.length) {
-    try {
-      const { triage, resolveVerdict } = await import('./triage.mjs');
-      const { verdicts, cost } = await triage(items, { cwd: session.cwd, db, lang: opts.learningLanguage, model: opts.reviewerModel });
-      insertReview(db, { sessionId: session.id, mode: 'background', trigger: 'triage', model: opts.reviewerModel, status: 'ok', usage: { cost }, sessionStartedAt: session.started_at });
-      const next = [];
-      for (const item of items) {
-        const { outcome, item: resolved, note } = resolveVerdict(item, verdicts.get(item.id));
-        if (outcome !== 'dropped' && outcome !== 'merged') {
-          next.push({ ...resolved, id: item.id, triageNote: note || undefined });
-          continue;
-        }
-        db.prepare(`
-          INSERT INTO candidates (review_id, session_id, project, kind, scope, memory_type, title, summary, evidence, confidence, repeats, outcome, note, cwd, triaged_at, ts)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(reviewId, session.id, session.project, item.kind, item.scope, item.memory_type ?? null,
-          String(item.title || item.text || '').slice(0, 200), String(item.text || item.body || item.description || '').slice(0, 1500),
-          String(item.evidence || '').slice(0, 800), item.confidence, item.repeats || null, outcome, note, session.cwd, ts0, ts0);
-      }
-      items = next;
-    } catch (err) {
-      logError(db, 'review-worker:triage', err);
-    }
-  }
-  out = { ...out, items };
-  const payload = {
-    cwd: session.cwd,
-    session_id: session.id,
-    trigger: 'session_end',
-    items,
-  };
-  const results = apply(db, payload, { actor: 'background', autonomy: opts.autonomy });
   const ts = Date.now();
-  let learned = 0;
-  let patched = 0;
-  let merges = 0;
-  for (let idx = 0; idx < results.length; idx++) {
-    let r = results[idx];
-    const item = out.items[idx];
-    if (r.status === 'duplicate' && r.target) {
-      // Seeing the same thing again reinforces what was already learned...
-      db.prepare("UPDATE learnings SET confidence = MIN(0.9, COALESCE(confidence, 0.5) + 0.1), updated_at = ? WHERE status = 'active' AND (lower(path) = lower(?) OR id = ?)")
-        .run(ts, r.target, r.target);
-      // ...and new details are folded into the existing note.
-      if (merges < MAX_MERGES_PER_REVIEW && item.kind !== 'profile') {
-        merges++;
-        try {
-          const m = await mergeDuplicate(db, session, item, r.target, opts);
-          if (m.status === 'patched' || m.status === 'queued') r = { ...m, title: item.title, mergedInto: r.target };
-        } catch (err) {
-          logError(db, 'review-worker:merge', err);
-        }
-      }
-    }
-    if (r.status === 'created') learned++;
-    if (r.status === 'patched') patched++;
-    results[idx] = r;
-    if (r.status === 'queued' && r.candidateId) {
-      db.prepare('UPDATE candidates SET review_id = ?, repeats = ?, triaged_at = ?, note = COALESCE(?, note) WHERE id = ?').run(reviewId, item.repeats || null, ts, item.triageNote || null, r.candidateId);
-      continue;
-    }
-    db.prepare(`
-      INSERT INTO candidates (review_id, session_id, project, kind, scope, memory_type, title, summary, evidence, confidence, repeats, outcome, learning_id, cwd, ts)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(reviewId, session.id, session.project, item.kind, item.kind === 'profile' ? 'global' : item.scope || 'project',
-      item.memory_type ?? null, String(item.title).slice(0, 200), String(item.text || item.body || item.description || '').slice(0, 1500),
-      String(item.evidence || '').slice(0, 800), item.confidence, item.repeats || null, r.status, r.id || null, session.cwd, ts);
+  const insert = db.prepare(`
+    INSERT INTO candidates (review_id, session_id, project, kind, scope, memory_type, title, summary, evidence, confidence, repeats, outcome, payload, cwd, ts)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`);
+  const ids = [];
+  for (const raw of out.items) {
+    const item = { op: 'create', ...raw, scope: raw.kind === 'profile' ? 'global' : raw.scope || 'project' };
+    const r = insert.run(reviewId, session.id, session.project, item.kind, item.scope, item.memory_type ?? null,
+      String(item.title || item.text || '').slice(0, 200), String(item.text || item.body || item.description || '').slice(0, 1500),
+      String(item.evidence || '').slice(0, 800), item.confidence ?? null, item.repeats || null,
+      JSON.stringify({ item, cwd: session.cwd, trigger: 'session_end', actor: 'background' }), session.cwd, ts);
+    ids.push(Number(r.lastInsertRowid));
   }
+  if (!ids.length) return [];
+  const rows = db.prepare(`
+    SELECT c.*, s.started_at session_started_at FROM candidates c LEFT JOIN sessions s ON s.id = c.session_id
+    WHERE c.id IN (${ids.map(() => '?').join(',')}) ORDER BY c.id`).all(...ids);
+  const { evaluate } = await import('./evaluate.mjs');
+  let report = { results: [], created: 0, patched: 0 };
+  try {
+    report = await evaluate(db, rows, {
+      cwd: session.cwd, sessionId: session.id, sessionStartedAt: session.started_at, actor: 'background',
+      autonomy: opts.autonomy, lang: opts.learningLanguage, model: opts.reviewerModel, payload: { trigger: 'session_end' },
+    });
+  } catch (err) {
+    // Without the knowledge check nothing is written on its own: the proposals wait
+    // in the queue, and the next queue check evaluates them.
+    logError(db, 'review-worker:evaluate', err);
+  }
+  db.prepare(`UPDATE candidates SET outcome = 'queued', triaged_at = NULL WHERE outcome = 'pending' AND id IN (${ids.map(() => '?').join(',')})`).run(...ids);
+  const results = report.results || [];
   const lines = [
     ...results.filter((r) => r.status === 'created').map((r) => `📝 learned: ${r.title}`),
     ...results.filter((r) => r.status === 'patched').map((r) => `📝 updated: ${r.title}`),
     ...results.filter((r) => r.status === 'queued').map((r) => `⏳ waiting for approval: ${r.title}`),
   ];
-  if (notices && lines.length) db.prepare('INSERT INTO notices (ts, session_id, text) VALUES (?, ?, ?)').run(ts, session.id, lines.join('\n'));
-  db.prepare('UPDATE reviews SET learned = ?, patched = ? WHERE id = ?').run(learned, patched, reviewId);
+  if (notices && lines.length) db.prepare('INSERT INTO notices (ts, session_id, text) VALUES (?, ?, ?)').run(Date.now(), session.id, lines.join('\n'));
+  db.prepare('UPDATE reviews SET learned = ?, patched = ? WHERE id = ?').run(report.created || 0, report.patched || 0, reviewId);
   return results;
 }
 
@@ -560,7 +489,7 @@ async function main() {
     } else if (args.session) {
       await reviewSession(db, args.session, args.trigger || 'session_end');
     } else if (args['triage-queue']) {
-      const { tidyQueue } = await import('./triage.mjs');
+      const { tidyQueue } = await import('./evaluate.mjs');
       console.log(JSON.stringify(await tidyQueue(db, { force: !!args.force }), null, 2));
     } else if (args.maintain) {
       const { maintain } = await import('./maintenance.mjs');

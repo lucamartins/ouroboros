@@ -133,9 +133,10 @@ const ACTION_LABEL = {
   undo: (r) => (r.status === 'undone' ? `↩ undone: ${r.title || r.id}` : r.reason || r.status),
   forget: (r) => (r.status === 'archived' ? `🗑 archived: ${r.title}` : r.reason || r.status),
   confirm: (r) => (r.status === 'confirmed' ? '✓ confidence raised' : r.status),
-  approve: (r) => (r.status === 'created' || r.status === 'patched' ? `📝 saved: ${r.title}` : `${r.status}${r.reason ? ` — ${r.reason}` : ''}`),
-  reject: () => 'rejected',
-  triage_queue: (r) => `checked ${r.total}: ${r.kept} kept, ${r.patched} as updates, ${r.dropped} dropped, ${r.merged} merged (${fmt.usd(r.cost)})`,
+  approve: (r) => (r.status === 'created' || r.status === 'patched' ? `📝 saved: ${r.title}${r.rebased ? ' (on top of the newer file)' : ''}` : `${r.status}${r.reason ? ` — ${r.reason}` : ''}`),
+  reject: (r) => (r.status === 'rejected_by_user' ? 'rejected' : `${r.status}${r.reason ? ` — ${r.reason}` : ''}`),
+  triage_queue: (r) => `checked ${r.total}${r.recomposed ? ` + ${r.recomposed} changes` : ''}: ${r.kept} new, ${r.routed} to existing files, ${r.dropped} dropped, ${r.merged} merged, ${r.suggested} fixes (${fmt.usd(r.cost)})`,
+  dismiss: () => 'dismissed',
   restore: () => 'back in the queue',
   approve_many: (r) => `📝 saved ${r.saved} of ${r.total}${r.other ? ` (${r.other} skipped: duplicate or over budget)` : ''}`,
   reject_many: (r) => `rejected ${r.rejected}`,
@@ -374,34 +375,108 @@ function learnedSection(learned, writes) {
 }
 
 const OUTCOME_LABEL = {
-  dropped: 'dropped by triage', merged: 'merged by triage',
+  dropped: 'dropped by the knowledge check', merged: 'merged by the knowledge check', suggested: 'suggested as a fix',
   created: 'saved', patched: 'merged into existing', duplicate: 'already known', rejected: 'rejected',
   over_budget: 'over budget', queued: 'waiting for approval', rejected_by_user: 'rejected by you', error: 'error',
 };
 
+/** Word-level diff of two texts: [{ op: '=', '-' or '+', text }]. */
+function wordDiff(a, b) {
+  const A = a.split(/(\s+)/);
+  const B = b.split(/(\s+)/);
+  if (A.length * B.length > 250_000) return [{ op: '-', text: a }, { op: '+', text: b }];
+  const L = Array.from({ length: A.length + 1 }, () => new Uint16Array(B.length + 1));
+  for (let i = A.length - 1; i >= 0; i--) for (let j = B.length - 1; j >= 0; j--) L[i][j] = A[i] === B[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+  const out = [];
+  const push = (op, text) => (out.length && out[out.length - 1].op === op ? (out[out.length - 1].text += text) : out.push({ op, text }));
+  let i = 0;
+  let j = 0;
+  while (i < A.length && j < B.length) {
+    if (A[i] === B[j]) { push('=', A[i]); i++; j++; } else if (L[i + 1][j] >= L[i][j + 1]) { push('-', A[i++]); } else { push('+', B[j++]); }
+  }
+  while (i < A.length) push('-', A[i++]);
+  while (j < B.length) push('+', B[j++]);
+  return out;
+}
+
+/** One edit as a diff: context faint, removed struck through, added highlighted. */
+function editDiff(e) {
+  if (e.append !== undefined) {
+    return h('pre', { class: 'diff' }, h('span', { class: 'ctx' }, `under "${e.section || 'end of file'}":\n`), h('ins', {}, e.append));
+  }
+  const parts = wordDiff(e.old || '', e.new || '');
+  const trim = (t, end) => (t.length > 160 ? (end ? `…${t.slice(-160)}` : `${t.slice(0, 160)}…`) : t);
+  return h('pre', { class: 'diff' }, parts.map((p, k) => (p.op === '+' ? h('ins', {}, p.text)
+    : p.op === '-' ? h('del', {}, p.text)
+      : h('span', { class: 'ctx' }, k === 0 ? trim(p.text, true) : k === parts.length - 1 ? trim(p.text, false) : p.text))));
+}
+
+function itemCard(q) {
+  return h('article', { class: 'card lcard' },
+    h('div', { class: 'meta' },
+      h('span', { class: `badge ${q.kind}` }, q.op === 'patch' ? `update · ${q.kind}` : q.kind === 'profile' ? `profile · ${q.block || ''}` : q.memory_type ? `${q.kind} · ${q.memory_type}` : q.kind),
+      h('span', { title: 'When the session this came from happened' }, `${projectName(q.project, q.cwd)} · ${fmt.datetime(q.session_started_at || q.ts)}`),
+      h('span', { class: 'conf' }, meter(q.confidence || 0, 1, { plain: true }), fmt.pct((q.confidence || 0) * 100))),
+    h('div', { class: 'title' }, q.title || q.target || '(untitled)'),
+    q.description ? h('div', { class: 'muted small' }, q.description) : null,
+    q.note ? h('div', { class: `small ${q.note.startsWith('⚠') ? 'warn-text' : 'faint'}` }, q.note) : null,
+    h('div', { class: 'summary' }, q.summary),
+    q.evidence ? h('div', { class: 'evidence' }, q.evidence) : null,
+    h('div', { class: 'actions' }, actionButton('Approve', 'approve', q.key), actionButton('Reject', 'reject', q.key, { confirmText: 'Reject it?' })));
+}
+
+function changesetCard(c) {
+  const name = c.file.split(/[\\/]/).slice(-3).join('/');
+  const stale = c.status === 'stale';
+  return h('article', { class: 'card lcard wide' },
+    h('div', { class: 'meta' },
+      h('span', { class: `badge ${c.kind}` }, c.corrects ? `correction · ${c.kind}` : `update · ${c.kind}`),
+      h('span', { title: 'When the oldest session behind it happened' }, fmt.datetime(c.session_started_at || c.created_at)),
+      h('span', {}, `${c.claims.length} learning${c.claims.length === 1 ? '' : 's'}`)),
+    h('div', { class: 'title' }, name),
+    h('div', { class: 'file', title: c.file }, c.file),
+    stale ? h('div', { class: 'small warn-text' }, `Needs a new check: ${c.note || 'the file changed'}`)
+      : c.changed ? h('div', { class: 'small warn-text' }, 'The file changed since this was composed; approving re-applies the edits if they still fit.')
+        : c.note ? h('div', { class: 'small faint' }, c.note) : null,
+    ...c.edits.map((e) => editDiff(e)),
+    h('ol', { class: 'claims' }, c.claims.map((l) => h('li', {},
+      h('div', { class: 'row' }, h('span', {}, l.claim || l.title),
+        c.claims.length > 1 ? actionButton('Remove', 'reject', String(l.id), { confirmText: 'Remove this learning and recompose?', title: 'Reject this learning; the rest of the change is composed again without it' }) : null),
+      l.note ? h('div', { class: 'faint small' }, l.note) : null,
+      l.evidence ? h('div', { class: 'evidence' }, l.evidence) : null))),
+    h('div', { class: 'actions' },
+      stale ? null : actionButton('Approve change', 'approve', c.key),
+      actionButton('Reject', 'reject', c.key, { confirmText: 'Reject the whole change?' })));
+}
+
 function queueSection(queue) {
   if (!queue.length) return [];
+  const unchecked = queue.filter((q) => q.type === 'item' && !q.triaged_at).length + queue.filter((q) => q.status === 'stale').length;
+  const ready = queue.filter((q) => q.status !== 'stale');
   return [
     h('div', { class: 'section-head' },
       h('div', {}, h('h2', {}, `Waiting for approval (${queue.length})`),
-        h('div', { class: 'muted small' }, 'Held by your autonomy setting or a learning backfill, in the order the sessions happened (oldest first). Approve to save through the curator, or reject.')),
+        h('div', { class: 'muted small' }, 'New items and changes to existing files, in the order the sessions happened (oldest first). Each change shows the exact edit and the learnings behind it.')),
       h('div', { class: 'actions' },
-        queue.some((q) => !q.triaged_at)
-          ? actionButton(`Check ${queue.filter((q) => !q.triaged_at).length} against knowledge`, 'triage_queue', false, { title: 'Drop what your memories, CLAUDE.md, rules and skills already say; merge duplicates; turn additions into skill updates' })
-          : actionButton('Re-check all', 'triage_queue', true, { confirmText: 'Re-check everything?', title: 'Run the knowledge check again on every queued item' }),
-        actionButton(`Approve all ${queue.length}`, 'approve_many', queue.map((q) => q.id), { confirmText: `Save all ${queue.length}?` }),
-        actionButton('Reject all', 'reject_many', queue.map((q) => q.id), { confirmText: `Reject all ${queue.length}?` }))),
-    h('div', { class: 'cards' }, queue.map((q) => h('article', { class: 'card lcard' },
-      h('div', { class: 'meta' },
-        h('span', { class: `badge ${q.kind}` }, q.op === 'patch' ? `update · ${q.kind}` : q.kind === 'profile' ? `profile · ${q.block || ''}` : q.memory_type ? `${q.kind} · ${q.memory_type}` : q.kind),
-        h('span', { title: 'When the session this came from happened' }, `${projectName(q.project, q.cwd)} · ${fmt.datetime(q.session_started_at || q.ts)}`),
-        h('span', { class: 'conf' }, meter(q.confidence || 0, 1, { plain: true }), fmt.pct((q.confidence || 0) * 100))),
-      h('div', { class: 'title' }, q.title || q.target || '(untitled)'),
-      q.description ? h('div', { class: 'muted small' }, q.description) : null,
-      q.note ? h('div', { class: `small ${q.note.startsWith('⚠') ? 'warn-text' : 'faint'}` }, q.note) : null,
-      h('div', { class: 'summary' }, q.summary),
-      q.evidence ? h('div', { class: 'evidence' }, q.evidence) : null,
-      h('div', { class: 'actions' }, actionButton('Approve', 'approve', q.id), actionButton('Reject', 'reject', q.id, { confirmText: 'Reject it?' }))))),
+        unchecked
+          ? actionButton(`Check ${unchecked} against knowledge`, 'triage_queue', false, { title: 'Screen new proposals with the rubric, and compose the changes to each owner file' })
+          : actionButton('Re-check all', 'triage_queue', true, { confirmText: 'Re-check everything?', title: 'Run the knowledge check again on everything waiting' }),
+        actionButton(`Approve all ${ready.length}`, 'approve_many', ready.map((q) => q.key), { confirmText: `Save all ${ready.length}?` }),
+        actionButton('Reject all', 'reject_many', queue.map((q) => q.key), { confirmText: `Reject all ${queue.length}?` }))),
+    h('div', { class: 'cards' }, queue.map((q) => (q.type === 'changeset' ? changesetCard(q) : itemCard(q)))),
+    h('div', { style: 'height:28px' }),
+  ];
+}
+
+function suggestionsSection(suggestions) {
+  if (!suggestions.length) return [];
+  return [
+    h('details', { class: 'card dropped', open: true },
+      h('summary', {}, `Suggested fixes (${suggestions.length}) — fix these in the project instead of learning a workaround`),
+      h('ul', { class: 'list' }, suggestions.map((s) => h('li', {},
+        h('div', { class: 'row' }, h('span', {}, s.title),
+          h('span', { class: 'actions' }, actionButton('Restore', 'restore', s.id, { title: 'Treat it as a learning after all' }), actionButton('Dismiss', 'dismiss', s.id))),
+        h('div', { class: 'faint small' }, `${projectName(s.project, s.cwd)} · ${(s.note || '').replace(/^fix in the project(\s*\[[^\]]*\])?:\s*/, '')}`))))),
     h('div', { style: 'height:28px' }),
   ];
 }
@@ -419,7 +494,7 @@ function droppedSection(dropped) {
 }
 
 async function renderLearnings() {
-  const [{ learned, writes, candidates, corrections }, queue, dropped] = await Promise.all([api('learnings'), api('queue'), api('dropped')]);
+  const [{ learned, writes, candidates, corrections }, queue, dropped, suggestions] = await Promise.all([api('learnings'), api('queue'), api('dropped'), api('suggestions')]);
   const f = state.filters;
   const chipGroup = (key, options) => h('div', { class: 'chips', role: 'group' }, options.map(([value, label]) =>
     h('button', { class: 'chip', 'aria-pressed': String(f[key] === value), onclick: () => { f[key] = value; renderLearnings(); } }, label)));
@@ -447,6 +522,7 @@ async function renderLearnings() {
 
   view.replaceChildren(
     ...queueSection(queue),
+    ...suggestionsSection(suggestions),
     ...droppedSection(dropped),
     ...learnedSection(learned, writes),
     h('section', { class: 'section' }, h('div', { class: 'section-head' },
@@ -593,10 +669,13 @@ function qualityCard(q) {
   if (q.proposed >= 10 && q.dropped / q.proposed > 0.5) signals.push('Most proposals are dropped by the knowledge check: reviews are proposing things that are already documented or fail the rubric.');
   if (q.undoRate !== null && q.writes >= 5 && q.undoRate > 0.2) signals.push('More than 1 in 5 writes was undone: learnings are being saved that you do not want.');
   if (q.approvalRate !== null && q.approvalRate < 0.5) signals.push('You reject most queued proposals: consider a stricter autonomy or reviewing the rubric results.');
+  const changes = Object.fromEntries((q.changes || []).map((c) => [c.status, c.n]));
+  const stale = changes.stale || 0;
+  if (stale >= 3) signals.push(`${stale} changes went stale (their files changed before approval): approve or re-check the queue more often.`);
   return h('div', { class: 'card' },
     h('h3', {}, `Learning quality (last ${q.days} days)`),
-    h('div', {}, `${fmt.int(q.proposed)} proposed · ${fmt.int(q.saved)} saved · ${fmt.int(q.queued)} waiting · ${fmt.int(q.dropped)} dropped · ${fmt.int(q.merged)} merged · ${fmt.int(q.rejectedByUser)} rejected by you`),
-    h('div', { class: 'muted small' }, `Approval rate ${pct(q.approvalRate)} · undo rate ${pct(q.undoRate)} of ${fmt.int(q.writes)} writes`),
+    h('div', {}, `${fmt.int(q.proposed)} proposed · ${fmt.int(q.saved)} saved · ${fmt.int(q.queued)} waiting · ${fmt.int(q.dropped)} dropped · ${fmt.int(q.merged)} merged · ${fmt.int(q.duplicates || 0)} already known · ${fmt.int(q.suggested || 0)} fixes suggested · ${fmt.int(q.rejectedByUser)} rejected by you`),
+    h('div', { class: 'muted small' }, `Approval rate ${pct(q.approvalRate)} · undo rate ${pct(q.undoRate)} of ${fmt.int(q.writes)} writes · changes to files: ${fmt.int(changes.applied || 0)} applied, ${fmt.int(changes.pending || 0)} waiting, ${fmt.int(changes.rejected || 0)} rejected, ${fmt.int(changes.superseded || 0)} recomposed`),
     reasons.length ? h('div', { class: 'faint small', style: 'margin-top:6px' }, `Dropped because: ${reasons.map(([r, n]) => `${r} (${n})`).join(', ')}`) : null,
     ...signals.map((s) => h('div', { class: 'small warn-text', style: 'margin-top:6px' }, s)),
     signals.length ? null : h('div', { class: 'small', style: 'margin-top:6px' }, h('span', { class: 'status-dot good' }), 'No quality warnings'));

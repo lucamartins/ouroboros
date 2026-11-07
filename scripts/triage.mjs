@@ -1,16 +1,15 @@
-// Knowledge check (triage): judge proposals with the learning rubric against what
-// Claude already knows, the project's sources of truth, the map of which skill or rule
-// owns each topic, and what the user rejected before. One isolated model call per
-// batch decides, for every proposal:
-//   keep     save as new (normalized rewrite)
-//   drop     fails the rubric (covered, one-off, derivable, default behavior, ...)
-//   merge    same as another proposal
-//   patch    add to the skill / rule / memory that owns the topic
-//   correct  existing knowledge is wrong: fix it (always waits for the user)
-import fs from 'node:fs';
-import path from 'node:path';
+// Screening (stage 1 of the learning evaluation, see evaluate.mjs): judge proposals with
+// the learning rubric against what Claude already knows, the project's sources of
+// truth, the map of which skill or rule file owns each topic, and what the user
+// rejected before. One isolated model call per batch decides, for every proposal:
+//   keep   save as new (normalized rewrite)
+//   drop   fails the rubric (covered, one-off, derivable, default behavior, ...)
+//   merge  same as another proposal
+//   route  belongs to an existing owner file: the editor composes the change there
+//   fix    a workaround for a fixable defect: suggested to the user, not learned
+// Screening never writes text into existing files; it only sees excerpts of them.
 import { options } from './config.mjs';
-import { buildIndex, knowledgeKind, ownersMap, PATCHABLE } from './knowledge.mjs';
+import { buildIndex, ownersMap } from './knowledge.mjs';
 import { runModel } from './review-worker.mjs';
 import { languageRule, rubricText } from './rubric.mjs';
 
@@ -20,20 +19,6 @@ const EXCERPT_CHARS = 900;
 const REJECTIONS_DAYS = 180;
 
 export const DROP_KINDS = ['covered', 'one_off', 'derivable', 'default_behavior', 'unverified', 'stale', 'low_value', 'rejected_before'];
-
-const PATCH_SCHEMA = {
-  type: 'object',
-  additionalProperties: false,
-  required: ['file', 'mode'],
-  properties: {
-    file: { type: 'string' },
-    mode: { type: 'string', enum: ['append', 'replace'] },
-    section: { type: 'string' },
-    text: { type: 'string' },
-    old: { type: 'string' },
-    new: { type: 'string' },
-  },
-};
 
 export const TRIAGE_SCHEMA = {
   type: 'object',
@@ -48,13 +33,22 @@ export const TRIAGE_SCHEMA = {
         required: ['id', 'verdict', 'reason'],
         properties: {
           id: { type: 'integer' },
-          verdict: { type: 'string', enum: ['keep', 'drop', 'merge', 'patch', 'correct'] },
+          verdict: { type: 'string', enum: ['keep', 'drop', 'merge', 'route', 'fix'] },
           reason: { type: 'string' },
           rule: { type: 'string' },
           drop_kind: { type: 'string', enum: DROP_KINDS },
           covered_by: { type: 'string' },
           merge_into: { type: 'integer' },
-          conflict_with: { type: 'string' },
+          owner: { type: 'string' },
+          section: { type: 'string' },
+          claim: { type: 'string' },
+          fix: { type: 'string' },
+          stale: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['file', 'claim'],
+            properties: { file: { type: 'string' }, claim: { type: 'string' } },
+          },
           rewrite: {
             type: 'object',
             additionalProperties: false,
@@ -69,7 +63,6 @@ export const TRIAGE_SCHEMA = {
               body: { type: 'string' },
             },
           },
-          patch: PATCH_SCHEMA,
         },
       },
     },
@@ -95,6 +88,7 @@ export const DEDUPE_SCHEMA = {
           description: { type: 'string' },
           text: { type: 'string' },
           body: { type: 'string' },
+          claim: { type: 'string' },
         },
       },
     },
@@ -103,10 +97,12 @@ export const DEDUPE_SCHEMA = {
 
 export { languageRule };
 
-function describe(p) {
+export function describe(p) {
   return [
     `kind=${p.kind}${p.memory_type ? `/${p.memory_type}` : ''}${p.block ? `/${p.block}` : ''}${p.scope ? ` scope=${p.scope}` : ''}${p.op === 'patch' ? ` op=patch target=${p.target}` : ''}`,
     `title: ${p.title || ''}`,
+    p.claim ? `claim: ${p.claim}` : '',
+    p.target && p.op !== 'patch' ? `previously routed to: ${p.target}` : '',
     p.description ? `description: ${p.description}` : '',
     p.text ? `text: ${p.text}` : '',
     p.body ? `body: ${String(p.body).slice(0, 1500)}` : '',
@@ -118,35 +114,32 @@ function describe(p) {
 }
 
 const KIND_LABEL = {
-  skill: 'skill (patchable)', rules: 'rule file (patchable, needs approval)', instructions: 'CLAUDE.md (patchable, needs approval)',
-  memory: 'memory (patchable)', profile: 'global profile (patchable)', source: 'SOURCE OF TRUTH (read-only)', rejected: 'REJECTED BEFORE by the user',
+  skill: 'skill (owner)', rules: 'rule file (owner, needs approval)', instructions: 'CLAUDE.md (owner, needs approval)',
+  memory: 'memory (owner)', profile: 'global profile', source: 'SOURCE OF TRUTH (read-only)', rejected: 'REJECTED BEFORE by the user',
 };
 
 export function triagePrompt({ batch, others, excerpts, owners, lang }) {
-  return `You curate what an AI coding assistant remembers between sessions. Judge each PROPOSAL with the rubric, using the EXCERPTS (what is already written, sources of truth, and proposals the user rejected before) and the OWNERS map (which skill or rule file owns which topic).
+  return `You curate what an AI coding assistant remembers between sessions. Screen each PROPOSAL with the rubric and decide where it belongs, using the EXCERPTS (what is already written, sources of truth, and proposals the user rejected before) and the OWNERS map (which skill or rule file owns which topic). You do NOT write changes to existing files: an editor later reads the whole owner file, checks the project's code and writes the change.
 
 RUBRIC — a proposal is saved only if it passes every rule:
 ${rubricText()}
 
 VERDICTS (set "rule" to the id of the rubric rule that decided it):
 - "drop" with drop_kind: covered (an excerpt already says it; set covered_by to the file), one_off, derivable, default_behavior, unverified (a source of truth contradicts it), stale, low_value, rejected_before (the user already rejected the same thing).
-- "merge" with merge_into: another proposal says the same thing in any language or kind. The absorbing proposal must be "keep" and its rewrite must combine both.
-- "patch": the topic has an owner (a skill, rule file, memory or profile in OWNERS or EXCERPTS) and the proposal adds a real detail it lacks. Prefer this over a new memory whenever an owner exists, even if no excerpt shares its words. Set patch.file to the owner's path and either:
-    mode "append": patch.section = the heading or bold topic to add under (from OWNERS or the excerpt), patch.text = the addition, written in the owner's style and language;
-    mode "replace": patch.old = an exact, unique fragment copied verbatim from an excerpt of that file, patch.new = its replacement keeping the old content.
-  Also give rewrite.title: a short title for the addition.
-- "correct": the proposal is verified (by the user or a source of truth) and shows that an existing skill, rule or memory is WRONG or outdated. Give a patch that fixes the wrong text (usually mode "replace") and set conflict_with to what was wrong. Never just keep a proposal that contradicts existing knowledge: either correct the knowledge or drop the proposal.
-- Stale owners: whatever the verdict for a proposal, if its excerpts show a skill, rule or memory that a SOURCE OF TRUTH contradicts on the same topic, answer "correct" with a patch that fixes that text (this is how outdated documentation gets repaired).
+- "merge" with merge_into: another proposal (in THIS BATCH or OTHER PROPOSALS) says the same thing in any language, kind or target. The one it merges into must not be dropped.
+- "route": the topic has an owner — a skill or one of its reference files, a rule file, a CLAUDE.md, or a memory (from OWNERS or EXCERPTS) — and the proposal may add to it or correct it. Set owner = the owner's full path (a reference file is its skill's folder + the listed relative path), claim = the knowledge as ONE self-contained statement (what is true or what to do, and the reason when the proposal gives one), section = the heading it belongs under when obvious. Choose the owner an assistant would read when the topic comes up. Do not try to judge whether the owner already says it in parts you cannot see: the editor checks the whole file. Prefer this over "keep" whenever an owner exists.
+- "fix": the proposal documents a workaround for something the project could fix once (a generated file not ignored, a broken script, a missing config line). Set fix = the change to make in the project, in one sentence. Nothing is learned.
 - "keep": worth saving as new and no owner fits. Give a rewrite that picks the right kind ("profile" = one sentence valid on every project in "text", block user/environment; "memory" = one project's fact with "description" and a "body" holding the fact plus "**Why:**" and "**How to apply:**"; "skill" = a reusable multi-step procedure with description ≤ 250 chars saying when to use it), uses a short human-readable title (never a slug), and removes details that will go stale.
+- Stale owners: whatever the verdict, if an excerpt shows a skill, rule, CLAUDE.md or memory that a SOURCE OF TRUTH contradicts on this proposal's topic, also set stale = { file: that file's path, claim: the corrected statement, backed by the source }. This is how outdated documentation gets repaired.
 
 ${languageRule(lang)} Keep code identifiers, commands and file names as they are.
 Answer once for every proposal id in THIS BATCH.
 
-OWNERS (skills and rule files: name — description — sections):
-${owners.map((o) => `- [${o.kind}] ${o.name} (${o.file}) — ${o.description}${o.headings.length ? ` — sections: ${o.headings.join(' | ')}` : ''}`).join('\n') || '(none)'}
+OWNERS (skills and rule files: name — description — sections — reference files):
+${owners.map((o) => `- [${o.kind}] ${o.name} (${o.file}) — ${o.description}${o.headings.length ? ` — sections: ${o.headings.join(' | ')}` : ''}${o.references?.length ? ` — references: ${o.references.join(', ')}` : ''}`).join('\n') || '(none)'}
 
 OTHER PROPOSALS (for duplicates across batches; decide only THIS BATCH):
-${others.map((o) => `#${o.id} ${o.kind}: ${o.title}`).join('\n') || '(none)'}
+${others.map((o) => `#${o.id} ${o.kind}: ${o.title}${o.claim ? ` — ${String(o.claim).slice(0, 160)}` : ''}`).join('\n') || '(none)'}
 
 EXCERPTS:
 ${excerpts.map((e) => `<excerpt file="${e.file}" kind="${KIND_LABEL[e.kind] || e.kind}"${e.heading ? ` heading="${e.heading}"` : ''}>\n${e.text.slice(0, EXCERPT_CHARS)}\n</excerpt>`).join('\n') || '(none found)'}
@@ -156,30 +149,32 @@ ${batch.map((p) => `<proposal id="${p.id}">\n${describe(p)}\n</proposal>`).join(
 }
 
 export function dedupePrompt({ items, lang }) {
-  return `These notes are about to be saved for an AI coding assistant. Find groups that state the same rule or fact (in any language, kind or wording) and should be ONE note. Do not group notes that merely share a topic but say different things.
+  return `These learnings are about to be saved for an AI coding assistant, as new notes or as changes to an existing file (→ owner). Find groups that state the same rule or fact (in any language, kind, wording or owner) and should be saved ONCE. Do not group items that merely share a topic but say different things.
 
-For each group: "keep" is the id to keep, "merge" the ids folded into it, and give the combined "title", "description" and "body" (memories) or "text" (profile facts) with every detail of the group. Return an empty list if there are no duplicates. ${languageRule(lang)}
+For each group: "keep" is the id to keep — when they go to different owners, the one whose owner an assistant would read when the topic comes up — and "merge" the ids folded into it. Give the combined "claim" (changes to an owner) or "title", "description" and "body" (new memories) or "text" (profile facts), with every detail of the group. Return an empty list if there are no duplicates. ${languageRule(lang)}
 
-${items.map((i) => [`#${i.id} [${i.kind}] ${i.title}`, i.description, i.text, i.body && String(i.body).slice(0, 600)].filter(Boolean).join('\n')).join('\n\n')}`;
+${items.map((i) => [`#${i.id} [${i.kind}${i.owner ? ` → ${i.owner}` : ''}] ${i.title}`, i.claim, i.description, i.text, i.body && String(i.body).slice(0, 600)].filter(Boolean).join('\n')).join('\n\n')}`;
 }
 
 /** Proposals the user rejected or undid recently, as extra documents for the index. */
-export function rejectionDocs(db) {
+export function rejectionDocs(db, { exclude = [] } = {}) {
   if (!db) return [];
   const since = Date.now() - REJECTIONS_DAYS * 86_400_000;
-  const rejected = db.prepare("SELECT title, summary, note FROM candidates WHERE outcome = 'rejected_by_user' AND COALESCE(decided_at, ts) >= ?").all(since)
-    .map((r) => ({ file: '(rejected proposal)', kind: 'rejected', heading: r.title, text: `${r.title}\n${r.summary || ''}` }));
+  const skip = new Set(exclude);
+  const rejected = db.prepare("SELECT id, title, summary, claim FROM candidates WHERE outcome = 'rejected_by_user' AND COALESCE(decided_at, ts) >= ?").all(since)
+    .filter((r) => !skip.has(r.id))
+    .map((r) => ({ file: '(rejected proposal)', kind: 'rejected', heading: r.title, text: `${r.title}\n${r.claim || r.summary || ''}` }));
   const undone = db.prepare("SELECT title, path FROM learnings WHERE status = 'reverted' AND updated_at >= ?").all(since)
     .map((r) => ({ file: '(undone learning)', kind: 'rejected', heading: r.title, text: `${r.title} (was saved to ${r.path} and undone by the user)` }));
   return [...rejected, ...undone];
 }
 
 /**
- * Triage proposals ({id, kind, title, description, text, body, ...}) for one project dir.
- * Returns { verdicts: Map(id -> verdict), cost, calls }.
+ * Screen proposals ({id, kind, title, description, text, body, claim, ...}) for one
+ * project dir. Returns { verdicts: Map(id -> verdict), cost, calls }.
  */
-export async function triage(proposals, { cwd, db = null, lang = options().learningLanguage, model = options().reviewerModel } = {}) {
-  const index = buildIndex(cwd, { extra: rejectionDocs(db) });
+export async function triage(proposals, { cwd, db = null, lang = options().learningLanguage, model = options().reviewerModel, exclude = [] } = {}) {
+  const index = buildIndex(cwd, { extra: rejectionDocs(db, { exclude }) });
   const owners = ownersMap(cwd);
   const verdicts = new Map();
   let cost = 0;
@@ -195,7 +190,7 @@ export async function triage(proposals, { cwd, db = null, lang = options().learn
       excerpts.push(hit);
     };
     for (const p of batch) {
-      const query = [p.title, p.description, p.text, p.body, p.target, p.append].filter(Boolean).join(' ');
+      const query = [p.title, p.claim, p.description, p.text, p.body, p.target, p.append].filter(Boolean).join(' ');
       for (const hit of index.search(query, EXCERPTS_PER_PROPOSAL)) take(hit);
       // Always look at the best source of truth and past rejection, even if they rank lower.
       for (const hit of index.search(query, 1, { kinds: ['source'] })) take(hit);
@@ -210,56 +205,45 @@ export async function triage(proposals, { cwd, db = null, lang = options().learn
     }
   }
 
-  // Batches only see each other's titles: one more pass over everything kept catches
-  // duplicates that landed in different batches.
-  if (proposals.length > BATCH) {
-    const kept = proposals.filter((p) => verdicts.get(p.id)?.verdict === 'keep').map((p) => ({ id: p.id, ...rewriteItem(p, verdicts.get(p.id)) }));
-    if (kept.length > 1) {
-      const result = await runModel({ prompt: dedupePrompt({ items: kept, lang }), schema: DEDUPE_SCHEMA, model });
-      cost += Number(result.total_cost_usd) || 0;
-      calls++;
-      const keptIds = new Set(kept.map((k) => k.id));
-      for (const g of result.structured_output.groups || []) {
-        const merge = (g.merge || []).filter((id) => id !== g.keep && keptIds.has(id));
-        if (!keptIds.has(g.keep) || !merge.length) continue;
-        const v = verdicts.get(g.keep);
+  // Batches only see each other's titles: one more pass over everything that will be
+  // saved catches duplicates across batches, including the same fact sent to two owners.
+  const survivors = proposals.filter((p) => ['keep', 'route'].includes(verdicts.get(p.id)?.verdict));
+  if (proposals.length > BATCH && survivors.length > 1) {
+    const items = survivors.map((p) => {
+      const v = verdicts.get(p.id);
+      return v.verdict === 'route' ? { id: p.id, kind: p.kind, title: p.title, owner: v.owner, claim: v.claim } : { id: p.id, ...rewriteItem(p, v) };
+    });
+    const result = await runModel({ prompt: dedupePrompt({ items, lang }), schema: DEDUPE_SCHEMA, model });
+    cost += Number(result.total_cost_usd) || 0;
+    calls++;
+    const ids = new Set(items.map((k) => k.id));
+    for (const g of result.structured_output.groups || []) {
+      const merge = (g.merge || []).filter((id) => id !== g.keep && ids.has(id));
+      if (!ids.has(g.keep) || !merge.length) continue;
+      const v = verdicts.get(g.keep);
+      if (v.verdict === 'route') {
+        if (g.claim) v.claim = g.claim;
+      } else {
         v.rewrite = { ...(v.rewrite || {}), ...Object.fromEntries(['title', 'description', 'text', 'body'].filter((k) => g[k]).map((k) => [k, g[k]])) };
-        for (const id of merge) verdicts.set(id, { id, verdict: 'merge', merge_into: g.keep, reason: g.reason });
       }
+      for (const id of merge) verdicts.set(id, { id, verdict: 'merge', merge_into: g.keep, reason: g.reason, stale: verdicts.get(id)?.stale });
     }
   }
   return { verdicts, cost, calls };
 }
 
-/**
- * Turn a "patch" or "correct" verdict into a curator patch item, after checking the
- * target is a patchable file and, for replacements, that the fragment is really there.
- */
-export function patchItemFromVerdict(v) {
-  const p = v.patch;
-  if (!p?.file) return null;
-  const file = path.resolve(p.file);
-  let text;
-  try { text = fs.readFileSync(file, 'utf8'); } catch { return null; }
-  const kind = knowledgeKind(file);
-  if (!PATCHABLE.has(kind)) return null;
-  const base = { op: 'patch', kind: ['skill', 'profile'].includes(kind) ? kind : 'memory', target: file, targetKind: kind, corrects: v.verdict === 'correct' || undefined };
-  if (p.mode === 'append' || (p.old === undefined && p.text)) {
-    if (!String(p.text || '').trim()) return null;
-    // Adding to the profile is adding a fact to one of its blocks.
-    if (kind === 'profile') return { op: 'create', kind: 'profile', block: /user/i.test(p.section || '') ? 'user' : 'environment', text: p.text };
-    return { ...base, section: p.section || '', append: p.text };
-  }
-  if (!p.old || text.split(p.old).length - 1 !== 1) return null;
-  return { ...base, old: p.old, new: p.new ?? '' };
-}
-
 /** Apply a "keep" verdict's rewrite on top of the original proposal. */
 export function rewriteItem(item, v) {
-  const r = v.rewrite || {};
+  const r = v?.rewrite || {};
   const next = { ...item };
   for (const k of ['kind', 'block', 'memory_type', 'scope', 'title', 'description', 'text', 'body']) {
     if (r[k] !== undefined && r[k] !== '') next[k] = r[k];
+  }
+  // A re-screened change to an owner that is now kept as new starts as a plain create.
+  if (next.op === 'patch') {
+    next.op = 'create';
+    if (!next.body && !next.text) next.body = next.append ?? next.new ?? next.claim ?? '';
+    for (const k of ['target', 'targetKind', 'append', 'section', 'old', 'new', 'corrects']) delete next[k];
   }
   if (next.kind === 'profile') {
     next.scope = 'global';
@@ -271,87 +255,11 @@ export function rewriteItem(item, v) {
   return next;
 }
 
-const DROP_OUTCOME = { drop: 'dropped', merge: 'merged' };
-
 export function noteFor(v) {
   const rule = v.rule ? ` [${v.rule}]` : '';
   if (v.verdict === 'drop') return `${(v.drop_kind || 'dropped').replace(/_/g, ' ')}${rule}: ${v.reason}${v.covered_by ? ` (${v.covered_by})` : ''}`;
   if (v.verdict === 'merge') return `merged into #${v.merge_into}: ${v.reason}`;
-  if (v.verdict === 'correct') return `✎ corrects ${v.patch?.file}: ${v.conflict_with || v.reason}`;
-  if (v.verdict === 'patch') return `adds to ${v.patch?.file}${v.patch?.section ? ` › ${v.patch.section}` : ''}: ${v.reason}`;
-  return v.conflict_with ? `⚠ conflicts with ${v.conflict_with}` : null;
-}
-
-/** Resolve one verdict into: { outcome, item, note } for the caller to record or apply. */
-export function resolveVerdict(item, v) {
-  if (!v) return { outcome: 'keep', item, note: null };
-  if (v.verdict === 'drop' || v.verdict === 'merge') return { outcome: DROP_OUTCOME[v.verdict], item, note: noteFor(v) };
-  if (v.verdict === 'patch' || v.verdict === 'correct') {
-    const patch = patchItemFromVerdict(v);
-    if (patch) {
-      return {
-        outcome: v.verdict,
-        item: { ...patch, title: v.rewrite?.title || item.title, confidence: item.confidence, evidence: item.evidence },
-        note: noteFor(v),
-      };
-    }
-    // The owner could not be updated safely: keep as new, flagged.
-    return { outcome: 'keep', item: rewriteItem(item, v), note: `kept as new (could not update ${v.patch?.file || 'its owner'} safely)` };
-  }
-  return { outcome: 'keep', item: rewriteItem(item, v), note: noteFor(v) };
-}
-
-/**
- * Triage the approval queue. Only untriaged items unless `force`.
- * Records the cost as a maintenance review.
- */
-export async function tidyQueue(db, { force = false } = {}) {
-  const rows = db.prepare(`
-    SELECT c.*, s.started_at session_started_at FROM candidates c LEFT JOIN sessions s ON s.id = c.session_id
-    WHERE c.outcome = 'queued' ${force ? '' : 'AND c.triaged_at IS NULL'}
-    ORDER BY COALESCE(s.started_at, c.ts), c.id`).all();
-  const report = { total: rows.length, kept: 0, dropped: 0, merged: 0, patched: 0, corrections: 0, cost: 0, byRule: {} };
-  if (!rows.length) return report;
-
-  // Retrieval depends on the project, so triage one project directory at a time.
-  const groups = new Map();
-  for (const r of rows) {
-    let payload = {};
-    try { payload = JSON.parse(r.payload || '{}'); } catch { /* ignore */ }
-    const key = payload.cwd || r.cwd || '';
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push({ row: r, payload });
-  }
-
-  const now = Date.now();
-  for (const [cwd, items] of groups) {
-    const proposals = items.map(({ row, payload }) => ({
-      id: row.id, ...payload.item, evidence: row.evidence,
-      when: row.session_started_at ? new Date(row.session_started_at).toISOString().slice(0, 10) : undefined,
-    }));
-    const { verdicts, cost } = await triage(proposals, { cwd, db });
-    report.cost += cost;
-    for (const { row, payload } of items) {
-      const v = verdicts.get(row.id);
-      if (!v) continue;
-      if (v.rule) report.byRule[v.rule] = (report.byRule[v.rule] || 0) + 1;
-      const { outcome, item, note } = resolveVerdict(payload.item, v);
-      if (outcome === 'dropped' || outcome === 'merged') {
-        db.prepare('UPDATE candidates SET outcome = ?, note = ?, decided_at = ?, triaged_at = ? WHERE id = ?').run(outcome, note, now, now, row.id);
-        report[outcome]++;
-        continue;
-      }
-      report[outcome === 'patch' ? 'patched' : outcome === 'correct' ? 'corrections' : 'kept']++;
-      db.prepare(`
-        UPDATE candidates SET kind = ?, scope = ?, memory_type = ?, title = ?, summary = ?, payload = ?, note = ?, triaged_at = ?
-        WHERE id = ?`).run(
-        item.kind, item.kind === 'profile' ? 'global' : item.scope || 'project', item.memory_type ?? null,
-        String(item.title || item.text || '').slice(0, 200),
-        String(item.op === 'patch' ? (item.append ?? item.new) : item.text || item.body || item.description || '').slice(0, 1500),
-        JSON.stringify({ ...payload, item }), note, now, row.id);
-    }
-  }
-  db.prepare("INSERT INTO reviews (session_id, mode, trigger, model, status, detail, cost_usd, ts) VALUES ('maintenance', 'maintenance', 'triage', ?, 'ok', ?, ?, ?)")
-    .run(options().reviewerModel, JSON.stringify(report), report.cost, Date.now());
-  return report;
+  if (v.verdict === 'fix') return `fix in the project${rule}: ${v.fix || v.reason}`;
+  if (v.verdict === 'route') return `for ${v.owner}: ${v.reason}`;
+  return null;
 }

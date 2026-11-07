@@ -194,46 +194,45 @@ test('knowledge index finds existing documentation by keywords', async () => {
   assert.equal(hits[0].heading, 'Deploy');
 });
 
-test('queue tidy drops covered proposals, merges duplicates, keeps the rest; patch verdicts are verified', async () => {
-  const { tidyQueue, patchItemFromVerdict } = await import('../scripts/triage.mjs');
+test('queue check drops covered proposals, merges duplicates, suggests fixes, keeps the rest', async () => {
+  const { tidyQueue } = await import('../scripts/evaluate.mjs');
   for (const c of db.prepare("SELECT id FROM candidates WHERE outcome = 'queued'").all()) curator.decideQueued(db, c.id, false);
   const r = curator.apply(db, { cwd: cwdA, items: [
     { kind: 'memory', memory_type: 'project', title: 'Release checklist owner', description: 'Releases are cut by the backend lead', confidence: 0.8 },
     { kind: 'memory', memory_type: 'project', title: 'Zip deploys', description: 'DROPME zip with python', confidence: 0.8 },
     { kind: 'memory', memory_type: 'project', title: 'Who cuts releases', description: 'MERGEME the backend lead cuts releases', confidence: 0.8 },
+    { kind: 'memory', memory_type: 'project', title: 'Delete AGENTS.md before removing a worktree', description: 'FIXME next dev writes it', confidence: 0.8 },
   ] }, { actor: 'background', autonomy: 'queue' });
-  assert.deepEqual(r.map((x) => x.status), ['queued', 'queued', 'queued']);
+  assert.deepEqual(r.map((x) => x.status), ['queued', 'queued', 'queued', 'queued']);
   const report = await tidyQueue(db);
-  assert.deepEqual([report.kept, report.dropped, report.merged], [1, 1, 1]);
+  assert.deepEqual([report.kept, report.dropped, report.merged, report.suggested], [1, 1, 1, 1]);
   const rows = db.prepare('SELECT title, outcome, note FROM candidates WHERE triaged_at IS NOT NULL ORDER BY id').all();
   assert.equal(rows.find((x) => x.title === 'Zip deploys').outcome, 'dropped');
   assert.match(rows.find((x) => x.title === 'Zip deploys').note, /covered: already documented \(CLAUDE\.md\)/);
   assert.equal(rows.find((x) => x.title === 'Who cuts releases').outcome, 'merged');
-  assert.equal((await tidyQueue(db)).total, 0, 'already triaged items are not checked again');
-
-  const skill = path.join(tmp, 'claude', 'skills', 'learned-bisect-flaky-tests', 'SKILL.md');
-  assert.equal(patchItemFromVerdict({ patch: { file: skill, old: 'not in the file', new: 'x' } }), null);
-  const ok = patchItemFromVerdict({ patch: { file: skill, old: '# Bisect flaky tests', new: '# Bisect flaky tests\n\nAlso check retries.' } });
-  assert.equal(ok.op, 'patch');
-  assert.equal(ok.kind, 'skill');
+  assert.equal(rows.find((x) => x.title.startsWith('Delete AGENTS')).outcome, 'suggested');
+  assert.match(rows.find((x) => x.title.startsWith('Delete AGENTS')).note, /fix in the project/);
+  assert.equal(rows.find((x) => x.title === 'Release checklist owner').outcome, 'queued');
+  assert.equal((await tidyQueue(db)).total, 0, 'already checked items are not checked again');
 });
 
-test('a proposal owned by an existing doc becomes an append patch that waits for approval', async () => {
-  const { tidyQueue } = await import('../scripts/triage.mjs');
+test('a proposal owned by an existing doc becomes a changeset that waits for approval', async () => {
+  const { tidyQueue } = await import('../scripts/evaluate.mjs');
   const claudeMd = path.join(cwdA, 'CLAUDE.md');
   curator.apply(db, { cwd: cwdA, items: [
-    { kind: 'memory', memory_type: 'project', title: 'Deploy with the script', description: `APPENDME:${claudeMd}`, confidence: 0.8 },
+    { kind: 'memory', memory_type: 'project', title: 'Deploy with the script', description: `ROUTEME:${claudeMd}`, confidence: 0.8 },
   ] }, { actor: 'background', autonomy: 'queue' });
-  await tidyQueue(db);
-  const c = db.prepare("SELECT id, note, payload FROM candidates WHERE outcome = 'queued' ORDER BY id DESC").get();
-  const item = JSON.parse(c.payload).item;
-  assert.equal(item.op, 'patch');
-  assert.equal(item.append, 'Use the deploy script.');
-  assert.match(c.note, /adds to .*CLAUDE\.md › Deploy/);
   // Rule files and CLAUDE.md are only changed through approval, even in auto mode.
-  const auto = curator.apply(db, { cwd: cwdA, items: [{ ...item }] }, { actor: 'background', autonomy: 'auto' });
-  assert.equal(auto[0].status, 'queued');
+  await tidyQueue(db, { autonomy: 'auto' });
+  const cs = db.prepare("SELECT * FROM changesets WHERE status = 'pending'").get();
+  assert.equal(path.resolve(cs.file), path.resolve(claudeMd));
+  assert.match(JSON.parse(cs.edits)[0].new, /Use the deploy script\./);
+  const c = db.prepare('SELECT id, note, outcome FROM candidates WHERE changeset_id = ?').get(cs.id);
+  assert.equal(c.outcome, 'queued');
+  assert.match(c.note, /adds to .*CLAUDE\.md/);
   const r = curator.decideQueued(db, c.id, true);
   assert.equal(r.status, 'patched', r.reason);
-  assert.match(fs.readFileSync(claudeMd, 'utf8'), /## Deploy\n\nZip with Python: [^\n]*\nUse the deploy script\.\n\n## Tests/);
+  assert.match(fs.readFileSync(claudeMd, 'utf8'), /Run pnpm test\.\nUse the deploy script\./);
+  assert.equal(db.prepare('SELECT status FROM changesets WHERE id = ?').get(cs.id).status, 'applied');
+  assert.equal(db.prepare('SELECT outcome FROM candidates WHERE id = ?').get(c.id).outcome, 'patched');
 });
