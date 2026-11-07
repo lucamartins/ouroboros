@@ -1,121 +1,121 @@
 # Ouroboros — design
 
-> Plugin do Claude Code que aprende sozinho com as suas sessões: grava memórias e cria/refina skills sem você pedir, no espírito do Hermes Agent (Nous Research), e mostra num dashboard local o que aprendeu, o quanto isso está sendo usado e quanto custa.
+> A Claude Code plugin that learns from your sessions on its own: it saves memories and creates/refines skills without being asked, in the spirit of Nous Research's Hermes Agent, and shows on a local dashboard what it learned, how much that is being used and what it costs.
 
-Status: **desenho** (nenhum código ainda). Decisões do dono em [§12](#12-decisões-tomadas).
+Status: **design** (no code yet). Owner decisions in [§12](#12-decisions).
 
 ---
 
-## 1. Problema
+## 1. Problem
 
-O Claude Code já tem onde guardar aprendizado — auto memory por projeto (`~/.claude/projects/<proj>/memory/`, índice `MEMORY.md`), skills pessoais (`~/.claude/skills/`, recarregadas sem reiniciar), `CLAUDE.md` — mas **falta o escritor**:
+Claude Code already has places to store learning — per-project auto memory (`~/.claude/projects/<proj>/memory/`, `MEMORY.md` index), personal skills (`~/.claude/skills/`, hot-reloaded), `CLAUDE.md` — but **nothing writes to them proactively**:
 
-- a auto memory nativa salva pouco, só 4 tipos (user, feedback, project, reference), e por desenho ignora procedimentos e correções de debug — justamente o que o Hermes transforma em skill;
-- não há loop de revisão: nada nativo revisa a sessão e cria/ajusta skills;
-- resultado: o usuário repete as mesmas correções entre sessões.
+- native auto memory saves little, only 4 types (user, feedback, project, reference), and by design skips procedures and debugging fixes — exactly what Hermes turns into skills;
+- there is no review loop: nothing native reviews a session and creates/patches skills;
+- result: the user repeats the same corrections across sessions.
 
-O Hermes resolve com (a) gatilhos explícitos de salvamento no prompt, (b) uma revisão em background após cada turno, (c) skills como "memória procedural" refinadas por patches pontuais e (d) limites rígidos de tamanho que forçam consolidação. O Ouroboros reproduz isso como plugin.
+Hermes solves this with (a) explicit save triggers in its prompt, (b) a background review after each turn, (c) skills as "procedural memory" refined through targeted patches and (d) hard size limits that force consolidation. Ouroboros reproduces this as a plugin.
 
-## 2. Princípios
+## 2. Principles
 
-1. **Três camadas separadas**: *captura* (hooks determinísticos, sem LLM, baratos) → *reflexão* (LLM decide o que aprender) → *curadoria* (regras determinísticas decidem onde gravar, deduplicam, aplicam limites, registram). Custo e qualidade ficam controláveis em cada camada.
-2. **Nada de LLM no caminho crítico** da sessão, exceto o nudge de revisão em momentos de alto sinal.
-3. **Tudo reversível**: toda escrita tem origem, diff e undo.
-4. **Limites rígidos** (como o Hermes): orçamento de contexto fixo; ao atingir 80%, consolidar.
-5. **Medir antes de aprender**: a fase 1 só mede, para existir um baseline contra o qual provar valor.
-6. **Aprender só de fontes confiáveis**: falas do usuário e resultados verificados — nunca de texto vindo de ferramentas (páginas web, saídas de comando), para evitar "envenenamento" por prompt injection.
-7. **Zero dependências**: Node ≥ 22.13 (`node:sqlite` embutido), sem `npm install`. Funciona igual em Windows, macOS e Linux.
+1. **Three separate layers**: *capture* (deterministic hooks, no LLM, cheap) → *reflection* (an LLM decides what to learn) → *curation* (deterministic rules decide where to write, dedupe, enforce limits, keep a ledger). Cost and quality are controllable at each layer.
+2. **No LLM on the session's critical path**, except the review nudge at high-signal moments.
+3. **Everything reversible**: every write has an origin, a diff and an undo.
+4. **Hard limits** (like Hermes): fixed context budget; consolidate at 80%.
+5. **Measure before learning**: phase 1 only measures, so there is a baseline to prove value against.
+6. **Learn only from trusted sources**: user turns and verified outcomes — never from tool-provided text (web pages, command output), to avoid poisoning via prompt injection.
+7. **Zero dependencies**: Node ≥ 22.13 (built-in `node:sqlite`), no `npm install`. Same behavior on Windows, macOS and Linux.
 
-## 3. Arquitetura
+## 3. Architecture
 
 ```
-Sessão do Claude Code
- ├─ SessionStart ─► injeta user.md (perfil global) + protocolo de aprendizado (gatilhos)
+Claude Code session
+ ├─ SessionStart ─► inject user.md (global profile) + learning protocol (triggers)
  │
- ├─ CAPTURA (hooks async, sem LLM) ───────────────────────► events.db (SQLite, WAL)
- │    UserPromptSubmit      correção / "lembre, sempre, nunca, a partir de agora"
- │    PostToolUse(Failure)  erro → recuperação; uso de skill; leitura de memória;
- │                          escrita em memória/skill (ledger por observação)
- │    UserPromptExpansion   /skill digitada (não passa pelo PostToolUse)
- │    PreCompact            marca sessão para revisão
+ ├─ CAPTURE (async hooks, no LLM) ────────────────────────► events.db (SQLite, WAL)
+ │    UserPromptSubmit      correction / "remember, always, never, from now on"
+ │    PostToolUse(Failure)  error → recovery; skill use; memory read;
+ │                          write to memory/skill (ledger by observation)
+ │    UserPromptExpansion   typed /skill (does not go through PostToolUse)
+ │    PreCompact            mark session for review
  │
- ├─ REFLEXÃO A — no loop (Stop, síncrono)
- │    sinal alto + cooldown ok + !stop_hook_active  →  {"decision":"block", reason: roteiro}
- │    o próprio Claude revisa o turno com a skill `aprender` e grava (Write/Edit)
+ ├─ REFLECTION A — in-loop (Stop, synchronous)
+ │    high signal + cooldown ok + !stop_hook_active  →  {"decision":"block", reason: script}
+ │    Claude itself reviews the turn with the `learn` skill and writes (Write/Edit)
  │
- ├─ SessionEnd (≤1,5 s) ─► enfileira sessão + dispara worker destacado
+ ├─ SessionEnd (≤1.5 s) ─► enqueue session + spawn detached worker
  │
- └─ REFLEXÃO B — background (worker Node destacado)
-      transcript → resumo compacto → `claude -p` (Haiku, JSON schema) → propostas
-      → CURADOR (determinístico): dedupe vs inventário → create | patch | skip
-      → roteamento → limites → grava → ledger → aviso na próxima sessão
+ └─ REFLECTION B — background (detached Node worker)
+      transcript → compact digest → `claude -p` (Haiku, JSON schema) → proposals
+      → CURATOR (deterministic): dedupe vs inventory → create | patch | skip
+      → routing → limits → write → ledger → notice in the next session
 
-Dashboard (node, 127.0.0.1) ◄── events.db + varredura de memórias/skills + usage dos transcripts
+Dashboard (node, 127.0.0.1) ◄── events.db + scan of memories/skills + transcript usage
 ```
 
-### 3.1 Onde cada coisa fica
+### 3.1 Where things live
 
-| Conteúdo | Local | Por quê |
+| Content | Location | Why |
 |---|---|---|
-| Perfil global do usuário (equivalente ao `USER.md` do Hermes) | `~/.ouroboros/user.md` | Sobrevive a desinstalar/atualizar; editável à mão; injetado em toda sessão |
-| Config avançada (roteamento, limites) | `~/.ouroboros/config.json` | Estruturas que `userConfig` não expressa bem |
-| Telemetria + ledger | `${CLAUDE_PLUGIN_DATA}/events.db` | Estado do plugin; persiste entre updates |
-| Fatos de projeto | auto memory nativa (`~/.claude/projects/<proj>/memory/*.md` + `MEMORY.md`), respeitando `autoMemoryDirectory` | Coopera com o mecanismo nativo em vez de competir |
-| Skills aprendidas genéricas | `~/.claude/skills/learned-<nome>/SKILL.md` | Valem em todos os projetos; prefixo identifica a origem |
-| Skills aprendidas de projeto | destino do mapa de roteamento (ex.: `nisus-*` → `~/source/repos/nisus-skills/...`) ou `.claude/skills/` do repo | Não vazam para outros projetos |
+| Global user profile (Hermes `USER.md` equivalent) | `~/.ouroboros/user.md` | Survives uninstall/update; hand-editable; injected into every session |
+| Advanced config (routing, limits) | `~/.ouroboros/config.json` | Structures `userConfig` doesn't express well |
+| Telemetry + ledger | `${CLAUDE_PLUGIN_DATA}/events.db` | Plugin state; persists across updates |
+| Project facts | native auto memory (`~/.claude/projects/<proj>/memory/*.md` + `MEMORY.md`), honoring `autoMemoryDirectory` | Cooperates with the native mechanism instead of competing |
+| Generic learned skills | `~/.claude/skills/learned-<name>/SKILL.md` | Apply to every project; prefix marks the origin |
+| Project learned skills | target from the routing map (e.g. `nisus-*` → `~/source/repos/nisus-skills/...`) or the repo's `.claude/skills/` | Don't leak into other projects |
 
-Toda memória/skill criada pelo Ouroboros leva no frontmatter:
+Every memory/skill Ouroboros creates carries in its frontmatter:
 
 ```yaml
 metadata:
   origin: ouroboros
-  id: lrn_01J...          # chave no ledger
-  confidence: 0.6        # 0.3 tentativo … 0.9 quase certo
+  id: lrn_01J...          # ledger key
+  confidence: 0.6        # 0.3 tentative … 0.9 near-certain
   created: 2026-11-07
   trigger: correction     # correction | remember | recovery | long_task | repetition | review
 ```
 
-## 4. Componentes do plugin
+## 4. Plugin components
 
 ```
 ouroboros/
 ├── .claude-plugin/
-│   ├── plugin.json            # manifesto + userConfig
-│   └── marketplace.json       # o repo é o próprio marketplace
-├── hooks/hooks.json           # todos os hooks, exec form: node <dispatcher> <evento>
+│   ├── plugin.json            # manifest + userConfig
+│   └── marketplace.json       # the repo is its own marketplace
+├── hooks/hooks.json           # all hooks, exec form: node <dispatcher> <event>
 ├── scripts/
-│   ├── hook.mjs               # dispatcher único (um processo por evento)
+│   ├── hook.mjs               # single dispatcher (one process per event)
 │   ├── db.mjs                 # schema + migrations (node:sqlite)
-│   ├── signals.mjs            # detecção de correção/pedido de lembrar (regex PT/EN)
-│   ├── transcript.mjs         # leitura do JSONL → resumo compacto p/ o revisor
-│   ├── review-worker.mjs      # reflexão B (claude -p) + chamada ao curador
-│   ├── curator.mjs            # dedupe, roteamento, limites, escrita, ledger
-│   └── paths.mjs              # resolução de memória nativa, skills, config
+│   ├── signals.mjs            # correction / remember-request detection (PT/EN regex)
+│   ├── transcript.mjs         # JSONL → compact digest for the reviewer
+│   ├── review-worker.mjs      # reflection B (claude -p) + curator call
+│   ├── curator.mjs            # dedupe, routing, limits, writing, ledger
+│   └── paths.mjs              # resolves native memory, skills, config
 ├── skills/
-│   ├── aprender/SKILL.md      # roteiro de revisão (nudge e manual: /ouroboros:aprender)
-│   ├── desfazer/SKILL.md      # reverte a última (ou uma) escrita
-│   ├── esquecer/SKILL.md      # arquiva um aprendizado
-│   └── dashboard/SKILL.md     # sobe o dashboard e abre o navegador
-├── agents/curador.md          # subagente (modelo barato) p/ consolidação quando o orçamento estoura
+│   ├── learn/SKILL.md         # review script (nudge and manual: /ouroboros:learn)
+│   ├── undo/SKILL.md          # reverts the last (or a given) write
+│   ├── forget/SKILL.md        # archives a learning
+│   └── dashboard/SKILL.md     # starts the dashboard and opens the browser
+├── agents/curator.md          # cheap-model subagent for consolidation when a budget overflows
 ├── dashboard/
-│   ├── server.mjs             # http nativo, 127.0.0.1, API JSON
-│   └── public/                # HTML/CSS/JS sem build; gráficos em SVG próprio
+│   ├── server.mjs             # native http, 127.0.0.1, JSON API
+│   └── public/                # build-free HTML/CSS/JS; hand-rolled SVG charts
 └── DESIGN.md
 ```
 
-Sem pasta `bin/` (impede instalação via claude.ai/Cowork).
+No `bin/` folder (it blocks installation through claude.ai/Cowork).
 
 ### 4.1 `userConfig`
 
-| Chave | Tipo | Padrão | Uso |
+| Key | Type | Default | Use |
 |---|---|---|---|
-| `autonomy` | string (`auto`/`hybrid`/`queue`) | `auto` | Política de escrita (§7) |
-| `reviewer_model` | string | `haiku` | Modelo do revisor em background |
-| `background_review` | boolean | `true` | Liga/desliga a reflexão B |
-| `inloop_nudge` | boolean | `true` | Liga/desliga a reflexão A |
-| `nudge_cooldown_min` | number | `20` | Intervalo mínimo entre nudges por sessão |
-| `monthly_budget_usd` | number | `5` | Teto do revisor; ao estourar, reflexão B pausa até o mês seguinte |
-| `language` | string | `pt-BR` | Idioma dos aprendizados e avisos |
+| `autonomy` | string (`auto`/`hybrid`/`queue`) | `auto` | Write policy (§7) |
+| `reviewer_model` | string | `haiku` | Background reviewer model |
+| `background_review` | boolean | `true` | Toggles reflection B |
+| `inloop_nudge` | boolean | `true` | Toggles reflection A |
+| `nudge_cooldown_min` | number | `20` | Minimum interval between nudges per session |
+| `monthly_budget_usd` | number | `5` | Reviewer cap; when exceeded, reflection B pauses until next month |
+| `language` | string | `pt-BR` | Language of learnings and notices |
 
 ### 4.2 `~/.ouroboros/config.json`
 
@@ -136,91 +136,91 @@ Sem pasta `bin/` (impede instalação via claude.ai/Cowork).
 }
 ```
 
-## 5. Captura (hooks)
+## 5. Capture (hooks)
 
-Todos em **exec form** (`"command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs", "<evento>"]`) — sem problemas de aspas/shell no Windows. Hooks que só registram rodam com `async: true` (não bloqueiam a sessão). Guarda de recursão: se `OUROBOROS_REVIEWER=1` (sessões do próprio revisor), todo hook sai imediatamente.
+All in **exec form** (`"command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs", "<event>"]`) — no quoting/shell issues on Windows. Logging-only hooks run with `async: true` (never block the session). Recursion guard: if `OUROBOROS_REVIEWER=1` (the reviewer's own sessions), every hook exits immediately.
 
-| Evento | Matcher | Modo | O que faz |
+| Event | Matcher | Mode | What it does |
 |---|---|---|---|
-| `SessionStart` | `startup\|resume\|clear\|compact` | síncrono | Cria a sessão no DB; injeta `user.md` + protocolo (§6.1) + avisos pendentes do revisor ("📝 desde a última sessão aprendi: …"); varre fila órfã e redispara worker se necessário |
-| `UserPromptSubmit` | — | async | Conta prompt; `signals.mjs` detecta correção/pedido de lembrar → evento com trecho |
-| `UserPromptExpansion` | — | async | `/skill` digitada → `skill_used` |
-| `PostToolUse` | `Skill` | async | `skill_used` (+ incrementa `uses` se for aprendida) |
-| `PostToolUse` | `Read` | async | Leitura dentro de diretório de memória → `memory_read` |
-| `PostToolUse` | `Write\|Edit` | async | Escrita em memória/skill → ledger por observação (pega também o que o Claude grava por conta própria) |
-| `PostToolUse` | `*` | async | Conta tool calls; fecha sequência erro → sucesso no mesmo alvo como `recovery` |
-| `PostToolUseFailure` | `*` | async | `tool_fail` com alvo (arquivo/comando normalizado) |
-| `PreCompact` | `manual\|auto` | async | Marca sessão `needs_review` |
-| `Stop` | — | **síncrono** | Decide o nudge (§6.2) |
-| `SessionEnd` | — | síncrono, < 300 ms | Enfileira e dispara `review-worker.mjs` destacado (`spawn` com `detached`, `windowsHide`, `unref`) |
+| `SessionStart` | `startup\|resume\|clear\|compact` | sync | Creates the session row; injects `user.md` + protocol (§6.1) + pending reviewer notices ("📝 since the last session I learned: …"); sweeps orphaned queue and respawns the worker if needed |
+| `UserPromptSubmit` | — | async | Counts the prompt; `signals.mjs` detects correction/remember-request → event with excerpt |
+| `UserPromptExpansion` | — | async | Typed `/skill` → `skill_used` |
+| `PostToolUse` | `Skill` | async | `skill_used` (+ bumps `uses` if it is a learned skill) |
+| `PostToolUse` | `Read` | async | Read inside a memory directory → `memory_read` |
+| `PostToolUse` | `Write\|Edit` | async | Write to memory/skill → ledger by observation (also catches what Claude saves on its own) |
+| `PostToolUse` | `*` | async | Counts tool calls; closes an error → success sequence on the same target as `recovery` |
+| `PostToolUseFailure` | `*` | async | `tool_fail` with target (normalized file/command) |
+| `PreCompact` | `manual\|auto` | async | Marks the session `needs_review` |
+| `Stop` | — | **sync** | Decides the nudge (§6.2) |
+| `SessionEnd` | — | sync, < 300 ms | Enqueues and spawns `review-worker.mjs` detached (`spawn` with `detached`, `windowsHide`, `unref`) |
 
-Meta de latência: hooks síncronos < 150 ms (dominado pelo start do Node), async não contam.
+Latency target: sync hooks < 150 ms (dominated by Node startup); async ones don't count.
 
-## 6. Reflexão
+## 6. Reflection
 
-### 6.1 Protocolo injetado (o "system prompt" do Hermes, como contexto de sessão)
+### 6.1 Injected protocol (Hermes's "system prompt", as session context)
 
-Injetado pelo `SessionStart`, curto (~600 caracteres), em vez de editar o `CLAUDE.md` do usuário — assim o plugin é autocontido e compartilhável:
+Injected by `SessionStart`, short (~600 characters), instead of editing the user's `CLAUDE.md` — so the plugin is self-contained and shareable:
 
-> Ouroboros ativo. Sem precisar pedir, salve quando aprender: preferência do usuário, correção de abordagem, convenção do projeto, fato de ambiente. Crie ou ajuste uma skill quando: montar um workflow de vários passos reaproveitável; achar o caminho que funciona depois de erros; o usuário corrigir sua abordagem. Prefira ajustar o existente a criar novo. Não salve o que é derivável do código/CLAUDE.md nem o que é efêmero. Ao gravar, avise em 1 linha: "📝 aprendi: …". Detalhes: skill `ouroboros:aprender`.
+> Ouroboros is active. Without being asked, save when you learn: a user preference, a correction of your approach, a project convention, an environment fact. Create or patch a skill when: you worked out a reusable multi-step workflow; you found the working path after errors; the user corrected your approach. Prefer patching what exists over creating new. Don't save what is derivable from the code/CLAUDE.md or what is ephemeral. When you save, say so in one line: "📝 learned: …". Details: skill `ouroboros:learn`.
 
-### 6.2 Reflexão A — nudge no loop (Stop)
+### 6.2 Reflection A — in-loop nudge (Stop)
 
-Dispara `{"decision":"block","reason": <roteiro>}` somente se **todas**:
+Returns `{"decision":"block","reason": <script>}` only if **all** hold:
 
-- `stop_hook_active` é falso (evita loop);
-- passou `nudge_cooldown_min` desde o último nudge na sessão;
-- houve **sinal alto** desde o último nudge: `correction`, `remember`, `recovery`, ou ≥ 5 tool calls numa tarefa concluída (heurística do Hermes);
-- o próprio Claude ainda não gravou nada desde o sinal (ledger por observação).
+- `stop_hook_active` is false (prevents loops);
+- `nudge_cooldown_min` has passed since the session's last nudge;
+- there was a **high signal** since the last nudge: `correction`, `remember`, `recovery`, or ≥ 5 tool calls in a completed task (Hermes's heuristic);
+- Claude has not already written anything since the signal (ledger by observation).
 
-O `reason` cita os sinais concretos ("o usuário corrigiu: 'não, use pnpm'"; "3 falhas em `dotnet test` seguidas de sucesso") e manda executar a skill `aprender` de forma breve, terminando com "nada a aprender" se nada passar nos filtros. Custo medido pelo `usage` do transcript entre o nudge e o próximo `Stop`.
+The `reason` quotes the concrete signals ("the user corrected: 'no, use pnpm'"; "3 failures in `dotnet test` followed by success") and tells Claude to run the `learn` skill briefly, ending with "nothing to learn" if nothing passes the filters. Cost is measured from transcript `usage` between the nudge and the next `Stop`.
 
-### 6.3 Reflexão B — revisor em background
+### 6.3 Reflection B — background reviewer
 
-1. **Gatilho**: `SessionEnd` (ou sessão `needs_review` órfã encontrada no próximo `SessionStart`). Ignora sessões com < 3 prompts ou já totalmente cobertas pelo nudge.
-2. **Resumo**: `transcript.mjs` reduz o JSONL a falas do usuário, texto do assistente, nomes de ferramentas, erros e eventos marcados; teto ~20k tokens.
-3. **Inventário**: títulos + descrições das memórias/skills existentes no escopo (para o modelo escolher `patch` em vez de `create`).
-4. **Chamada**: `claude -p --model <reviewer_model> --output-format json` com JSON schema de saída, sem ferramentas, `cwd` em `${CLAUDE_PLUGIN_DATA}/reviewer` (para os transcripts do revisor não poluírem os projetos do usuário), `OUROBOROS_REVIEWER=1`.
-5. **Saída**: lista de propostas `{kind, scope, op: create|patch, target?, title, body | patch, confidence, trigger, evidence, duplicates_learning?}`. O campo `duplicates_learning` indica "o usuário precisou repetir algo que já estava aprendido" → métrica de *miss* (§9).
-6. **Custo**: `total_cost_usd` e tokens do resultado vão para `reviews`. Se o acumulado do mês ≥ `monthly_budget_usd`, o worker não roda.
+1. **Trigger**: `SessionEnd` (or an orphaned `needs_review` session found at the next `SessionStart`). Skips sessions with < 3 prompts or already fully covered by nudges.
+2. **Digest**: `transcript.mjs` reduces the JSONL to user turns, assistant text, tool names, errors and flagged events; capped at ~20k tokens.
+3. **Inventory**: titles + descriptions of the existing memories/skills in scope (so the model picks `patch` over `create`).
+4. **Call**: `claude -p --model <reviewer_model> --output-format json` with an output JSON schema, no tools, `cwd` at `${CLAUDE_PLUGIN_DATA}/reviewer` (so the reviewer's transcripts don't pollute the user's projects), `OUROBOROS_REVIEWER=1`.
+5. **Output**: list of proposals `{kind, scope, op: create|patch, target?, title, body | patch, confidence, trigger, evidence, duplicates_learning?}`. `duplicates_learning` means "the user had to repeat something already learned" → *miss* metric (§9).
+6. **Cost**: `total_cost_usd` and tokens from the result go to `reviews`. If the month's total ≥ `monthly_budget_usd`, the worker doesn't run.
 
-### 6.4 Roteiro da skill `aprender` (usada por A e manualmente)
+### 6.4 `learn` skill script (used by A and manually)
 
-- Filtros de qualidade (Claudeception + Hermes): **descoberta real** (não foi só ler doc), **verificada** (funcionou), **reutilizável** ("ajudaria daqui a 6 meses?"), **não derivável** do código/CLAUDE.md, **não efêmera**, **fonte confiável** (fala do usuário ou resultado observado).
-- Classificar: fato → memória (tipo nativo `user|feedback|project|reference`; perfil global → `user.md`); procedimento → skill.
-- Sempre checar o existente antes; preferir patch pontual.
-- Formato de memória idêntico ao da auto memory nativa (frontmatter `name/description/metadata.type` + linha no `MEMORY.md`), acrescido de `metadata.origin/id/confidence`.
+- Quality filters (Claudeception + Hermes): **real discovery** (not just reading docs), **verified** (it worked), **reusable** ("would this help in 6 months?"), **not derivable** from code/CLAUDE.md, **not ephemeral**, **trusted source** (user turn or observed outcome).
+- Classify: fact → memory (native type `user|feedback|project|reference`; global profile → `user.md`); procedure → skill.
+- Always check what exists first; prefer a targeted patch.
+- Memory format identical to native auto memory (frontmatter `name/description/metadata.type` + a line in `MEMORY.md`), plus `metadata.origin/id/confidence`.
 
-## 7. Curadoria e política de escrita
+## 7. Curation and write policy
 
-Decisão do dono: **`autonomy = auto`** (como o Hermes). Consequências:
+Owner decision: **`autonomy = auto`** (like Hermes). Consequences:
 
-- Proposta que passa nos filtros é gravada direto; aviso de 1 linha na sessão (A) ou na próxima sessão (B).
-- **Undo é obrigatório desde a primeira escrita**: `/ouroboros:desfazer` e botão no dashboard revertem pelo diff do ledger.
-- Confiança baixa (< 0,5) entra mesmo assim, mas é a primeira a ser arquivada se não for usada.
-- Os modos `hybrid`/`queue` ficam implementados como opção para quem instalar o plugin (fila no dashboard).
+- A proposal that passes the filters is written directly; one-line notice in the session (A) or in the next session (B).
+- **Undo is mandatory from the first write**: `/ouroboros:undo` and a dashboard button revert using the ledger diff.
+- Low confidence (< 0.5) still goes in, but is the first to be archived if unused.
+- `hybrid`/`queue` modes are implemented as options for other users (queue in the dashboard).
 
-Passos do curador (`curator.mjs`, determinístico):
+Curator steps (`curator.mjs`, deterministic):
 
-1. **Validar** schema e tamanho.
-2. **Dedupe**: similaridade lexical (trigramas, Jaccard ≥ 0,6) contra o inventário do escopo → converte `create` em `patch` ou descarta.
-3. **Rotear**: escopo `global` → `user.md` ou `~/.claude/skills/learned-*`; `project` → memória nativa do projeto ou `routing[].skillsDir`; sem regra → `.claude/skills/` do repo.
-4. **Limites**: se a escrita passar de 80% de qualquer orçamento → dispara consolidação (subagente `curador`: funde parecidos, encurta, arquiva os de menor `confidence × uso`). Acima de 100%, a escrita só entra após consolidar.
-5. **Gravar** (atomicamente: arquivo temporário + rename) e registrar em `writes` com diff.
-6. **Aviso** pendente para a próxima sessão.
+1. **Validate** schema and size.
+2. **Dedupe**: lexical similarity (trigrams, Jaccard ≥ 0.6) against the scope's inventory → turns `create` into `patch` or drops it.
+3. **Route**: `global` scope → `user.md` or `~/.claude/skills/learned-*`; `project` → the project's native memory or `routing[].skillsDir`; no rule → the repo's `.claude/skills/`.
+4. **Limits**: if the write takes any budget past 80% → trigger consolidation (`curator` subagent: merges similar items, shortens, archives the lowest `confidence × uses`). Above 100%, the write only lands after consolidating.
+5. **Write** atomically (temp file + rename) and record it in `writes` with the diff.
+6. **Notice** queued for the next session.
 
-### 7.1 Ciclo de vida
+### 7.1 Lifecycle
 
 ```
-proposta ─► ativo (conf. 0,3–0,9) ─► reforçado (+0,1 por uso; +0,2 se o usuário confirmar)
+proposal ─► active (conf. 0.3–0.9) ─► reinforced (+0.1 per use; +0.2 if the user confirms)
                      │
-                     ├─► arquivado (60 dias sem uso, ou consolidado em outro)
-                     └─► revertido (undo do usuário; conta como sinal negativo p/ o revisor)
+                     ├─► archived (60 days unused, or merged into another)
+                     └─► reverted (user undo; counts as a negative signal for the reviewer)
 ```
 
-Arquivar = mover para `~/.ouroboros/archive/` (fora do contexto), nunca apagar.
+Archive = move to `~/.ouroboros/archive/` (out of context), never delete.
 
-## 8. Modelo de dados (`events.db`)
+## 8. Data model (`events.db`)
 
 ```sql
 sessions  (id, project, cwd, started_at, ended_at, prompts, tool_calls,
@@ -238,80 +238,81 @@ reviews   (id, session_id, mode, model, input_tokens, output_tokens,
 nudges    (id, session_id, ts, signals_json, outcome, tokens)
 ```
 
-WAL + `busy_timeout` para várias sessões simultâneas. Migrations versionadas em `db.mjs`.
+WAL + `busy_timeout` for concurrent sessions. Versioned migrations in `db.mjs`.
 
 ## 9. Dashboard
 
-`/ouroboros:dashboard` sobe `node dashboard/server.mjs` em `127.0.0.1:4747` (porta configurável) e abre o navegador. HTML/JS sem build, gráficos em SVG próprio, tema claro/escuro. API local protegida por token gerado no start (evita que outra página do navegador chame os endpoints).
+`/ouroboros:dashboard` starts `node dashboard/server.mjs` on `127.0.0.1:4747` (configurable port) and opens the browser. Build-free HTML/JS, hand-rolled SVG charts, light/dark theme. The local API is protected by a token generated at startup (so another browser page can't call the endpoints). UI text localized (pt-BR default + en).
 
-### 9.1 Telas
+### 9.1 Screens
 
-| Tela | Conteúdo |
+| Screen | Content |
 |---|---|
-| **Visão geral** | KPIs da semana: aprendizados novos, taxa de aproveitamento, taxa de correção vs baseline, custo do mês vs teto; linha do tempo das últimas escritas |
-| **Inventário** | Todas as memórias/skills (aprendidas e nativas), filtro por escopo/projeto/tipo/status; confiança, usos, último uso; ações: ver diff, editar, arquivar, desfazer |
-| **Valor** | Correções por sessão ao longo do tempo (com marca de quando o aprendizado foi ligado); *misses*; sessões com ≥ 1 aprendizado usado |
-| **Custo** | Revisor (US$ e tokens por dia), nudges (tokens), overhead fixo de contexto; projeção do mês |
-| **Saúde** | Barras de orçamento (user.md, MEMORY.md, nº de skills, listagem de skills), itens parados, duplicatas suspeitas, erros de hooks/worker |
+| **Overview** | Weekly KPIs: new learnings, utilization rate, correction rate vs baseline, month cost vs cap; timeline of recent writes |
+| **Inventory** | All memories/skills (learned and native), filter by scope/project/type/status; confidence, uses, last use; actions: view diff, edit, archive, undo |
+| **Value** | Corrections per session over time (marking when learning was enabled); *misses*; sessions with ≥ 1 learned item used |
+| **Cost** | Reviewer (USD and tokens per day), nudges (tokens), fixed context overhead; month projection |
+| **Health** | Budget bars (user.md, MEMORY.md, skill count, skill listing), stale items, suspected duplicates, hook/worker errors |
 
-### 9.2 Métricas (definições)
+### 9.2 Metrics (definitions)
 
-| Métrica | Definição |
+| Metric | Definition |
 |---|---|
-| Taxa de correção | `correction` ÷ prompts, média móvel de 7 dias. **Indicador principal de valor**: deve cair vs baseline |
-| Misses | Propostas com `duplicates_learning` — o usuário precisou repetir algo já aprendido (memória falhou: não carregou, descrição ruim, ou foi ignorada) |
-| Taxa de aproveitamento | Aprendizados ativos com ≥ 1 uso nos últimos 30 dias ÷ ativos |
-| Hits | Sessões com ≥ 1 `skill_used`/`memory_read` de item aprendido |
-| Custo do revisor | Σ `reviews.cost_usd` (em assinatura, é equivalente de cota, não cobrança extra) |
-| Custo do nudge | Σ tokens do assistente entre o nudge e o `Stop` seguinte |
-| Overhead fixo | (chars de `user.md` + protocolo + linhas do `MEMORY.md` + descrições de skills aprendidas) ÷ 4 × sessões |
-| Custo por hit | (revisor + nudge + overhead) ÷ hits |
+| Correction rate | `correction` ÷ prompts, 7-day moving average. **Primary value indicator**: should drop vs baseline |
+| Misses | Proposals with `duplicates_learning` — the user had to repeat something already learned (memory failed: not loaded, poor description, or ignored) |
+| Utilization rate | Active learnings with ≥ 1 use in the last 30 days ÷ active |
+| Hits | Sessions with ≥ 1 `skill_used`/`memory_read` of a learned item |
+| Reviewer cost | Σ `reviews.cost_usd` (on a subscription this is quota-equivalent, not an extra charge) |
+| Nudge cost | Σ assistant tokens between a nudge and the following `Stop` |
+| Fixed overhead | (chars of `user.md` + protocol + `MEMORY.md` lines + learned skill descriptions) ÷ 4 × sessions |
+| Cost per hit | (reviewer + nudge + overhead) ÷ hits |
 
-## 10. Distribuição
+## 10. Distribution
 
-- Repositório GitHub (privado por enquanto) que é o próprio marketplace (`.claude-plugin/marketplace.json`).
-- Instalação: `/plugin marketplace add lucamartins/ouroboros` → `/plugin install ouroboros@ouroboros`.
-- `claude plugin validate --strict` no CI.
-- Requisito declarado: Node ≥ 22.13 no PATH. O `SessionStart` checa a versão e, se faltar, avisa uma vez e desativa os hooks silenciosamente.
+- GitHub repository (private for now) that is its own marketplace (`.claude-plugin/marketplace.json`).
+- Install: `/plugin marketplace add lucamartins/ouroboros` → `/plugin install ouroboros@ouroboros`.
+- `claude plugin validate --strict` in CI.
+- Declared requirement: Node ≥ 22.13 on PATH. `SessionStart` checks the version and, if missing, warns once and disables the hooks silently.
 
-## 11. Riscos e mitigação
+## 11. Risks and mitigations
 
-| Risco | Mitigação |
+| Risk | Mitigation |
 |---|---|
-| Poluição de memória (modo auto) | Filtros de qualidade, dedupe, limites rígidos com consolidação, arquivamento por desuso, undo |
-| Loop infinito no `Stop` | `stop_hook_active`, cooldown, no máximo N nudges por sessão |
-| Latência | Captura async; um único processo Node por evento; LLM fora do caminho crítico |
-| `SessionEnd` com 1,5 s | Só enfileira e dispara worker destacado; fila órfã reprocessada no próximo `SessionStart` |
-| Recursão (o revisor dispara hooks) | `OUROBOROS_REVIEWER=1` desliga tudo; `cwd` separado; sessões marcadas `is_reviewer` fora das métricas |
-| Prompt injection ensinando o agente | Só aprende de falas do usuário e resultados observados; texto de ferramentas nunca vira aprendizado literal |
-| Vazamento entre projetos | Roteamento por escopo; `excludeProjects` |
-| Dados sensíveis gravados | Filtro de segredos (padrões de token/chave/senha) antes de qualquer escrita; dashboard só em `127.0.0.1` |
-| Orçamento da listagem de skills (~1% do contexto) | Limite de nº de skills aprendidas e de tamanho da descrição; métrica na tela Saúde |
-| Custo do revisor | Haiku, resumo compacto do transcript, teto mensal, pular sessões curtas ou já cobertas pelo nudge |
+| Memory pollution (auto mode) | Quality filters, dedupe, hard limits with consolidation, archive on disuse, undo |
+| Infinite `Stop` loop | `stop_hook_active`, cooldown, max N nudges per session |
+| Latency | Async capture; a single Node process per event; LLM off the critical path |
+| `SessionEnd` 1.5 s budget | Only enqueues and spawns a detached worker; orphaned queue reprocessed at the next `SessionStart` |
+| Recursion (reviewer fires hooks) | `OUROBOROS_REVIEWER=1` disables everything; separate `cwd`; sessions flagged `is_reviewer` excluded from metrics |
+| Prompt injection teaching the agent | Learn only from user turns and observed outcomes; tool text never becomes a literal learning |
+| Cross-project leakage | Scope-based routing; `excludeProjects` |
+| Sensitive data written | Secret filter (token/key/password patterns) before any write; dashboard bound to `127.0.0.1` only |
+| Skill listing budget (~1% of context) | Cap on learned-skill count and description length; metric on the Health screen |
+| Reviewer cost | Haiku, compact transcript digest, monthly cap, skip short sessions or ones already covered by nudges |
 
-## 12. Decisões tomadas
+## 12. Decisions
 
-| Decisão | Escolha |
+| Decision | Choice |
 |---|---|
-| Nome | `ouroboros` |
-| Autonomia | Automático total (como o Hermes); `hybrid`/`queue` disponíveis como opção |
-| Reflexão | Ambas: nudge no `Stop` em sinal alto + revisor em background (Haiku) |
-| Destino das skills | Roteamento automático (global vs projeto, com mapa por repositório) |
-| Repositório | GitHub privado por enquanto |
-| Runtime | Node ≥ 22.13, zero dependências |
+| Name | `ouroboros` |
+| Autonomy | Fully automatic (like Hermes); `hybrid`/`queue` available as options |
+| Reflection | Both: `Stop` nudge on high signal + background reviewer (Haiku) |
+| Skill destination | Automatic routing (global vs project, with a per-repo map) |
+| Repository | Private GitHub for now |
+| Runtime | Node ≥ 22.13, zero dependencies |
+| Language | Code, docs and skills in English; learnings, notices and dashboard UI localized (pt-BR default + en) |
 
-## 13. Fases
+## 13. Phases
 
-| Fase | Entrega | Critério de pronto |
+| Phase | Deliverable | Done when |
 |---|---|---|
-| **1. Medir** | Captura completa, `events.db`, dashboard só leitura (Visão geral, Inventário, Saúde) | 1–2 semanas de baseline de correções/misses; hooks sem latência perceptível |
-| **2. Aprender manual** | Skill `aprender`, curador, ledger, `desfazer`/`esquecer`, `user.md` + protocolo no `SessionStart` | `/ouroboros:aprender` grava, deduplica, roteia e desfaz corretamente |
-| **3. Aprender sozinho** | Nudge no `Stop`, worker em background, avisos, telas Valor e Custo | Taxa de correção cai vs baseline com custo dentro do teto |
-| **4. Ciclo de vida e distribuição** | Confiança/decay, consolidação automática, ações no dashboard, marketplace, `validate --strict` no CI, README | Outra pessoa instala do zero no Windows e no macOS |
+| **1. Measure** | Full capture, `events.db`, read-only dashboard (Overview, Inventory, Health) | 1–2 weeks of correction/miss baseline; hooks with no noticeable latency |
+| **2. Manual learning** | `learn` skill, curator, ledger, `undo`/`forget`, `user.md` + protocol at `SessionStart` | `/ouroboros:learn` writes, dedupes, routes and undoes correctly |
+| **3. Self-learning** | `Stop` nudge, background worker, notices, Value and Cost screens | Correction rate drops vs baseline with cost under the cap |
+| **4. Lifecycle and distribution** | Confidence/decay, automatic consolidation, dashboard actions, marketplace, `validate --strict` in CI, README | Someone else installs it from scratch on Windows and macOS |
 
-## 14. Perguntas em aberto
+## 14. Open questions
 
-1. Regex de correção em PT/EN basta, ou vale um classificador Haiku opcional (custo extra por prompt)?
-2. `user.md` deve ser só perfil (como o `USER.md` do Hermes) ou também notas globais do agente (como o `MEMORY.md` do Hermes)? Proposta inicial: dois blocos no mesmo arquivo, com orçamentos separados.
-3. Revisor deve ler também sessões de subagentes/workflows, ou só a sessão principal?
-4. Painel dentro do Claude Code (mod/status line com "📝 3 aprendizados nesta sessão") além do dashboard web?
+1. Is PT/EN correction regex enough, or is an optional Haiku classifier worth it (extra cost per prompt)?
+2. Should `user.md` be only a profile (like Hermes's `USER.md`) or also global agent notes (like Hermes's `MEMORY.md`)? Initial proposal: two blocks in the same file with separate budgets.
+3. Should the reviewer also read subagent/workflow sessions, or only the main session?
+4. An in-Claude-Code panel (mod/status line with "📝 3 learnings this session") in addition to the web dashboard?
