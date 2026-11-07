@@ -17,8 +17,9 @@ import { options } from './config.mjs';
 import { apply as curatorApply } from './curator.mjs';
 import { applyChangeset, applyEdits, changesetNeedsApproval, claimsOf, getChangeset, pendingChangeset, saveChangeset } from './changesets.mjs';
 import { logError } from './db.mjs';
-import { groundIdentifiers, identifiersIn, knowledgeKind, PATCHABLE, resolveOwner, tokenize } from './knowledge.mjs';
+import { buildIndex, groundIdentifiers, identifiersIn, knowledgeKind, PATCHABLE, resolveOwner, tokenize } from './knowledge.mjs';
 import { insertReview, runModel, usageOf } from './review-worker.mjs';
+import { rubricText } from './rubric.mjs';
 import { describe, noteFor, rewriteItem, triage } from './triage.mjs';
 
 const FULL_FILE_CHARS = 40_000;
@@ -102,16 +103,19 @@ export function fileView(text, claimsText) {
   return { text: `OUTLINE:\n${outline}\n\nEXCERPTS (verbatim):\n${parts.join('\n\n')}`, partial: true };
 }
 
-export function editorPrompt({ file, kind, view, claims, grounding }) {
+export function editorPrompt({ file, kind, view, claims, grounding, elsewhere = [] }) {
   return `You maintain one file that an AI coding assistant reads as knowledge: ${KIND_DESC[kind] || 'a knowledge file'}. Learnings (CLAIMS) were proposed for it. Decide what each one means for this file and write the edits.
 
+RUBRIC — what is worth writing at all:
+${rubricText()}
+
 STATUS of each claim:
-- "covered": the file already says it, in any words. No edit.
+- "covered": the file already says it, in any words, or another file the assistant reads (ELSEWHERE) already does. No edit: never copy knowledge that already lives in another file.
 - "contradicted": the PROJECT EVIDENCE (tracked code, scripts, config) shows the claim is false or outdated, or it names things that do not exist. No edit.
-- "adds": true, lasting, and missing from the file. Add it where it belongs.
-- "corrects": the file states something that the claim shows is wrong or outdated, and the claim is backed by the project evidence or by the user. Replace the wrong text.
-- "conflict": it contradicts another claim or the file, and neither the project evidence nor recency settles it (set conflicts_with when it is another claim). No edit.
-When two claims disagree, prefer the one the project evidence confirms, then the one from the more recent session.
+- "adds": true, lasting, passes the rubric, and missing from the file. Add it where it belongs.
+- "corrects": the file states something wrong or outdated, shown by the project evidence or by the user explicitly changing a standing rule ("from now on", "that changed"). A request made once, for one situation, never overturns a rule the file states: that claim is "conflict". Replace the wrong text.
+- "conflict": it contradicts another claim or the file, and neither the project evidence nor an explicit change of rule settles it (set conflicts_with when it is another claim). No edit.
+When two claims disagree, prefer the one the project evidence confirms, then an explicit change of rule, then the one from the more recent session.
 Read the whole file for each claim: text elsewhere in the file that says the opposite must be corrected by the same edits, or the file would contradict itself.
 
 EDITS:
@@ -133,7 +137,38 @@ ${claims.map((c) => `<claim id="${c.id}"${c.when ? ` session="${c.when}"` : ''}$
 PROJECT EVIDENCE (where the project's tracked code and config mention what the claims name; "not found" means no tracked file mentions it):
 ${grounding.length ? grounding.map((g) => (g.hits.length
     ? `- \`${g.id}\`:\n${g.hits.map((h) => `    ${h.file}:${h.line}: ${h.text}`).join('\n')}`
-    : `- \`${g.id}\`: ${g.exists ? 'exists' : 'not found'}`)).join('\n') : '(nothing to look up)'}`;
+    : `- \`${g.id}\`: ${g.exists ? 'exists' : 'not found'}`)).join('\n') : '(nothing to look up)'}
+
+ELSEWHERE (what other files the assistant reads say on these topics):
+${elsewhere.length ? elsewhere.map((e) => `<excerpt file="${e.file}"${e.heading ? ` heading="${e.heading}"` : ''}>\n${e.text.slice(0, 700)}\n</excerpt>`).join('\n') : '(nothing related)'}`;
+}
+
+const ELSEWHERE_PER_CLAIM = 2;
+const ELSEWHERE_MAX = 8;
+
+/**
+ * What OTHER knowledge files say about the claims (the assistant reads those too): a
+ * claim another file already covers must not be copied into this one.
+ */
+export function elsewhereFor(file, claims, cwd) {
+  const index = buildIndex(cwd);
+  const self = path.resolve(file).toLowerCase();
+  const seen = new Set();
+  const out = [];
+  for (const c of claims) {
+    let taken = 0;
+    for (const hit of index.search(c.claim, ELSEWHERE_PER_CLAIM + 3)) {
+      if (taken >= ELSEWHERE_PER_CLAIM) break;
+      if (path.resolve(hit.file).toLowerCase() === self || hit.kind === 'source' || hit.score < 3) continue;
+      const key = `${hit.file}#${hit.heading}#${hit.text.slice(0, 40)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(hit);
+      taken++;
+    }
+    if (out.length >= ELSEWHERE_MAX) break;
+  }
+  return out.slice(0, ELSEWHERE_MAX);
 }
 
 /**
@@ -146,7 +181,8 @@ export async function composeFile({ file, claims, cwd, model }) {
   const all = claims.map((c) => c.claim).join('\n');
   const grounding = groundIdentifiers(identifiersIn(all), cwd);
   const view = fileView(base, all);
-  const result = await runModel({ prompt: editorPrompt({ file, kind, view, claims, grounding }), schema: EDITOR_SCHEMA, model });
+  const elsewhere = elsewhereFor(file, claims, cwd);
+  const result = await runModel({ prompt: editorPrompt({ file, kind, view, claims, grounding, elsewhere }), schema: EDITOR_SCHEMA, model });
   const out = result.structured_output;
   const status = new Map();
   for (const s of out.claims || []) if (claims.some((c) => c.id === s.id)) status.set(s.id, s);
@@ -293,7 +329,7 @@ export async function evaluate(db, rows, ctx) {
           row.session_id, row.project, `Outdated: ${path.basename(owner)}`.slice(0, 200), v.stale.claim.slice(0, 1500),
           `found while checking #${row.id}: ${v.reason}`.slice(0, 800), ctx.cwd || null, v.stale.claim, owner,
           JSON.stringify({ item: { op: 'create', kind: 'memory', title: `Outdated: ${path.basename(owner)}`, body: v.stale.claim }, cwd: ctx.cwd }), Date.now());
-        route(owner, { id: Number(r.lastInsertRowid), title: `Outdated: ${path.basename(owner)}`, claim: v.stale.claim, evidence: `a source of truth contradicts ${owner}`, confidence: 0.7, corrects: true });
+        route(owner, { id: Number(r.lastInsertRowid), title: `Outdated: ${path.basename(owner)}`, claim: v.stale.claim, evidence: `flagged as outdated while screening #${row.id}: ${v.reason}`, confidence: 0.7, corrects: true });
         report.stale++;
       }
     }

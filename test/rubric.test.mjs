@@ -51,3 +51,11 @@ test('corrections and changes to rule files or CLAUDE.md always wait for approva
   assert.equal(needsApproval({ op: 'patch', target: skill, confidence: 0.9 }, 'background', 'auto'), false);
   assert.equal(needsApproval({ op: 'patch', target: rule, corrects: true }, 'manual', 'queue'), false, 'explicit requests are written');
 });
+
+test('the editor prompt carries the rubric and the one-off rule', async () => {
+  const { editorPrompt } = await import('../scripts/evaluate.mjs');
+  const p = editorPrompt({ file: 'x.md', kind: 'skill', view: { text: 'x', partial: false }, claims: [{ id: 1, claim: 'c' }], grounding: [], elsewhere: [] });
+  for (const r of RULES) assert.ok(p.includes(r.test), `editor prompt lacks rule "${r.id}"`);
+  assert.match(p, /A request made once, for one situation, never overturns a rule/);
+  assert.match(p, /ELSEWHERE/);
+});
