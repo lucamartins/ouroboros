@@ -240,38 +240,106 @@ function finish(db, sessionId, state, cursor) {
   `).run(state, Date.now(), cursor ?? null, Date.now(), sessionId);
 }
 
+export const MERGE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['action'],
+  properties: {
+    action: { type: 'string', enum: ['skip', 'patch'] },
+    old: { type: 'string' },
+    new: { type: 'string' },
+  },
+};
+
+export function mergePrompt({ existing, proposal }) {
+  return `An existing saved note and a new finding cover the same topic. Decide whether the finding adds information worth keeping.
+
+- "skip" if the note already says it (or the finding is weaker).
+- "patch" to fold the new information in: "old" must be an exact, unique fragment copied from the note (a sentence or a line), and "new" its replacement that keeps what was there and adds the new information. Keep the note's language, format and length roughly the same.
+
+Existing note:
+<note>
+${existing}
+</note>
+
+New finding:
+<finding>
+${proposal}
+</finding>`;
+}
+
+const MAX_MERGES_PER_REVIEW = 3;
+
+/** Fold new information into an existing memory or skill the reviewer duplicated. */
+async function mergeDuplicate(db, session, item, target, opts) {
+  const existing = target && fs.existsSync(target) ? fs.readFileSync(target, 'utf8') : null;
+  if (!existing || !/\.md$/i.test(target)) return { status: 'skipped' };
+  const result = await runModel({
+    prompt: mergePrompt({ existing: existing.slice(0, 12_000), proposal: [item.title, item.description, item.body || item.text].filter(Boolean).join('\n') }),
+    schema: MERGE_SCHEMA,
+    model: opts.reviewerModel,
+  });
+  const usage = usageOf(result);
+  insertReview(db, { sessionId: session.id, mode: 'background', trigger: 'merge', model: opts.reviewerModel, status: 'ok', usage, sessionStartedAt: session.started_at });
+  const out = result.structured_output;
+  if (out.action !== 'patch' || !out.old || out.new === undefined) return { status: 'skipped' };
+  const [r] = apply(db, { cwd: session.cwd, session_id: session.id, trigger: 'session_end', items: [{ op: 'patch', kind: item.kind, target, old: out.old, new: out.new, confidence: item.confidence, title: item.title }] },
+    { actor: 'background', autonomy: opts.autonomy });
+  return r;
+}
+
 /** Write learn-mode proposals through the curator and record their outcome. */
-function applyLearnings(db, session, reviewId, out) {
+async function applyLearnings(db, session, reviewId, out, opts) {
   const payload = {
     cwd: session.cwd,
     session_id: session.id,
     trigger: 'session_end',
     items: out.items.map((i) => ({ op: 'create', ...i, scope: i.kind === 'profile' ? 'global' : i.scope || 'project' })),
   };
-  const results = apply(db, payload, { actor: 'background' });
+  const results = apply(db, payload, { actor: 'background', autonomy: opts.autonomy });
   const ts = Date.now();
   let learned = 0;
-  results.forEach((r, idx) => {
+  let patched = 0;
+  let merges = 0;
+  for (let idx = 0; idx < results.length; idx++) {
+    let r = results[idx];
     const item = out.items[idx];
-    if (r.status === 'created') learned++;
-    // Seeing the same thing again reinforces what was already learned.
     if (r.status === 'duplicate' && r.target) {
+      // Seeing the same thing again reinforces what was already learned...
       db.prepare("UPDATE learnings SET confidence = MIN(0.9, COALESCE(confidence, 0.5) + 0.1), updated_at = ? WHERE status = 'active' AND (lower(path) = lower(?) OR id = ?)")
         .run(ts, r.target, r.target);
+      // ...and new details are folded into the existing note.
+      if (merges < MAX_MERGES_PER_REVIEW && item.kind !== 'profile') {
+        merges++;
+        try {
+          const m = await mergeDuplicate(db, session, item, r.target, opts);
+          if (m.status === 'patched' || m.status === 'queued') r = { ...m, title: item.title, mergedInto: r.target };
+        } catch (err) {
+          logError(db, 'review-worker:merge', err);
+        }
+      }
+    }
+    if (r.status === 'created') learned++;
+    if (r.status === 'patched') patched++;
+    results[idx] = r;
+    if (r.status === 'queued' && r.candidateId) {
+      db.prepare('UPDATE candidates SET review_id = ?, repeats = ? WHERE id = ?').run(reviewId, item.repeats || null, r.candidateId);
+      continue;
     }
     db.prepare(`
-      INSERT INTO candidates (review_id, session_id, project, kind, scope, memory_type, title, summary, evidence, confidence, repeats, outcome, learning_id, ts)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO candidates (review_id, session_id, project, kind, scope, memory_type, title, summary, evidence, confidence, repeats, outcome, learning_id, cwd, ts)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(reviewId, session.id, session.project, item.kind, item.kind === 'profile' ? 'global' : item.scope || 'project',
       item.memory_type ?? null, String(item.title).slice(0, 200), String(item.text || item.body || item.description || '').slice(0, 1500),
-      String(item.evidence || '').slice(0, 800), item.confidence, item.repeats || null, r.status, r.id || null, ts);
-  });
-  const created = results.filter((r) => r.status === 'created');
-  if (created.length) {
-    db.prepare('INSERT INTO notices (ts, session_id, text) VALUES (?, ?, ?)')
-      .run(ts, session.id, created.map((r) => `📝 learned: ${r.title}`).join('\n'));
+      String(item.evidence || '').slice(0, 800), item.confidence, item.repeats || null, r.status, r.id || null, session.cwd, ts);
   }
-  db.prepare('UPDATE reviews SET learned = ? WHERE id = ?').run(learned, reviewId);
+  const lines = [
+    ...results.filter((r) => r.status === 'created').map((r) => `📝 learned: ${r.title}`),
+    ...results.filter((r) => r.status === 'patched').map((r) => `📝 updated: ${r.title}`),
+    ...results.filter((r) => r.status === 'queued').map((r) => `⏳ waiting for approval: ${r.title}`),
+  ];
+  if (lines.length) db.prepare('INSERT INTO notices (ts, session_id, text) VALUES (?, ?, ?)').run(ts, session.id, lines.join('\n'));
+  db.prepare('UPDATE reviews SET learned = ?, patched = ? WHERE id = ?').run(learned, patched, reviewId);
   return results;
 }
 
@@ -332,7 +400,7 @@ export async function reviewSession(db, sessionId, trigger) {
         .run(reviewId, sessionId, String(c.quote).slice(0, 500), c.kind, ts);
     }
     if (mode === 'background') {
-      applyLearnings(db, session, reviewId, out);
+      await applyLearnings(db, session, reviewId, out, opts);
       finish(db, sessionId, 'done', digest.nextLine);
       return 'ok';
     }
@@ -439,6 +507,10 @@ async function main() {
       await backfill(db, { days: Number(args.days) || 30, limit: Number(args.limit) || 20, dryRun: !!args['dry-run'] });
     } else if (args.session) {
       await reviewSession(db, args.session, args.trigger || 'session_end');
+    } else if (args.maintain) {
+      const { maintain } = await import('./maintenance.mjs');
+      const report = await maintain(db, { force: !!args.force });
+      if (args.force) console.log(JSON.stringify(report, null, 2));
     }
   } catch (err) {
     logError(db, 'review-worker', err);

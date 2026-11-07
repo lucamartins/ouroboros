@@ -50,6 +50,7 @@ node --no-warnings "${CLAUDE_PLUGIN_ROOT}/scripts/curator.mjs" apply --data "${C
   "cwd": "<current working directory>",
   "memory_dir": "<your auto-memory directory, if known>",
   "trigger": "manual",
+  "actor": "<manual if the user explicitly asked you to remember or learn this; inloop otherwise>",
   "items": [
     { "op": "create", "kind": "profile", "block": "user", "text": "Prefers concise answers in Portuguese; files on disk in English.", "confidence": 0.8 },
     { "op": "create", "kind": "memory", "scope": "project", "memory_type": "feedback", "project_dir": "<repo the fact is about>",
@@ -71,6 +72,7 @@ Fields: `title` (short), `description` (one line; ≤ 250 chars for skills — s
 The first lines are a human summary; the last line is JSON.
 
 - `created` / `patched` → tell the user one line per item: `📝 learned: <title>` (or `📝 updated: …`).
+- `queued` → the user's autonomy setting holds it for approval: say `⏳ waiting for approval: <title>` (approve in `/ouroboros:dashboard`).
 - `duplicate` → read the existing item it names and, if the new information adds something, re-submit as a `patch` to that target.
 - `over_budget` → consolidate first: merge or shorten items with patches, or archive a stale one with `/ouroboros:forget`, then retry.
 - `rejected` → fix the cause it states, or drop the item.

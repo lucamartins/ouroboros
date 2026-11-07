@@ -102,6 +102,68 @@ function meter(value, limit, { plain = false } = {}) {
     h('span', { style: `width:${Math.min(100, ratio * 100).toFixed(1)}%` }));
 }
 
+// ---------- write actions ----------
+let actionToken = null;
+
+async function act(action, id) {
+  if (!actionToken) actionToken = (await api('token')).token;
+  const res = await fetch('/api/action', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Ouroboros-Token': actionToken },
+    body: JSON.stringify({ action, id }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.message || body.error || `HTTP ${res.status}`);
+  return body;
+}
+
+function toast(text, bad = false) {
+  let el = document.getElementById('toast');
+  if (!el) {
+    el = h('div', { id: 'toast', class: 'toast', role: 'status' });
+    document.body.append(el);
+  }
+  el.textContent = text;
+  el.className = `toast show${bad ? ' bad' : ''}`;
+  clearTimeout(el._t);
+  el._t = setTimeout(() => { el.className = 'toast'; }, 4000);
+}
+
+const ACTION_LABEL = {
+  undo: (r) => (r.status === 'undone' ? `↩ undone: ${r.title || r.id}` : r.reason || r.status),
+  forget: (r) => (r.status === 'archived' ? `🗑 archived: ${r.title}` : r.reason || r.status),
+  confirm: (r) => (r.status === 'confirmed' ? '✓ confidence raised' : r.status),
+  approve: (r) => (r.status === 'created' || r.status === 'patched' ? `📝 saved: ${r.title}` : `${r.status}${r.reason ? ` — ${r.reason}` : ''}`),
+  reject: () => 'rejected',
+};
+
+/** A small button that runs an action; `confirmText` asks for a second click first. */
+function actionButton(label, action, id, { confirmText, title } = {}) {
+  const btn = h('button', { class: 'act', type: 'button', title });
+  btn.textContent = label;
+  let armed = false;
+  btn.addEventListener('click', async () => {
+    if (confirmText && !armed) {
+      armed = true;
+      btn.textContent = confirmText;
+      btn.classList.add('armed');
+      setTimeout(() => { armed = false; btn.textContent = label; btn.classList.remove('armed'); }, 3000);
+      return;
+    }
+    btn.disabled = true;
+    try {
+      const r = await act(action, id);
+      const ok = !['conflict', 'error', 'not_found', 'nothing', 'ambiguous'].includes(r.status);
+      toast(ACTION_LABEL[action](r), !ok);
+      await render();
+    } catch (err) {
+      toast(String(err.message), true);
+      btn.disabled = false;
+    }
+  });
+  return btn;
+}
+
 function emptyState(title, text) {
   return h('div', { class: 'card empty-state' }, h('strong', {}, title), text);
 }
@@ -219,7 +281,9 @@ async function renderOverview() {
         : 'nothing written yet'),
     tile('Recoveries', fmt.int(t.recoveries), 'errors followed by a working path'),
     tile('Would learn', fmt.int((o.candidates.memory || 0) + (o.candidates.skill || 0)), `${o.candidates.memory || 0} memories · ${o.candidates.skill || 0} skills`),
-    tile('Misses', fmt.int(o.misses), 'had to repeat something already saved'),
+    o.queued
+      ? tile('Waiting for approval', fmt.int(o.queued), 'review them in Learnings')
+      : tile('Misses', fmt.int(o.misses), 'had to repeat something already saved'),
     h('div', { class: 'card tile' },
       h('div', { class: 'label' }, 'Reviewer cost this month'),
       h('div', { class: 'value' }, fmt.usd(o.cost.month)),
@@ -284,6 +348,10 @@ function learnedSection(learned, writes) {
     { label: 'Last used', render: (r) => (r.last_used_at ? fmt.ago(r.last_used_at) : '—') },
     { label: 'Confidence', render: (r) => h('span', { class: 'conf' }, meter(r.confidence || 0, 1, { plain: true }), fmt.pct((r.confidence || 0) * 100)) },
     { label: 'Updated', render: (r) => fmt.date(r.updated_at) },
+    { label: '', render: (r) => h('div', { class: 'actions' },
+      r.confidence < 0.9 ? actionButton('Confirm', 'confirm', r.id, { title: 'This is right: +0.2 confidence' }) : null,
+      r.writes ? actionButton('Undo', 'undo', r.id, { confirmText: 'Undo last change?', title: 'Revert the last write of this learning' }) : null,
+      r.origin_session === 'native' ? null : actionButton('Archive', 'forget', r.id, { confirmText: 'Archive it?', title: 'Stop loading it; restorable with undo' })) },
   ], active, { empty: 'Nothing learned yet. Ask Claude to remember something, or run /ouroboros:learn after a session with corrections.' });
 
   const opLabel = { create: 'learned', patch: 'updated', archive: 'archived' };
@@ -301,8 +369,33 @@ function learnedSection(learned, writes) {
   ];
 }
 
+const OUTCOME_LABEL = {
+  created: 'saved', patched: 'merged into existing', duplicate: 'already known', rejected: 'rejected',
+  over_budget: 'over budget', queued: 'waiting for approval', rejected_by_user: 'rejected by you', error: 'error',
+};
+
+function queueSection(queue) {
+  if (!queue.length) return [];
+  return [
+    h('div', { class: 'section-head' },
+      h('div', {}, h('h2', {}, `Waiting for approval (${queue.length})`),
+        h('div', { class: 'muted small' }, 'Held by your autonomy setting. Approve to save through the curator, or reject.'))),
+    h('div', { class: 'cards' }, queue.map((q) => h('article', { class: 'card lcard' },
+      h('div', { class: 'meta' },
+        h('span', { class: `badge ${q.kind}` }, q.op === 'patch' ? `update · ${q.kind}` : q.kind === 'profile' ? `profile · ${q.block || ''}` : q.memory_type ? `${q.kind} · ${q.memory_type}` : q.kind),
+        h('span', {}, `${projectName(q.project, q.cwd)} · ${fmt.date(q.ts)}`),
+        h('span', { class: 'conf' }, meter(q.confidence || 0, 1, { plain: true }), fmt.pct((q.confidence || 0) * 100))),
+      h('div', { class: 'title' }, q.title || q.target || '(untitled)'),
+      q.description ? h('div', { class: 'muted small' }, q.description) : null,
+      h('div', { class: 'summary' }, q.summary),
+      q.evidence ? h('div', { class: 'evidence' }, q.evidence) : null,
+      h('div', { class: 'actions' }, actionButton('Approve', 'approve', q.id), actionButton('Reject', 'reject', q.id, { confirmText: 'Reject it?' }))))),
+    h('div', { style: 'height:28px' }),
+  ];
+}
+
 async function renderLearnings() {
-  const { learned, writes, candidates, corrections } = await api('learnings');
+  const [{ learned, writes, candidates, corrections }, queue] = await Promise.all([api('learnings'), api('queue')]);
   const f = state.filters;
   const chipGroup = (key, options) => h('div', { class: 'chips', role: 'group' }, options.map(([value, label]) =>
     h('button', { class: 'chip', 'aria-pressed': String(f[key] === value), onclick: () => { f[key] = value; renderLearnings(); } }, label)));
@@ -314,12 +407,13 @@ async function renderLearnings() {
           h('span', { class: `badge ${c.kind}` }, c.kind === 'memory' && c.memory_type ? `memory · ${c.memory_type}` : c.kind),
           h('span', { class: 'badge' }, c.scope || '—'),
           h('span', {}, `${projectName(c.project, c.cwd)} · ${fmt.date(c.session_started_at)}`),
-          h('span', { class: 'conf', title: 'Reviewer confidence' }, meter(c.confidence || 0, 1, { plain: true }), fmt.pct((c.confidence || 0) * 100))),
+          h('span', { class: 'conf', title: 'Reviewer confidence' }, meter(c.confidence || 0, 1, { plain: true }), fmt.pct((c.confidence || 0) * 100)),
+          h('span', { class: 'badge', title: 'What happened to it' }, OUTCOME_LABEL[c.outcome] || 'measured only')),
         h('div', { class: 'title' }, c.title),
         h('div', { class: 'summary' }, c.summary),
         c.repeats ? h('div', { class: 'small' }, h('span', { class: 'status-dot warn' }), `Repeats existing: ${c.repeats}`) : null,
         h('div', { class: 'evidence' }, c.evidence))))
-    : emptyState('Nothing here yet', 'Each reviewed session lists what it would have learned. Phase 1 only records these; nothing is written.');
+    : emptyState('Nothing here yet', 'End-of-session reviews list what they found worth learning here, with what happened to each item (saved, duplicate, queued…).');
 
   const corr = h('div', { class: 'card' }, corrections.length
     ? h('ul', { class: 'list' }, corrections.map((c) => h('li', {},
@@ -328,9 +422,10 @@ async function renderLearnings() {
     : h('p', { class: 'muted small' }, 'No corrections recorded.'));
 
   view.replaceChildren(
+    ...queueSection(queue),
     ...learnedSection(learned, writes),
     h('section', { class: 'section' }, h('div', { class: 'section-head' },
-      h('div', {}, h('h2', {}, 'Review candidates'), h('div', { class: 'muted small' }, `${shown.length} of ${candidates.length} — what end-of-session reviews found worth learning (recorded, not written)`)),
+      h('div', {}, h('h2', {}, 'Review candidates'), h('div', { class: 'muted small' }, `${shown.length} of ${candidates.length} — what end-of-session reviews found worth learning, and what happened to each`)),
       h('div', { class: 'chips' }, chipGroup('kind', [['all', 'All'], ['memory', 'Memories'], ['skill', 'Skills']]), chipGroup('scope', [['all', 'Any scope'], ['global', 'Global'], ['project', 'Project']])))),
     cards,
     h('section', { class: 'section' }, h('div', { class: 'section-head' }, h('h2', {}, 'Corrections'), h('span', { class: 'muted small' }, `${corrections.length} recorded`)), corr));

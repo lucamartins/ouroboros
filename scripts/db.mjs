@@ -171,6 +171,22 @@ const MIGRATIONS = [
     delivered_at  INTEGER
   );
   `,
+  // 4 — phase 4: approval queue, maintenance runs
+  `
+  ALTER TABLE candidates ADD COLUMN payload TEXT;      -- the proposal as JSON, for queued items
+  ALTER TABLE candidates ADD COLUMN cwd TEXT;
+  ALTER TABLE candidates ADD COLUMN decided_at INTEGER;
+  CREATE INDEX candidates_outcome ON candidates(outcome);
+  CREATE TABLE maintenance (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts        INTEGER NOT NULL,
+    kind      TEXT NOT NULL,                       -- decay | consolidate:<area>
+    detail    TEXT,
+    archived  INTEGER NOT NULL DEFAULT 0,
+    merged    INTEGER NOT NULL DEFAULT 0,
+    cost_usd  REAL NOT NULL DEFAULT 0
+  );
+  `,
 ];
 
 export function openDb(explicitDir) {
@@ -209,6 +225,10 @@ export function logError(db, source, err) {
 
 export function getMeta(db, key) {
   return db.prepare('SELECT value FROM meta WHERE key = ?').get(key)?.value ?? null;
+}
+
+export function setMeta(db, key, value) {
+  db.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, String(value));
 }
 
 export function setMetaOnce(db, key, value) {

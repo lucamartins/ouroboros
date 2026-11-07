@@ -2,7 +2,7 @@
 
 > A Claude Code plugin that learns from your sessions on its own: it saves memories and creates/refines skills without being asked, in the spirit of Nous Research's Hermes Agent, and shows on a local dashboard what it learned, how much that is being used and what it costs.
 
-Status: phases 1 (measure), 2 (manual learning) and 3 (self-learning) implemented; phase 4 next. Owner decisions in [§12](#12-decisions).
+Status: all four phases implemented (v0.4.0); next: real-world use, then a fresh install test on another machine. Owner decisions in [§12](#12-decisions).
 
 ---
 
@@ -263,6 +263,18 @@ proposal ─► active (conf. 0.3–0.9) ─► reinforced (+0.1 per use; +0.2 i
 
 Archive = move to `~/.ouroboros/archive/` (out of context), never delete.
 
+How each transition happens (phase 4):
+
+- **Reinforcement**: the first read of a learned memory or use of a learned skill in a session adds +0.1 (hooks); a background review that rediscovers an existing item adds +0.1; **Confirm** in the dashboard adds +0.2. Cap 0.9.
+- **Merge on rediscovery**: when the background reviewer's item is a `duplicate` of a memory or skill file, a second small call (`MERGE_SCHEMA`) decides `skip` or a `patch` that folds the new detail in (max 3 per review).
+- **Promotion**: a `feedback`/`user` memory similar to one already saved in *another* project becomes a profile fact instead of a copy.
+- **Daily maintenance** (`review-worker.mjs --maintain`, started by `SessionStart` at most every 20 h, results shown as notices):
+  - *decay* — archive Ouroboros memories/skills unused for `archiveAfterDaysUnused` days whose confidence is below 0.7 (profile facts are always in context, so they never decay; native items are never touched);
+  - *consolidate the profile* — a block past `consolidateAt` is rewritten by one isolated call (`CONSOLIDATE_SCHEMA`: merged bullets with their source ids) down to 70% of its budget; one ledger batch, so `undo` restores the old block and reactivates the merged facts (measured: 6 facts → 3, US$ 0.001);
+  - *trim* — memory indexes and learned skills past `consolidateAt` archive their weakest items (`confidence × log2(1 + uses)`) down to 70%.
+- **Autonomy** (`auto` | `hybrid` | `queue`): proposals from Claude (`actor: inloop`) or the reviewer (`background`) that need approval are stored as `queued` candidates with their full payload; explicit user requests (`actor: manual`) are always written. `hybrid` writes facts with confidence ≥ 0.7 and queues skills and tentative items. Approve/Reject in the dashboard runs the stored proposal through the curator.
+- **Exclusions**: hooks do nothing at all in projects matching `excludeProjects`.
+
 ## 8. Data model (`events.db`)
 
 ```sql
@@ -285,7 +297,7 @@ WAL + `busy_timeout` for concurrent sessions. Versioned migrations in `db.mjs`.
 
 ## 9. Dashboard
 
-`/ouroboros:dashboard` starts `node dashboard/server.mjs` on `127.0.0.1:4747` (configurable port) and opens the browser. Build-free HTML/JS, hand-rolled SVG charts, light/dark theme, English UI. The launcher reuses a running server (`dashboard.json` in the data dir) or starts a detached one that shuts down after 4 h idle. Phase 1's API is read-only and GET-only, guarded by a `Host` check (anti DNS-rebinding) and a strict CSP; the write actions of phase 4 add a per-start token.
+`/ouroboros:dashboard` starts `node dashboard/server.mjs` on `127.0.0.1:4747` (configurable port) and opens the browser. Build-free HTML/JS, hand-rolled SVG charts, light/dark theme, English UI. The launcher reuses a running server (`dashboard.json` in the data dir) or starts a detached one that shuts down after 4 h idle. Reads are GET-only; writes go to `POST /api/action`, which requires the per-start token (served by `GET /api/token`, readable only by the page's own origin), a same-origin `Origin` and a JSON body. Every request passes a `Host` check (anti DNS-rebinding), and pages carry a strict CSP.
 
 ### 9.1 Screens
 
@@ -355,4 +367,4 @@ WAL + `busy_timeout` for concurrent sessions. Versioned migrations in `db.mjs`.
 | **1. Measure** | Full capture, `events.db`, `measure`-mode reviewer at session end, read-only dashboard (Overview, Inventory, Health) | 1–2 weeks of correction baseline; hooks with no noticeable latency |
 | **2. Manual learning** | `learn` skill, curator, ledger, `undo`/`forget`, `user.md` + protocol at `SessionStart` | `/ouroboros:learn` writes, dedupes, routes and undoes correctly |
 | **3. Self-learning** | Periodic in-loop review, background review of the tail, notices, Value and Cost screens | Correction rate drops vs baseline with cost under the cap |
-| **4. Lifecycle and distribution** | Confidence/decay, automatic consolidation, dashboard actions, marketplace, `validate --strict` in CI, README | Someone else installs it from scratch on Windows and macOS |
+| **4. Lifecycle and distribution** | Confidence/decay, automatic consolidation, merge on rediscovery, promotion, autonomy queue, dashboard actions (confirm/undo/archive/approve/reject, token-protected), `excludeProjects`, CI (tests on Ubuntu + Windows, macOS on demand; `validate --strict`), README | Someone else installs it from scratch on Windows and macOS |

@@ -6,6 +6,7 @@ import { dataDir } from './paths.mjs';
 
 const DEFAULTS = {
   learning: true,
+  autonomy: 'auto',
   inloop_review: true,
   review_every_turns: 10,
   long_turn_tool_calls: 15,
@@ -40,6 +41,7 @@ function snapshot() {
 function fromEnv() {
   return {
     learning: asBool(raw('learning'), DEFAULTS.learning),
+    autonomy: ['auto', 'hybrid', 'queue'].includes(raw('autonomy')) ? raw('autonomy') : DEFAULTS.autonomy,
     inloopReview: asBool(raw('inloop_review'), DEFAULTS.inloop_review),
     reviewEveryTurns: Math.max(1, asNumber(raw('review_every_turns'), DEFAULTS.review_every_turns)),
     longTurnToolCalls: Math.max(1, asNumber(raw('long_turn_tool_calls'), DEFAULTS.long_turn_tool_calls)),

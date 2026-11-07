@@ -118,6 +118,20 @@ test('SessionEnd runs a background review that writes learnings and leaves a not
   assert.equal(second.systemMessage, undefined);
 });
 
+test('a repeated finding is folded into the existing memory instead of duplicated', async () => {
+  hook('UserPromptSubmit', { session_id: 's6' });
+  hook('SessionEnd', { session_id: 's6', reason: 'other' });
+  const d = db();
+  const rows = await waitFor(() => {
+    const r = d.prepare("SELECT kind, outcome FROM candidates WHERE session_id = 's6' ORDER BY id").all();
+    return r.length === 2 && r;
+  });
+  assert.deepEqual(rows.map((r) => r.outcome), ['patched', 'duplicate']);
+  d.close();
+  const memory = fs.readFileSync(path.join(tmp, 'claude', 'projects', '-tmp-proj', 'memory', 'use-pnpm.md'), 'utf8');
+  assert.match(memory, /\(with lockfile v9\)/);
+});
+
 test('with learning off the end-of-session review only measures', async () => {
   const off = { CLAUDE_PLUGIN_OPTION_LEARNING: 'false' };
   hook('UserPromptSubmit', { session_id: 's4' }, off);

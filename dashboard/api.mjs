@@ -185,11 +185,24 @@ export function createApi(db) {
         candidates: Object.fromEntries(candidates.map((c) => [c.kind, c.n])),
         misses,
         learned: { ...learned, patchedNative, enabledAt },
+        queued: db.prepare("SELECT COUNT(*) n FROM candidates WHERE outcome = 'queued'").get().n,
+        maintenance: db.prepare('SELECT ts, archived, merged, cost_usd FROM maintenance ORDER BY id DESC LIMIT 1').get() || null,
         cost: { month: monthSpend(db), budget: opts?.monthlyBudgetUsd ?? null, monthStart: monthStart() },
         options: opts,
         series: [...series.values()],
         sessions,
       };
+    },
+
+    queue() {
+      return db.prepare(`
+        SELECT c.id, c.kind, c.scope, c.memory_type, c.title, c.summary, c.evidence, c.confidence, c.ts, c.cwd, c.project, c.payload
+        FROM candidates c WHERE c.outcome = 'queued' ORDER BY c.ts DESC LIMIT 200`).all().map((r) => {
+        let item = {};
+        try { item = JSON.parse(r.payload || '{}').item || {}; } catch { /* ignore */ }
+        const { payload, ...rest } = r;
+        return { ...rest, op: item.op || 'create', target: item.target || null, block: item.block || null, description: item.description || null };
+      });
     },
 
     learnings() {

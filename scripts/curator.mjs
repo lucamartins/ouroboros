@@ -11,6 +11,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { options } from './config.mjs';
 import { getMeta, logError, openDb, setMetaOnce } from './db.mjs';
 import { listMemories, listSkills, parseFrontmatter } from './inventory.mjs';
 import { claudeDir, classifyPath, normalize, ouroborosDir, projectKey } from './paths.mjs';
@@ -129,6 +130,10 @@ class Batch {
     }
     if (content === null) {
       if (before !== null) fs.rmSync(file, { force: true });
+      // An archived skill leaves no empty folder behind (Claude Code would still list it).
+      if (classifyPath(file) === 'skill') {
+        try { if (!fs.readdirSync(path.dirname(file)).length) fs.rmdirSync(path.dirname(file)); } catch { /* keep */ }
+      }
     } else {
       fs.mkdirSync(path.dirname(file), { recursive: true });
       const tmp = `${file}.${process.pid}.tmp`;
@@ -242,6 +247,11 @@ function countIndexEntries(indexText) {
   return (indexText ?? '').split(/\r?\n/).filter((l) => l.trim()).length;
 }
 
+/** Entries in the MEMORY.md index of a memory directory. */
+export function indexEntriesIn(dir) {
+  return countIndexEntries(readOrNull(path.join(dir, 'MEMORY.md')));
+}
+
 function setDescription(text, description) {
   return text.replace(/^(---\r?\n[\s\S]*?^description:).*$/m, `$1 ${yamlStr(description)}`);
 }
@@ -352,10 +362,24 @@ function createMemory(db, batch, item, settings, payload) {
   const file = path.join(dir, fileName);
   const indexFile = path.join(dir, 'MEMORY.md');
 
-  const existing = listMemories().filter((m) => !m.index && normalize(path.dirname(m.file)) === normalize(dir));
+  const all = listMemories().filter((m) => !m.index);
+  const existing = all.filter((m) => normalize(path.dirname(m.file)) === normalize(dir));
   if (fs.existsSync(file)) return { status: 'duplicate', target: file, reason: `a memory named "${name}" already exists; patch it instead` };
-  const dup = findSimilar(existing.map((m) => ({ text: `${m.name} ${m.description}`, file: m.file, name: m.name })), `${name} ${title} ${description}`);
+  const probe = `${name} ${title} ${description}`;
+  const dup = findSimilar(existing.map((m) => ({ text: `${m.name} ${m.description}`, file: m.file, name: m.name })), probe);
   if (dup) return { status: 'duplicate', target: dup.file, existing: dup.text, reason: 'a similar memory exists; patch it instead' };
+
+  // The same way-of-working rule in another project is really a global preference:
+  // promote it to the profile instead of copying it project by project.
+  if (['feedback', 'user'].includes(type)) {
+    const elsewhere = findSimilar(all.filter((m) => !existing.includes(m)).map((m) => ({ text: `${m.name} ${m.description}`, file: m.file, project: m.project })), probe);
+    if (elsewhere) {
+      const promoted = createProfile(db, batch, { ...item, kind: 'profile', block: 'user', text: description }, settings);
+      return promoted.status === 'created'
+        ? { ...promoted, note: `promoted to the profile: project ${elsewhere.project} already has a similar memory` }
+        : promoted;
+    }
+  }
 
   const indexText = readOrNull(indexFile);
   const entries = countIndexEntries(indexText) + 1;
@@ -493,8 +517,31 @@ function patchItem(db, batch, item, settings, payload) {
   return { status: 'patched', id, kind: t.kind, path: t.file, title: existing?.title || data.name || path.basename(t.file) };
 }
 
+/**
+ * Whether an item proposed by Claude or the reviewer must wait for approval.
+ * Explicit user requests (actor `manual`) are always written.
+ */
+export function needsApproval(item, actor, autonomy) {
+  if (actor === 'manual' || autonomy === 'auto') return false;
+  if (autonomy === 'queue') return true;
+  // hybrid: confident facts go in; skills and tentative items wait.
+  return item.kind === 'skill' || item.confidence < 0.7;
+}
+
+function enqueue(db, item, payload, actor) {
+  const r = db.prepare(`
+    INSERT INTO candidates (review_id, session_id, project, kind, scope, memory_type, title, summary, evidence, confidence, outcome, payload, cwd, ts)
+    VALUES (0, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+  `).run(payload.session_id || actor, projectKey(item.projectDir), item.kind, item.scope, item.memory_type ?? null,
+    String(item.title || item.text || item.target || '').slice(0, 200), String(item.text || item.body || item.new || item.description || '').slice(0, 1500),
+    String(item.evidence || '').slice(0, 800), item.confidence,
+    JSON.stringify({ item: { ...item, projectDir: undefined, project_dir: item.projectDir }, cwd: payload.cwd, memory_dir: payload.memory_dir, trigger: payload.trigger, actor }),
+    payload.cwd || null, Date.now());
+  return Number(r.lastInsertRowid);
+}
+
 /** Apply a batch of proposals. Each item succeeds or fails on its own. */
-export function apply(db, payload, { actor = 'manual' } = {}) {
+export function apply(db, payload, { actor = 'manual', autonomy = 'auto' } = {}) {
   ensureSettingsFile();
   const settings = loadSettings();
   const items = Array.isArray(payload?.items) ? payload.items : [];
@@ -503,6 +550,11 @@ export function apply(db, payload, { actor = 'manual' } = {}) {
     const item = normalizeItem(raw, payload || {});
     if (containsSecret(item.title, item.description, item.body, item.text, item.new)) {
       results.push({ status: 'rejected', title: item.title, reason: 'looks like it contains a secret (token, key or password); never store secrets' });
+      continue;
+    }
+    if (needsApproval(item, actor, autonomy)) {
+      const candidateId = enqueue(db, item, payload || {}, actor);
+      results.push({ status: 'queued', title: item.title || item.text, candidateId, reason: `waiting for approval in the dashboard (autonomy: ${autonomy})` });
       continue;
     }
     const batch = new Batch(db, { actor, sessionId: payload.session_id });
@@ -527,6 +579,74 @@ export function apply(db, payload, { actor = 'manual' } = {}) {
   return results;
 }
 
+// ---------- consolidation ----------
+
+/**
+ * Replace a profile block with consolidated bullets. Each new bullet lists the ids it
+ * merges; it keeps the first id, the other sources are marked archived (merged).
+ * One ledger batch, so `undo` restores the previous block.
+ */
+export function rewriteProfileBlock(db, block, bullets, { actor = 'background' } = {}) {
+  const file = profileFile();
+  const blocks = parseProfile(readOrNull(file) ?? '');
+  const before = blocks[block];
+  const known = new Set(before.map((b) => b.id).filter(Boolean));
+  const next = [];
+  const kept = new Set();
+  for (const b of bullets) {
+    const text = String(b.text || '').replace(/\s+/g, ' ').trim();
+    if (!text || containsSecret(text)) continue;
+    const ids = (b.sources || []).filter((id) => known.has(id) && !kept.has(id));
+    const id = ids[0] || newId();
+    kept.add(id);
+    next.push({ id, text });
+  }
+  if (!next.length) return { status: 'rejected', reason: 'consolidation produced no bullets' };
+  const batch = new Batch(db, { actor });
+  try {
+    db.exec('BEGIN IMMEDIATE');
+    blocks[block] = next;
+    batch.write(file, renderProfile(blocks), { learningId: next[0].id, op: 'consolidate' });
+    batch.commit();
+    const now = Date.now();
+    for (const b of next) {
+      upsertLearning(db, { id: b.id, kind: 'profile', scope: 'global', block, name: slug(b.text, 40), title: b.text.slice(0, 120), path: file, confidence: 0.6, trigger: 'consolidate' });
+      db.prepare('UPDATE learnings SET title = ?, updated_at = ? WHERE id = ?').run(b.text.slice(0, 120), now, b.id);
+    }
+    const merged = [...known].filter((id) => !kept.has(id));
+    for (const id of merged) db.prepare("UPDATE learnings SET status = 'archived', updated_at = ? WHERE id = ?").run(now, id);
+    db.exec('COMMIT');
+    return { status: 'consolidated', before: before.length, after: next.length, merged: merged.length };
+  } catch (err) {
+    try { db.exec('ROLLBACK'); } catch { /* ignore */ }
+    batch.rollback();
+    return { status: 'error', reason: String(err.message) };
+  }
+}
+
+// ---------- approval queue and confirmation ----------
+
+export function decideQueued(db, candidateId, approve) {
+  const c = db.prepare("SELECT * FROM candidates WHERE id = ? AND outcome = 'queued'").get(candidateId);
+  if (!c) return { status: 'not_found', reason: 'no queued proposal with that id' };
+  if (!approve) {
+    db.prepare("UPDATE candidates SET outcome = 'rejected_by_user', decided_at = ? WHERE id = ?").run(Date.now(), candidateId);
+    return { status: 'rejected_by_user', title: c.title };
+  }
+  const p = JSON.parse(c.payload || '{}');
+  const [result] = apply(db, { cwd: p.cwd, memory_dir: p.memory_dir, trigger: p.trigger, session_id: c.session_id, items: [p.item] }, { actor: 'manual' });
+  db.prepare('UPDATE candidates SET outcome = ?, learning_id = ?, decided_at = ? WHERE id = ?')
+    .run(result.status === 'created' || result.status === 'patched' ? result.status : `approved_${result.status}`, result.id || null, Date.now(), candidateId);
+  return result;
+}
+
+/** The user vouches for a learning: +0.2 confidence (max 0.9). */
+export function confirm(db, id) {
+  const r = db.prepare("UPDATE learnings SET confidence = MIN(0.9, COALESCE(confidence, 0.5) + 0.2), updated_at = ? WHERE id = ? AND status = 'active'")
+    .run(Date.now(), id);
+  return r.changes ? { status: 'confirmed', id } : { status: 'not_found', id };
+}
+
 // ---------- undo / forget ----------
 
 export function undo(db, { id, last } = {}) {
@@ -548,6 +668,13 @@ export function undo(db, { id, last } = {}) {
   const ops = new Set(writes.map((w) => w.op));
   const learningId = writes.find((w) => w.learning_id)?.learning_id;
   if (learningId) {
+    if (ops.has('consolidate')) {
+      // Bullets merged away come back with the previous block.
+      const restored = parseProfile(writes[0].before ?? '');
+      for (const b of [...restored.user, ...restored.environment]) {
+        if (b.id) db.prepare("UPDATE learnings SET status = 'active', updated_at = ? WHERE id = ?").run(now, b.id);
+      }
+    }
     const status = ops.has('create') ? 'reverted' : ops.has('archive') ? 'active' : null;
     if (status) db.prepare('UPDATE learnings SET status = ?, updated_at = ? WHERE id = ?').run(status, now, learningId);
   }
@@ -641,7 +768,7 @@ export function inventoryText(db, { cwd, memoryDir }) {
 }
 
 export function summarize(results) {
-  const icon = { created: '📝 learned', patched: '📝 updated', duplicate: '↺ duplicate', rejected: '✗ rejected', over_budget: '⚠ over budget', error: '✗ error' };
+  const icon = { created: '📝 learned', patched: '📝 updated', queued: '⏳ queued', duplicate: '↺ duplicate', rejected: '✗ rejected', over_budget: '⚠ over budget', error: '✗ error' };
   return results.map((r) => `${icon[r.status] || r.status}: ${r.title || ''}${r.reason ? ` — ${r.reason}` : ''}${r.warning ? ` (${r.warning})` : ''}${r.path ? ` → ${r.path}` : ''}`).join('\n');
 }
 
@@ -684,7 +811,7 @@ async function main() {
         process.exitCode = 1;
         return;
       }
-      const results = apply(db, payload, { actor: payload.actor || 'manual' });
+      const results = apply(db, payload, { actor: payload.actor || 'manual', autonomy: options().autonomy });
       console.log(summarize(results));
       console.log(JSON.stringify(results.map(({ items, ...r }) => r)));
     } else if (cmd === 'undo') {
@@ -693,6 +820,10 @@ async function main() {
       console.log(JSON.stringify(forget(db, { match: args.match || args._[1] }), null, 2));
     } else if (cmd === 'inventory') {
       console.log(inventoryText(db, { cwd: args.cwd || process.cwd(), memoryDir: args['memory-dir'] }));
+    } else if (cmd === 'confirm') {
+      console.log(JSON.stringify(confirm(db, args.id), null, 2));
+    } else if (cmd === 'approve' || cmd === 'reject') {
+      console.log(JSON.stringify(decideQueued(db, Number(args.id), cmd === 'approve'), null, 2));
     } else if (cmd === 'enabled-at') {
       console.log(getMeta(db, 'learning_enabled_at') ?? '');
     } else {

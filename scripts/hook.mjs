@@ -8,10 +8,13 @@ import { fileURLToPath } from 'node:url';
 import { options } from './config.mjs';
 import { classifyPath, dataDir, projectKey, skillNameFromPath } from './paths.mjs';
 import { profileForContext, readProfileText } from './profile.mjs';
+import { globMatch, loadSettings } from './settings.mjs';
 import { countLines, readTranscript, usageSince } from './transcript.mjs';
 
 const MIN_NODE = [22, 13];
 const here = path.dirname(fileURLToPath(import.meta.url));
+// db.mjs needs node:sqlite, so it is loaded only after the Node version check.
+let dbApi;
 
 export function nodeSupported(version = process.versions.node) {
   const [major, minor] = version.split('.').map(Number);
@@ -59,10 +62,23 @@ function addEvent(db, input, now, kind, target = null, payload = null) {
     .run(input.session_id, input.agent_id || null, now, kind, target, payload ? JSON.stringify(payload) : null);
 }
 
-function countSkillUse(db, name, now) {
+/** First use in a session reinforces a learning (+0.1 confidence, max 0.9). */
+const USE_SQL = `
+  UPDATE learnings SET uses = uses + 1, last_used_at = :now,
+    confidence = MIN(0.9, COALESCE(confidence, 0.5) + CASE WHEN COALESCE(last_used_at, 0) < :sessionStart THEN 0.1 ELSE 0 END)
+  WHERE status = 'active' AND `;
+
+function sessionStart(db, sessionId) {
+  return db.prepare('SELECT started_at FROM sessions WHERE id = ?').get(sessionId)?.started_at || 0;
+}
+
+function countSkillUse(db, name, now, sessionId) {
   const bare = String(name).split(':').pop();
-  db.prepare("UPDATE learnings SET uses = uses + 1, last_used_at = ? WHERE status = 'active' AND kind = 'skill' AND name = ?")
-    .run(now, bare);
+  db.prepare(`${USE_SQL} kind = 'skill' AND name = :name`).run({ now, sessionStart: sessionStart(db, sessionId), name: bare });
+}
+
+function countMemoryRead(db, file, now, sessionId) {
+  db.prepare(`${USE_SQL} lower(path) = lower(:file)`).run({ now, sessionStart: sessionStart(db, sessionId), file });
 }
 
 export const PROTOCOL = `Ouroboros (self-learning) is active. Without being asked, save what you learn through the \`ouroboros:learn\` skill — it deduplicates, routes and can be undone:
@@ -70,6 +86,13 @@ export const PROTOCOL = `Ouroboros (self-learning) is active. Without being aske
 - when the user explicitly asks you to remember something, save it right away;
 - create or patch a skill when you worked out a reusable multi-step workflow, found the working path after errors, or the user corrected your approach.
 Prefer patching what exists over creating new. Don't save what is derivable from the code or CLAUDE.md, ephemeral task details, or secrets. After saving, tell the user in one line: "📝 learned: …".`;
+
+/** Projects listed in ~/.ouroboros/config.json `excludeProjects` are left alone entirely. */
+export function isExcluded(cwd) {
+  if (!cwd) return false;
+  const { excludeProjects = [] } = loadSettings();
+  return excludeProjects.some((p) => typeof p === 'string' && globMatch(p, cwd));
+}
 
 export const RESULT_RE = /\[ouroboros\]\s*reviewed=(\d+)\s+corrections=(\d+)\s+learned=(\d+)\s+patched=(\d+)/i;
 
@@ -86,7 +109,7 @@ export function reviewRequest({ from, to, trigger, recoveries = [] }) {
     'Use the `ouroboros:learn` skill if anything passes its filters (corrections of your approach, preferences, conventions, working paths found after errors); be brief and mention each saved item in one line.',
     signals.length ? `Signals recorded in this stretch:\n${signals.join('\n')}` : '',
     'Count corrections: user turns in that range that redirected your approach, explicit or implicit.',
-    'End your message with exactly this line (numbers filled in), even when nothing was saved:',
+    'End your message with exactly this line (numbers filled in; learned/patched count only what you saved for this review), even when nothing was saved:',
     '[ouroboros] reviewed=<user turns reviewed> corrections=<n> learned=<items created> patched=<items updated>',
   ].filter(Boolean).join('\n');
 }
@@ -171,6 +194,11 @@ const handlers = {
       )
       ORDER BY started_at DESC LIMIT 3
     `).all(input.session_id, stale, stale);
+    // Daily upkeep (archive unused learnings, consolidate full budgets).
+    if (options().learning && now - (Number(dbApi.getMeta(db, 'maintenance_at')) || 0) > 20 * 60 * 60 * 1000) {
+      dbApi.setMeta(db, 'maintenance_at', now);
+      spawnWorker(['--maintain']);
+    }
     if (orphans.length && options().backgroundReview) {
       for (const { id } of orphans) {
         db.prepare("UPDATE sessions SET queue_state = 'queued', last_event_at = ? WHERE id = ?").run(now, id);
@@ -189,7 +217,7 @@ const handlers = {
     ensureSession(db, input, now);
     if (input.expansion_type === 'slash_command' && input.command_name) {
       addEvent(db, input, now, 'skill_used', input.command_name, { via: 'typed', source: input.command_source || null });
-      countSkillUse(db, input.command_name, now);
+      countSkillUse(db, input.command_name, now, input.session_id);
     }
   },
 
@@ -202,14 +230,13 @@ const handlers = {
 
     if (tool === 'Skill' && ti.skill) {
       addEvent(db, input, now, 'skill_used', ti.skill, { via: 'tool' });
-      countSkillUse(db, ti.skill, now);
+      countSkillUse(db, ti.skill, now, input.session_id);
     }
     if (ti.file_path) {
       const cls = classifyPath(ti.file_path);
       if (cls && tool === 'Read') {
         addEvent(db, input, now, `${cls}_read`, ti.file_path);
-        db.prepare("UPDATE learnings SET uses = uses + 1, last_used_at = ? WHERE status = 'active' AND lower(path) = lower(?)")
-          .run(now, ti.file_path);
+        countMemoryRead(db, ti.file_path, now, input.session_id);
       } else if (cls && /^(Write|Edit|MultiEdit)$/.test(tool)) {
         addEvent(db, input, now, `${cls}_write`, ti.file_path, {
           tool,
@@ -313,6 +340,7 @@ async function main() {
     return;
   }
   if (!input?.session_id) return;
+  if (isExcluded(input.cwd)) return;
 
   if (!nodeSupported()) {
     if (event === 'SessionStart') {
@@ -323,7 +351,8 @@ async function main() {
     return;
   }
 
-  const { openDb, logError } = await import('./db.mjs');
+  dbApi = await import('./db.mjs');
+  const { openDb, logError } = dbApi;
   let db;
   try {
     db = openDb();

@@ -1,7 +1,7 @@
 {
   "name": "ouroboros",
   "displayName": "Ouroboros",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Self-learning for Claude Code: reviews your sessions, turns what is worth keeping into memories and skills, and shows usage, value and cost on a local dashboard.",
   "author": {
     "name": "Luca Martins",
@@ -16,6 +16,13 @@
       "title": "Learning",
       "description": "Learn from sessions: inject the learning protocol and your global profile, run periodic reviews and let the background reviewer write. Off = measure only.",
       "default": true
+    },
+    "autonomy": {
+      "type": "string",
+      "title": "Autonomy",
+      "description": "auto: learnings are written right away (undoable). hybrid: only high-confidence facts are written; skills and the rest wait for approval in the dashboard. queue: everything Claude or the reviewer proposes waits for approval. Explicit requests (\"remember that…\") are always written.",
+      "options": ["auto", "hybrid", "queue"],
+      "default": "auto"
     },
     "inloop_review": {
       "type": "boolean",

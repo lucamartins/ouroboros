@@ -10,6 +10,19 @@ import { fileURLToPath } from 'node:url';
 import { openDb } from '../scripts/db.mjs';
 import { dataDir } from '../scripts/paths.mjs';
 import { createApi } from './api.mjs';
+import { confirm, decideQueued, forget, undo } from '../scripts/curator.mjs';
+
+/** Write actions available from the dashboard; all go through the curator (undoable). */
+function runAction(db, action, id) {
+  switch (action) {
+    case 'undo': return undo(db, { id });
+    case 'forget': return forget(db, { match: id });
+    case 'confirm': return confirm(db, id);
+    case 'approve': return decideQueued(db, Number(id), true);
+    case 'reject': return decideQueued(db, Number(id), false);
+    default: return null;
+  }
+}
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(here, 'public');
@@ -131,6 +144,33 @@ async function serve(args) {
   const db = openDb();
   const api = createApi(db);
   const version = codeVersion();
+  const token = crypto.randomBytes(24).toString('hex');
+
+  const sendJson = (res, status, body) => {
+    res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify(body));
+  };
+
+  /** POST /api/action {action, id}: same-origin only, with the per-start token. */
+  function handleAction(req, res, url) {
+    const origin = req.headers.origin;
+    if (req.method !== 'POST') return sendJson(res, 405, { error: 'POST only' });
+    if (req.headers['x-ouroboros-token'] !== token) return sendJson(res, 403, { error: 'bad token' });
+    if (origin && origin !== `http://${req.headers.host}`) return sendJson(res, 403, { error: 'bad origin' });
+    if (!String(req.headers['content-type'] || '').startsWith('application/json')) return sendJson(res, 415, { error: 'JSON only' });
+    if (isStale()) return sendJson(res, 503, { error: 'stale', message: 'Ouroboros was updated since this dashboard started. Run /ouroboros:dashboard again to restart it.' });
+    let body = '';
+    req.on('data', (d) => { body += d; if (body.length > 10_000) req.destroy(); });
+    req.on('end', () => {
+      try {
+        const { action, id } = JSON.parse(body || '{}');
+        const result = runAction(db, action, id);
+        sendJson(res, result ? 200 : 400, result || { error: `unknown action ${action}` });
+      } catch (err) {
+        sendJson(res, 500, { error: String(err.message) });
+      }
+    });
+  }
   let lastRequest = Date.now();
   let lastVersionCheck = 0;
   let port;
@@ -155,7 +195,17 @@ async function serve(args) {
     res.setHeader('Referrer-Policy', 'no-referrer');
 
     if (url.pathname.startsWith('/api/')) {
+      if (url.pathname === '/api/action') {
+        handleAction(req, res, url);
+        return;
+      }
       if (req.method !== 'GET') { res.writeHead(405).end(); return; }
+      if (url.pathname === '/api/token') {
+        // Readable only by our own origin (no CORS headers); required on every write.
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ token }));
+        return;
+      }
       if (url.pathname === '/api/ping') {
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
         res.end(JSON.stringify({ app: 'ouroboros', version }));

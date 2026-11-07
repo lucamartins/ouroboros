@@ -202,3 +202,21 @@ td .desc { color: var(--text-2); font-size: 12px; max-width: 60ch; }
 
 .chart .marker { stroke: var(--text-3); stroke-width: 1; stroke-dasharray: 3 3; }
 .chart .marker-label { fill: var(--text-2); font-size: 11px; }
+
+/* Actions */
+.actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.lcard .actions { justify-content: flex-start; margin-top: 4px; }
+.act {
+  font: inherit; font-size: 12px; color: var(--text-2); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 6px; padding: 2px 8px; cursor: pointer; white-space: nowrap;
+}
+.act:hover { color: var(--text); border-color: var(--text-3); }
+.act.armed { color: var(--critical); border-color: var(--critical); }
+.act:disabled { opacity: 0.5; cursor: default; }
+.toast {
+  position: fixed; left: 50%; bottom: 24px; transform: translate(-50%, 20px); opacity: 0; pointer-events: none;
+  background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 14px; font-size: 13px; box-shadow: 0 4px 16px rgb(0 0 0 / 0.15); transition: opacity .15s, transform .15s;
+}
+.toast.show { opacity: 1; transform: translate(-50%, 0); }
+.toast.bad { border-color: var(--critical); }
