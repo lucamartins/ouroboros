@@ -1,0 +1,54 @@
+{
+  "description": "Ouroboros capture hooks: record session activity for learning reviews and the dashboard. They only measure; they never block or change anything.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node", "args": ["--no-warnings", "${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs", "SessionStart"], "async": true }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node", "args": ["--no-warnings", "${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs", "UserPromptSubmit"], "async": true }
+        ]
+      }
+    ],
+    "UserPromptExpansion": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node", "args": ["--no-warnings", "${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs", "UserPromptExpansion"], "async": true }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node", "args": ["--no-warnings", "${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs", "PostToolUse"], "async": true }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node", "args": ["--no-warnings", "${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs", "PostToolUseFailure"], "async": true }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node", "args": ["--no-warnings", "${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs", "Stop"], "async": true }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node", "args": ["--no-warnings", "${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs", "SessionEnd"], "timeout": 5 }
+        ]
+      }
+    ]
+  }
+}

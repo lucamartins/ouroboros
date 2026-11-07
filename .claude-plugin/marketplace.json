@@ -1,0 +1,15 @@
+{
+  "name": "ouroboros",
+  "description": "Ouroboros: self-learning for Claude Code.",
+  "owner": {
+    "name": "Luca Martins",
+    "url": "https://github.com/lucamartins"
+  },
+  "plugins": [
+    {
+      "name": "ouroboros",
+      "source": "./",
+      "description": "Self-learning for Claude Code: memories and skills learned from your sessions, with a local dashboard."
+    }
+  ]
+}

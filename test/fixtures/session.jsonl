@@ -1,0 +1,12 @@
+{"type":"permission-mode","permissionMode":"default"}
+{"type":"user","message":{"role":"user","content":"install the deps"},"origin":{"kind":"human"},"cwd":"/tmp/proj","timestamp":"2026-11-01T10:00:00.000Z","sessionId":"s1"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"secret"},{"type":"text","text":"Running npm install."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"npm install"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"Exit code 1\nnpm ERR! lockfile mismatch"}]}}
+{"type":"user","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"Base directory for this skill: /x"}]}}
+{"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>abc</task-id>"},"origin":{"kind":"task-notification"}}
+{"type":"user","message":{"role":"user","content":"no, use pnpm"},"origin":{"kind":"human"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"pnpm install"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"done"}]}}
+{"type":"assistant","isSidechain":true,"message":{"role":"assistant","content":[{"type":"text","text":"subagent chatter"}]}}
+not json
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Installed with pnpm."}]}}

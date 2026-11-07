@@ -1,0 +1,42 @@
+{
+  "name": "ouroboros",
+  "displayName": "Ouroboros",
+  "version": "0.1.0",
+  "description": "Self-learning for Claude Code: reviews your sessions, turns what is worth keeping into memories and skills, and shows usage, value and cost on a local dashboard.",
+  "author": {
+    "name": "Luca Martins",
+    "url": "https://github.com/lucamartins"
+  },
+  "repository": "https://github.com/lucamartins/ouroboros",
+  "license": "MIT",
+  "keywords": ["memory", "skills", "self-learning", "continuous-learning", "dashboard"],
+  "userConfig": {
+    "measure_review": {
+      "type": "boolean",
+      "title": "End-of-session measurement",
+      "description": "After each session, a small isolated model call counts corrections and lists what could have been learned (nothing is written). Builds the baseline.",
+      "default": true
+    },
+    "reviewer_model": {
+      "type": "string",
+      "title": "Reviewer model",
+      "description": "Model used by the background reviewer.",
+      "options": ["haiku", "sonnet"],
+      "default": "haiku"
+    },
+    "monthly_budget_usd": {
+      "type": "number",
+      "title": "Monthly reviewer budget (USD)",
+      "description": "Background reviews stop for the rest of the month once this is spent.",
+      "default": 5,
+      "min": 0
+    },
+    "long_turn_tool_calls": {
+      "type": "number",
+      "title": "Long turn threshold",
+      "description": "Tool calls in a single turn that mark it as a long autonomous turn.",
+      "default": 15,
+      "min": 1
+    }
+  }
+}

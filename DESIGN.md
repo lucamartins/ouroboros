@@ -209,11 +209,11 @@ Cost is measured from transcript `usage` between the block and the next `Stop`. 
 2. **Scope**: only the **unreviewed tail** — from the session's cursor to the end. Skipped when the tail has < 2 user turns and no `recovery` events.
 3. **Digest**: `transcript.mjs` reduces the tail to user turns, assistant text, tool names and errors; plus the `recovery` snippets recorded inside subagents (never full subagent transcripts; workflow agents are excluded entirely). Capped at ~20k tokens.
 4. **Inventory**: titles + descriptions of the existing memories/skills in scope (so the model picks `patch` over `create`).
-5. **Call**: `claude -p --model <reviewer_model> --output-format json` with an output JSON schema, no tools, `cwd` at `${CLAUDE_PLUGIN_DATA}/reviewer` (so the reviewer's transcripts don't pollute the user's projects), `OUROBOROS_REVIEWER=1`.
+5. **Call**: `claude -p --safe-mode --model <reviewer_model> --output-format json --json-schema <schema> --tools "" --no-session-persistence --max-budget-usd 0.5 --system-prompt <short>`, `cwd` at `${CLAUDE_PLUGIN_DATA}/reviewer`, `OUROBOROS_REVIEWER=1`. Isolation is essential: a plain `claude -p` loads the user's whole environment (MCP servers, plugins, skills, CLAUDE.md) and a trivial call measured **US$ 0.78**; with `--safe-mode` and a custom system prompt the same call costs **US$ 0.0003**, and real session reviews cost US$ 0.002–0.008. `--safe-mode` also disables hooks, so the reviewer can't trigger the plugin; `--no-session-persistence` keeps its transcripts out of the user's projects.
 6. **Output**: `{corrections, proposals: [{kind, scope, op: create|patch, target?, title, body | patch, confidence, evidence, duplicates_learning?}]}`. `duplicates_learning` means "the user had to repeat something already learned" → *miss* metric (§9).
 7. **Cost**: `total_cost_usd` and tokens from the result go to `reviews`. If the month's total ≥ `monthly_budget_usd`, the worker doesn't run.
 
-**Phase 1 mode (`measure`)**: the same worker runs over the whole session but only returns `corrections` and candidate learnings, which are recorded and never written. This produces the baseline.
+**Phase 1 mode (`measure`)**: the same worker runs over the whole session but only returns `corrections` and candidate learnings, which are recorded and never written. This produces the baseline. `/ouroboros:backfill` runs it over past transcripts (newest first, with a dry run and confirmation) so the baseline exists from day one instead of after 1–2 weeks.
 
 ### 6.4 `learn` skill script (used by A and manually)
 
@@ -275,7 +275,7 @@ WAL + `busy_timeout` for concurrent sessions. Versioned migrations in `db.mjs`.
 
 ## 9. Dashboard
 
-`/ouroboros:dashboard` starts `node dashboard/server.mjs` on `127.0.0.1:4747` (configurable port) and opens the browser. Build-free HTML/JS, hand-rolled SVG charts, light/dark theme, English UI. The local API is protected by a token generated at startup (so another browser page can't call the endpoints).
+`/ouroboros:dashboard` starts `node dashboard/server.mjs` on `127.0.0.1:4747` (configurable port) and opens the browser. Build-free HTML/JS, hand-rolled SVG charts, light/dark theme, English UI. The launcher reuses a running server (`dashboard.json` in the data dir) or starts a detached one that shuts down after 4 h idle. Phase 1's API is read-only and GET-only, guarded by a `Host` check (anti DNS-rebinding) and a strict CSP; the write actions of phase 4 add a per-start token.
 
 ### 9.1 Screens
 
