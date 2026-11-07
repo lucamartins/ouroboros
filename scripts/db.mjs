@@ -156,6 +156,21 @@ const MIGRATIONS = [
     value  TEXT
   );
   `,
+  // 3 — phase 3: periodic in-loop reviews, background learning, notices
+  `
+  ALTER TABLE sessions ADD COLUMN review_requested_at INTEGER;
+  ALTER TABLE sessions ADD COLUMN review_requested_line INTEGER;
+  ALTER TABLE sessions ADD COLUMN review_trigger TEXT;
+  ALTER TABLE candidates ADD COLUMN outcome TEXT;      -- created | duplicate | rejected | over_budget | error (NULL: measure only)
+  ALTER TABLE candidates ADD COLUMN learning_id TEXT;
+  CREATE TABLE notices (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts            INTEGER NOT NULL,
+    session_id    TEXT,
+    text          TEXT NOT NULL,
+    delivered_at  INTEGER
+  );
+  `,
 ];
 
 export function openDb(explicitDir) {

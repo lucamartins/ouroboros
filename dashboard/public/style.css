@@ -199,3 +199,6 @@ td .desc { color: var(--text-2); font-size: 12px; max-width: 60ch; }
   .hero-row, .charts, .grid-2 { grid-template-columns: 1fr; }
   .tiles { grid-template-columns: repeat(2, 1fr); }
 }
+
+.chart .marker { stroke: var(--text-3); stroke-width: 1; stroke-dasharray: 3 3; }
+.chart .marker-label { fill: var(--text-2); font-size: 11px; }

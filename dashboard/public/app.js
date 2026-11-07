@@ -109,7 +109,7 @@ function emptyState(title, text) {
 // ---------- bar chart ----------
 // Single series, vertical bars, 4px rounded data end, recessive grid, per-bar tooltip
 // (hover and keyboard focus) and a table view so no value is hover-only.
-function barChart({ title, data, value, format, tip, emptyText = 'No data in this period' }) {
+function barChart({ title, data, value, format, tip, emptyText = 'No data in this period', marker = null }) {
   const wrap = h('div', { class: 'card chart' }, h('h3', {}, title));
   const holder = h('div');
   wrap.append(holder);
@@ -130,7 +130,8 @@ function barChart({ title, data, value, format, tip, emptyText = 'No data in thi
       return;
     }
     const nice = niceMax(max);
-    const ticks = [0, nice / 2, nice];
+    const integers = values.every((v) => v === null || Number.isInteger(v));
+    const ticks = integers && nice <= 2 ? [0, nice] : [0, nice / 2, nice];
     const grid = s('g', { class: 'grid' });
     const axis = s('g', { class: 'axis' });
     for (const t of ticks) {
@@ -167,6 +168,14 @@ function barChart({ title, data, value, format, tip, emptyText = 'No data in thi
       bar.addEventListener('blur', hideTip);
       svg.append(hit, bar);
     });
+    // Annotation: a dashed vertical rule at the marker day (e.g. "learning on").
+    const mi = marker ? data.findIndex((d) => d.day === marker.day) : -1;
+    if (mi >= 0) {
+      const mx = pad.left + step * mi;
+      svg.append(
+        s('line', { class: 'marker', x1: mx, x2: mx, y1: pad.top, y2: pad.top + innerH }),
+        s('text', { class: 'marker-label', x: mx + 4, y: pad.top + 10 }, marker.label));
+    }
     holder.replaceChildren(svg);
   };
 
@@ -368,6 +377,95 @@ async function renderInventory() {
       ], inv.instructions))));
 }
 
+function dayOf(ts) {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+async function renderValue() {
+  const v = await api('value', { days: state.days });
+  const marker = v.enabledAt ? { day: dayOf(v.enabledAt), label: 'learning on' } : null;
+  const rate = (d) => (d.reviewedTurns ? (d.corrections / d.reviewedTurns) * 100 : null);
+  const delta = v.before.rate !== null && v.after.rate !== null ? v.after.rate - v.before.rate : null;
+
+  const compare = h('div', { class: 'tiles' },
+    tile('Before learning', fmt.rate(v.before.rate), `corrections per 100 turns · ${fmt.int(v.before.turns)} turns, ${v.before.sessions} sessions`),
+    tile('After learning', fmt.rate(v.after.rate), v.enabledAt ? `${fmt.int(v.after.turns)} turns, ${v.after.sessions} sessions since ${fmt.date(v.enabledAt)}` : 'learning has not written anything yet'),
+    h('div', { class: 'card tile' },
+      h('div', { class: 'label' }, 'Change'),
+      h('div', { class: 'value' }, delta === null ? '—' : `${delta > 0 ? '+' : ''}${delta.toFixed(1)}`),
+      h('div', { class: 'sub' }, delta === null ? 'needs reviewed sessions on both sides' : delta < 0 ? h('span', {}, h('span', { class: 'status-dot good' }), 'fewer corrections') : h('span', {}, h('span', { class: 'status-dot warn' }), 'not lower yet'))),
+    tile('Sessions using learnings', v.sessions ? fmt.pct((v.hits / v.sessions) * 100) : '—', `${v.hits} of ${v.sessions} sessions read a learned memory or used a learned skill`),
+    tile('Misses', fmt.int(v.misses.length), 'times you repeated something already saved'),
+    tile('Most used', v.top[0] ? fmt.int(v.top[0].uses) : '0', v.top[0] ? v.top[0].title : 'nothing learned yet'));
+
+  const charts = h('div', { class: 'charts' },
+    barChart({ title: 'Corrections per 100 turns', data: v.series, value: rate, format: (x) => x.toFixed(x > 0 && x < 10 ? 1 : 0), marker,
+      tip: (d) => [fmt.day(d.day), `${d.corrections} corrections · ${d.reviewedTurns} turns reviewed`], emptyText: 'No reviewed sessions in this period' }),
+    barChart({ title: 'Sessions using learnings', data: v.series, value: (d) => d.hits, format: (x) => fmt.int(x), marker,
+      tip: (d) => [fmt.day(d.day), `${d.hits} of ${d.sessions} sessions`] }),
+    barChart({ title: 'Misses', data: v.series, value: (d) => d.misses, format: (x) => fmt.int(x), marker,
+      tip: (d) => [fmt.day(d.day), 'repeated something already saved'] }));
+
+  view.replaceChildren(
+    h('div', { class: 'section-head' }, h('h2', {}, 'Is it helping?'),
+      h('span', { class: 'muted small' }, 'Fewer corrections and fewer misses after learning turned on mean it is working.')),
+    compare,
+    h('section', { class: 'section' }, charts),
+    h('section', { class: 'section grid-2' },
+      h('div', { class: 'card' }, h('h3', {}, 'Most used learnings'), table([
+        { label: 'Learning', render: (r) => r.title },
+        { label: 'Kind', render: (r) => h('span', { class: `badge ${r.kind}` }, r.kind) },
+        { label: 'Uses', num: true, render: (r) => fmt.int(r.uses) },
+        { label: 'Last used', render: (r) => (r.last_used_at ? fmt.ago(r.last_used_at) : '—') },
+      ], v.top, { empty: 'Nothing learned yet.' })),
+      h('div', { class: 'card' }, h('h3', {}, 'Recent misses'), v.misses.length
+        ? h('ul', { class: 'list' }, v.misses.map((m) => h('li', {}, h('div', {}, m.title), h('div', { class: 'faint small' }, `already saved as ${m.repeats} · ${fmt.date(m.started_at)}`))))
+        : h('p', { class: 'muted small' }, 'None.'))));
+}
+
+async function renderCost() {
+  const c = await api('cost', { days: state.days });
+  const mode = Object.fromEntries(c.byMode.map((m) => [m.mode, m]));
+  const inloop = mode.inloop || { n: 0, input: 0, output: 0, cache_read: 0 };
+  const bgUsd = (mode.background?.usd || 0) + (mode.measure?.usd || 0);
+  const bgN = (mode.background?.n || 0) + (mode.measure?.n || 0);
+  const budget = c.month.budget;
+
+  const tiles = h('div', { class: 'tiles' },
+    h('div', { class: 'card tile' },
+      h('div', { class: 'label' }, 'End-of-session reviews this month'),
+      h('div', { class: 'value' }, fmt.usd(c.month.usd)),
+      budget ? meter(c.month.usd, budget) : null,
+      h('div', { class: 'sub' }, budget ? `of ${fmt.usd(budget)} monthly budget` : 'budget not reported yet')),
+    tile('Reviews in period', fmt.int(bgN + inloop.n), `${bgN} end-of-session (${fmt.usd(bgUsd)}) · ${inloop.n} in-session`),
+    tile('In-session review tokens', fmt.compact(inloop.input + inloop.output), `${fmt.compact(inloop.output)} output · ${fmt.compact(inloop.cache_read)} cache reads · on your plan`),
+    tile('Context per session', `${fmt.int(c.overhead.tokensPerSession)} tok`, `protocol + profile · ≈${fmt.compact(c.overhead.tokens)} tokens over ${c.overhead.sessions} sessions`),
+    tile('Cost per hit', c.hits ? fmt.usd(bgUsd / c.hits) : '—', c.hits ? `${c.hits} sessions used a learning` : 'no session used a learning yet'),
+    tile('Avg. per end-of-session review', bgN ? fmt.usd(bgUsd / bgN) : '—', 'isolated Haiku call'));
+
+  const charts = h('div', { class: 'charts' },
+    barChart({ title: 'End-of-session review cost', data: c.series, value: (d) => d.usd, format: fmt.usd, tip: (d) => [fmt.day(d.day), `${d.reviews} reviews`] }),
+    barChart({ title: 'In-session review tokens', data: c.series, value: (d) => d.inloopTokens, format: (x) => fmt.compact(x), tip: (d) => [fmt.day(d.day)] }),
+    barChart({ title: 'Reviews', data: c.series, value: (d) => d.reviews, format: (x) => fmt.int(x), tip: (d) => [fmt.day(d.day)] }));
+
+  view.replaceChildren(
+    tiles,
+    h('section', { class: 'section' }, charts),
+    h('section', { class: 'section' }, h('div', { class: 'section-head' }, h('h2', {}, 'Recent reviews')),
+      h('div', { class: 'card' }, table([
+        { label: 'When', render: (r) => fmt.datetime(r.ts) },
+        { label: 'Kind', render: (r) => `${r.mode === 'inloop' ? 'in-session' : r.mode === 'background' ? 'end of session' : r.mode}${r.trigger ? ` · ${r.trigger}` : ''}` },
+        { label: 'Project', render: (r) => projectName(r.project, r.cwd) },
+        { label: 'Status', render: (r) => h('span', { title: r.detail || '' }, reviewState(r.status === 'ok' ? 'done' : r.status)) },
+        { label: 'Turns', num: true, render: (r) => fmt.int(r.turns_reviewed) },
+        { label: 'Corrections', num: true, render: (r) => fmt.int(r.corrections) },
+        { label: 'Learned', num: true, render: (r) => fmt.int(r.learned + r.patched) },
+        { label: 'Tokens', num: true, render: (r) => fmt.compact(r.input + r.output) },
+        { label: 'Cost', num: true, render: (r) => (r.mode === 'inloop' ? 'plan' : fmt.usd(r.cost_usd)) },
+      ], c.recent, { empty: 'No reviews yet.' }))));
+}
+
 async function renderHealth() {
   const hl = await api('health');
   const LISTING_REF = 2000; // ~1% of a 200K-token context
@@ -423,11 +521,11 @@ async function renderHealth() {
 }
 
 // ---------- shell ----------
-const renderers = { overview: renderOverview, learnings: renderLearnings, inventory: renderInventory, health: renderHealth };
+const renderers = { overview: renderOverview, learnings: renderLearnings, value: renderValue, cost: renderCost, inventory: renderInventory, health: renderHealth };
 
 async function render() {
   hideTip();
-  rangeSelect.disabled = state.tab !== 'overview';
+  rangeSelect.disabled = !['overview', 'value', 'cost'].includes(state.tab);
   try {
     await renderers[state.tab]();
   } catch (err) {
@@ -463,3 +561,7 @@ const initial = location.hash.slice(1);
 if (renderers[initial]) document.querySelector(`.tabs button[data-tab="${initial}"]`).click();
 else render();
 setInterval(() => { if (!document.hidden && state.tab === 'overview') render(); }, 60_000);
+window.addEventListener('hashchange', () => {
+  const tab = location.hash.slice(1);
+  if (renderers[tab] && tab !== state.tab) document.querySelector(`.tabs button[data-tab="${tab}"]`).click();
+});

@@ -6,6 +6,7 @@ import { blockChars, parseProfile, readProfileText } from '../scripts/profile.mj
 import { loadSettings } from '../scripts/settings.mjs';
 import { listInstructionFiles, listMemories, listSkills, userProfile } from '../scripts/inventory.mjs';
 import { dataDir, normalize } from '../scripts/paths.mjs';
+import { sessionContext } from '../scripts/hook.mjs';
 
 const DAY = 86_400_000;
 const MEMORY_INDEX_LINE_LIMIT = 200; // Claude Code loads the first 200 lines / 25KB of MEMORY.md
@@ -20,13 +21,111 @@ function dayKey(ts) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
+/** Characters Ouroboros adds to every session's context (protocol + profile). */
+function overheadChars() {
+  try { return sessionContext().length; } catch { return null; }
+}
+
 function knownCwds(db) {
   return db.prepare('SELECT DISTINCT cwd FROM sessions WHERE cwd IS NOT NULL ORDER BY started_at DESC LIMIT 100').all().map((r) => r.cwd);
 }
 
+function rangeStart(params, fallback = 30) {
+  const days = Math.min(Math.max(Number(params.get('days')) || fallback, 1), 365);
+  const start = new Date(Date.now() - (days - 1) * DAY);
+  start.setHours(0, 0, 0, 0);
+  return { days, since: start.getTime() };
+}
+
+function emptySeries(since, make) {
+  const m = new Map();
+  for (let t = since; t <= Date.now(); t += DAY) m.set(dayKey(t), { day: dayKey(t), ...make() });
+  return m;
+}
+
+/** Sessions that used at least one learned memory or skill (profile facts are always in context). */
+const HITS_SQL = `
+  SELECT e.session_id, MIN(e.ts) ts FROM events e
+  JOIN learnings l ON l.status = 'active' AND l.origin_session IS NOT 'native' AND (
+    (e.kind = 'skill_used' AND l.kind = 'skill' AND (e.target = l.name OR e.target LIKE '%:' || l.name)) OR
+    (e.kind = 'memory_read' AND lower(e.target) = lower(l.path)))
+  WHERE e.ts >= ? GROUP BY e.session_id`;
+
 export function createApi(db) {
   const routes = {
     ping: () => ({ app: 'ouroboros' }),
+
+    value(params) {
+      const { days, since } = rangeStart(params, 90);
+      const enabledAt = Number(getMeta(db, 'learning_enabled_at')) || null;
+      const split = db.prepare(`
+        SELECT CASE WHEN ? IS NOT NULL AND COALESCE(session_started_at, ts) >= ? THEN 'after' ELSE 'before' END phase,
+               COUNT(DISTINCT session_id) sessions, COALESCE(SUM(turns_reviewed), 0) turns, COALESCE(SUM(corrections), 0) corrections
+        FROM reviews WHERE status = 'ok' GROUP BY phase`).all(enabledAt, enabledAt ?? 0);
+      const phase = (p) => {
+        const r = split.find((x) => x.phase === p) || { sessions: 0, turns: 0, corrections: 0 };
+        return { ...r, rate: r.turns ? (r.corrections / r.turns) * 100 : null };
+      };
+      const series = emptySeries(since, () => ({ reviewedTurns: 0, corrections: 0, misses: 0, sessions: 0, hits: 0 }));
+      for (const r of db.prepare("SELECT COALESCE(session_started_at, ts) t, turns_reviewed, corrections FROM reviews WHERE status = 'ok' AND COALESCE(session_started_at, ts) >= ?").all(since)) {
+        const d = series.get(dayKey(r.t));
+        if (d) { d.reviewedTurns += r.turns_reviewed; d.corrections += r.corrections; }
+      }
+      for (const r of db.prepare('SELECT s.started_at t FROM candidates c JOIN sessions s ON s.id = c.session_id WHERE c.repeats IS NOT NULL AND s.started_at >= ?').all(since)) {
+        const d = series.get(dayKey(r.t));
+        if (d) d.misses++;
+      }
+      for (const r of db.prepare('SELECT started_at t FROM sessions WHERE started_at >= ?').all(since)) {
+        const d = series.get(dayKey(r.t));
+        if (d) d.sessions++;
+      }
+      const hits = db.prepare(HITS_SQL).all(since);
+      for (const r of hits) {
+        const d = series.get(dayKey(r.ts));
+        if (d) d.hits++;
+      }
+      const sessions = db.prepare('SELECT COUNT(*) n FROM sessions WHERE started_at >= ?').get(since).n;
+      const top = db.prepare(`
+        SELECT id, kind, title, uses, last_used_at, confidence FROM learnings
+        WHERE status = 'active' AND origin_session IS NOT 'native' ORDER BY uses DESC, updated_at DESC LIMIT 10`).all();
+      const misses = db.prepare(`
+        SELECT c.title, c.repeats, s.started_at FROM candidates c JOIN sessions s ON s.id = c.session_id
+        WHERE c.repeats IS NOT NULL ORDER BY s.started_at DESC LIMIT 20`).all();
+      return { days, enabledAt, before: phase('before'), after: phase('after'), series: [...series.values()], hits: hits.length, sessions, top, misses };
+    },
+
+    cost(params) {
+      const { days, since } = rangeStart(params, 30);
+      const opts = readOptions();
+      const series = emptySeries(since, () => ({ usd: 0, inloopTokens: 0, reviews: 0 }));
+      for (const r of db.prepare('SELECT ts, mode, cost_usd, input_tokens, output_tokens, cache_write_tokens FROM reviews WHERE ts >= ?').all(since)) {
+        const d = series.get(dayKey(r.ts));
+        if (!d) continue;
+        d.usd += r.cost_usd;
+        d.reviews++;
+        if (r.mode === 'inloop') d.inloopTokens += r.input_tokens + r.output_tokens + r.cache_write_tokens;
+      }
+      const byMode = db.prepare(`
+        SELECT mode, COUNT(*) n, COALESCE(SUM(cost_usd), 0) usd, COALESCE(SUM(output_tokens), 0) output,
+               COALESCE(SUM(input_tokens + cache_write_tokens), 0) input, COALESCE(SUM(cache_read_tokens), 0) cache_read
+        FROM reviews WHERE ts >= ? GROUP BY mode`).all(since);
+      const recent = db.prepare(`
+        SELECT r.ts, r.mode, r.trigger, r.status, r.detail, r.turns_reviewed, r.corrections, r.learned, r.patched,
+               r.input_tokens + r.cache_write_tokens input, r.cache_read_tokens cache_read, r.output_tokens output, r.cost_usd, s.cwd, s.project
+        FROM reviews r LEFT JOIN sessions s ON s.id = r.session_id ORDER BY r.ts DESC LIMIT 30`).all();
+      const sessions = db.prepare('SELECT COUNT(*) n FROM sessions WHERE started_at >= ?').get(since).n;
+      const hits = db.prepare(HITS_SQL).all(since).length;
+      const contextChars = opts?.learning === false ? 0 : (overheadChars() || 0);
+      return {
+        days,
+        month: { usd: monthSpend(db), budget: opts?.monthlyBudgetUsd ?? null },
+        byMode,
+        series: [...series.values()],
+        overhead: { charsPerSession: contextChars, tokensPerSession: Math.round(contextChars / 4), sessions, tokens: Math.round((contextChars / 4) * sessions) },
+        hits,
+        recent,
+      };
+    },
 
     overview(params) {
       const days = Math.min(Math.max(Number(params.get('days')) || 30, 1), 365);

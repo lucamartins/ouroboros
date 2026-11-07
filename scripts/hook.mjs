@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { options } from './config.mjs';
 import { classifyPath, dataDir, projectKey, skillNameFromPath } from './paths.mjs';
 import { profileForContext, readProfileText } from './profile.mjs';
+import { countLines, readTranscript, usageSince } from './transcript.mjs';
 
 const MIN_NODE = [22, 13];
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -70,14 +71,62 @@ export const PROTOCOL = `Ouroboros (self-learning) is active. Without being aske
 - create or patch a skill when you worked out a reusable multi-step workflow, found the working path after errors, or the user corrected your approach.
 Prefer patching what exists over creating new. Don't save what is derivable from the code or CLAUDE.md, ephemeral task details, or secrets. After saving, tell the user in one line: "📝 learned: …".`;
 
+export const RESULT_RE = /\[ouroboros\]\s*reviewed=(\d+)\s+corrections=(\d+)\s+learned=(\d+)\s+patched=(\d+)/i;
+
+/** Instructions sent through the Stop hook to ask for a periodic review. */
+export function reviewRequest({ from, to, trigger, recoveries = [] }) {
+  const why = trigger === 'long_turn' ? 'after a long autonomous turn' : 'periodic';
+  const signals = recoveries.map((r) => {
+    let p = {};
+    try { p = JSON.parse(r.payload || '{}'); } catch { /* ignore */ }
+    return `- \`${r.target}\` failed ${p.failures || '?'}× before working${p.first_error ? ` (first error: ${String(p.first_error).split('\n')[0].slice(0, 120)})` : ''}`;
+  });
+  return [
+    `Ouroboros learning review (${why}). Before finishing, review user turns ${from}–${to} of this session — only what happened since the last review.`,
+    'Use the `ouroboros:learn` skill if anything passes its filters (corrections of your approach, preferences, conventions, working paths found after errors); be brief and mention each saved item in one line.',
+    signals.length ? `Signals recorded in this stretch:\n${signals.join('\n')}` : '',
+    'Count corrections: user turns in that range that redirected your approach, explicit or implicit.',
+    'End your message with exactly this line (numbers filled in), even when nothing was saved:',
+    '[ouroboros] reviewed=<user turns reviewed> corrections=<n> learned=<items created> patched=<items updated>',
+  ].filter(Boolean).join('\n');
+}
+
+/** Record the outcome of a requested in-loop review and move the cursor. */
+function finishInloopReview(db, input, s, now) {
+  const m = RESULT_RE.exec(String(input.last_assistant_message || ''));
+  let entries = null;
+  try { entries = input.transcript_path ? readTranscript(input.transcript_path) : null; } catch { /* unreadable */ }
+  const usage = entries ? usageSince(entries, s.review_requested_line || 0) : null;
+  const base = {
+    session: input.session_id, trigger: s.review_trigger, model: usage?.model,
+    input: usage?.input || 0, output: usage?.output || 0, cacheRead: usage?.cacheRead || 0, cacheWrite: usage?.cacheWrite || 0,
+  };
+  const insert = db.prepare(`
+    INSERT INTO reviews (session_id, mode, trigger, model, status, detail, turns_reviewed, corrections, learned, patched,
+      input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, duration_ms, session_started_at, ts)
+    VALUES (?, 'inloop', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`);
+  if (m) {
+    insert.run(base.session, base.trigger, base.model, 'ok', null, Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4]),
+      base.input, base.output, base.cacheRead, base.cacheWrite, now - s.review_requested_at, s.started_at, now);
+    db.prepare('UPDATE sessions SET review_cursor = ?, review_requested_at = NULL WHERE id = ?')
+      .run(entries ? entries.length : s.review_cursor, input.session_id);
+  } else {
+    // No result line: the segment stays unreviewed and falls to the end-of-session review.
+    insert.run(base.session, base.trigger, base.model, 'skipped', 'no result line', 0, 0, 0, 0,
+      base.input, base.output, base.cacheRead, base.cacheWrite, now - s.review_requested_at, s.started_at, now);
+    db.prepare('UPDATE sessions SET review_requested_at = NULL WHERE id = ?').run(input.session_id);
+  }
+}
+
 /** Context injected at session start: the protocol plus the global profile. */
-export function sessionContext() {
+export function sessionContext(learnedSinceLastSession = '') {
   const text = readProfileText();
   const profile = text ? profileForContext(text) : '';
   return [
     '<ouroboros>',
     PROTOCOL,
     profile ? `\nWhat you already know about the user and their environment (from ~/.ouroboros/user.md):\n${profile}` : '',
+    learnedSinceLastSession ? `\nLearned by the end-of-session review since the last session (already saved):\n${learnedSinceLastSession}` : '',
     '</ouroboros>',
   ].filter(Boolean).join('\n');
 }
@@ -99,9 +148,16 @@ const handlers = {
     // The dashboard runs outside hooks and can't see plugin options; leave a snapshot.
     fs.writeFileSync(path.join(dataDir(), 'options.json'), JSON.stringify({ ...options(), updatedAt: now }));
     if (options().learning) {
-      // Synchronous hook: stdout becomes session context.
+      // What the end-of-session reviewer learned since the last session start.
+      const notices = db.prepare('SELECT id, text FROM notices WHERE delivered_at IS NULL ORDER BY id').all();
+      if (notices.length) {
+        db.prepare(`UPDATE notices SET delivered_at = ? WHERE id IN (${notices.map(() => '?').join(',')})`).run(now, ...notices.map((n) => n.id));
+      }
+      const learnedText = notices.map((n) => n.text).join('\n');
+      // Synchronous hook: stdout becomes session context; systemMessage is shown to the user.
       process.stdout.write(JSON.stringify({
-        hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: sessionContext() },
+        ...(learnedText ? { systemMessage: `Ouroboros, since your last session:\n${learnedText}\n(/ouroboros:undo or /ouroboros:forget to revert)` } : {}),
+        hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: sessionContext(learnedText) },
       }));
     }
     // Sessions whose SessionEnd never ran a worker (crash, killed terminal) or whose
@@ -194,15 +250,46 @@ const handlers = {
 
   Stop(db, input, now) {
     ensureSession(db, input, now);
-    const s = db.prepare('SELECT turn_tool_calls FROM sessions WHERE id = ?').get(input.session_id);
-    if (s && s.turn_tool_calls >= options().longTurnToolCalls) {
+    const opts = options();
+    const s = db.prepare('SELECT * FROM sessions WHERE id = ?').get(input.session_id);
+    if (s.turn_tool_calls >= opts.longTurnToolCalls && !input.stop_hook_active) {
       addEvent(db, input, now, 'long_turn', null, { tool_calls: s.turn_tool_calls });
     }
+
+    // 1. A review was requested at the previous Stop: record its result line.
+    if (s.review_requested_at) {
+      finishInloopReview(db, input, s, now);
+      return;
+    }
+
+    // 2. Decide whether to ask for a periodic review now.
+    if (!opts.learning || !opts.inloopReview || input.stop_hook_active || input.agent_id) return;
+    const turnsSince = s.turns - s.turns_at_last_review;
+    const trigger = turnsSince >= opts.reviewEveryTurns ? 'periodic'
+      : s.turn_tool_calls >= opts.longTurnToolCalls && turnsSince >= 2 ? 'long_turn'
+        : null;
+    if (!trigger) return;
+
+    const line = input.transcript_path ? countLines(input.transcript_path) : null;
+    db.prepare(`
+      UPDATE sessions SET review_requested_at = ?, review_requested_line = ?, review_trigger = ?, turns_at_last_review = turns
+      WHERE id = ?
+    `).run(now, line, trigger, input.session_id);
+    const since = db.prepare("SELECT MAX(ts) t FROM reviews WHERE session_id = ? AND status = 'ok'").get(input.session_id).t || s.started_at || 0;
+    const recoveries = db.prepare("SELECT target, payload FROM events WHERE session_id = ? AND kind = 'recovery' AND ts > ? ORDER BY id DESC LIMIT 5")
+      .all(input.session_id, since);
+    addEvent(db, input, now, 'review_requested', trigger, { turns: [s.turns_at_last_review + 1, s.turns] });
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'Stop',
+        additionalContext: reviewRequest({ from: s.turns_at_last_review + 1, to: s.turns, trigger, recoveries }),
+      },
+    }));
   },
 
   SessionEnd(db, input, now) {
     ensureSession(db, input, now);
-    db.prepare('UPDATE sessions SET ended_at = ?, end_reason = ? WHERE id = ?').run(now, input.reason || null, input.session_id);
+    db.prepare('UPDATE sessions SET ended_at = ?, end_reason = ?, review_requested_at = NULL WHERE id = ?').run(now, input.reason || null, input.session_id);
     addEvent(db, input, now, 'session_end', input.reason || null);
     if (!options().backgroundReview) return;
     const res = db.prepare(`

@@ -94,6 +94,39 @@ export function buildDigest(entries, { fromLine = 0, maxChars = 80_000 } = {}) {
   return { text, humanTurns, nextLine: entries.length };
 }
 
+/** Number of lines in a transcript (the cursor unit), or null if unreadable. */
+export function countLines(file) {
+  try {
+    const text = fs.readFileSync(file, 'utf8');
+    let n = 0;
+    for (const line of text.split('\n')) if (line.trim()) n++;
+    return n;
+  } catch {
+    return null;
+  }
+}
+
+/** Token usage of the assistant messages from `fromLine` on. */
+export function usageSince(entries, fromLine = 0) {
+  const total = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, model: null };
+  const seen = new Set();
+  for (let i = fromLine; i < entries.length; i++) {
+    const e = entries[i];
+    if (!e || e.type !== 'assistant' || !e.message?.usage) continue;
+    // A message streamed in several entries repeats the same id and usage.
+    const id = e.message.id || `line-${i}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const u = e.message.usage;
+    total.input += u.input_tokens || 0;
+    total.output += u.output_tokens || 0;
+    total.cacheRead += u.cache_read_input_tokens || 0;
+    total.cacheWrite += u.cache_creation_input_tokens || 0;
+    total.model = e.message.model || total.model;
+  }
+  return total;
+}
+
 function render(lines) {
   return lines.map((l) => l.text).join('\n');
 }

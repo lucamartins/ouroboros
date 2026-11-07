@@ -2,7 +2,7 @@
 
 > A Claude Code plugin that learns from your sessions on its own: it saves memories and creates/refines skills without being asked, in the spirit of Nous Research's Hermes Agent, and shows on a local dashboard what it learned, how much that is being used and what it costs.
 
-Status: phases 1 (measure) and 2 (manual learning) implemented; phase 3 next. Owner decisions in [§12](#12-decisions).
+Status: phases 1 (measure), 2 (manual learning) and 3 (self-learning) implemented; phase 4 next. Owner decisions in [§12](#12-decisions).
 
 ---
 
@@ -187,7 +187,7 @@ Explicit "remember that…" requests need no detection: the protocol makes Claud
 
 ### 6.2 Reflection A — periodic in-loop review (Stop)
 
-The `Stop` hook returns `{"decision":"block","reason": <script>}` when:
+The `Stop` hook returns `{"hookSpecificOutput":{"hookEventName":"Stop","additionalContext": <script>}}` — which keeps the conversation going under the same loop protections as `decision: "block"`, without a hook-error notice — when:
 
 - `stop_hook_active` is false (prevents loops), **and**
 - `inloop_review` is on, **and** either
@@ -202,7 +202,7 @@ The `reason` tells Claude to run the `learn` skill over **the segment since the 
 
 On the next `Stop`, the hook parses that line from `last_assistant_message`, records it in `reviews`, and advances the session's cursor to the transcript position of the review. If the line is missing (Claude skipped the review), the cursor does not move and the segment falls to reflection B.
 
-Cost is measured from transcript `usage` between the block and the next `Stop`. Most of the input is a cache read; the output is usually short ("nothing to learn").
+Cost is measured from transcript `usage` between the request and the next `Stop`. Most of the input is a cache read; the output is usually short. Measured end to end: a review with one save read ~64k cached tokens and wrote 187 output tokens. The next request comes `review_every_turns` turns later even if Claude skipped this one (`turns_at_last_review` moves when the request is made, the cursor only when the result line arrives). Subagent stops and `stop_hook_active` stops never request a review.
 
 ### 6.3 Reflection B — end-of-session background review
 
@@ -211,8 +211,11 @@ Cost is measured from transcript `usage` between the block and the next `Stop`. 
 3. **Digest**: `transcript.mjs` reduces the tail to user turns, assistant text, tool names and errors; plus the `recovery` snippets recorded inside subagents (never full subagent transcripts; workflow agents are excluded entirely). Capped at ~20k tokens.
 4. **Inventory**: titles + descriptions of the existing memories/skills in scope (so the model picks `patch` over `create`).
 5. **Call**: `claude -p --safe-mode --model <reviewer_model> --output-format json --json-schema <schema> --tools "" --no-session-persistence --max-budget-usd 0.5 --system-prompt <short>`, `cwd` at `${CLAUDE_PLUGIN_DATA}/reviewer`, `OUROBOROS_REVIEWER=1`. Isolation is essential: a plain `claude -p` loads the user's whole environment (MCP servers, plugins, skills, CLAUDE.md) and a trivial call measured **US$ 0.78**; with `--safe-mode` and a custom system prompt the same call costs **US$ 0.0003**, and real session reviews cost US$ 0.002–0.008. `--safe-mode` also disables hooks, so the reviewer can't trigger the plugin; `--no-session-persistence` keeps its transcripts out of the user's projects.
-6. **Output**: `{corrections, proposals: [{kind, scope, op: create|patch, target?, title, body | patch, confidence, evidence, duplicates_learning?}]}`. `duplicates_learning` means "the user had to repeat something already learned" → *miss* metric (§9).
-7. **Cost**: `total_cost_usd` and tokens from the result go to `reviews`. If the month's total ≥ `monthly_budget_usd`, the worker doesn't run.
+6. **Output**: `{corrections, items: [{kind: profile|memory|skill, block?, scope?, memory_type?, title, text?, description?, body?, confidence, evidence, repeats?}]}`, applied through the curator as `create` items (the reviewer sees only names and descriptions of what exists, not contents, so it never patches). A `duplicate` answer reinforces the existing learning (+0.1 confidence, max 0.9). `repeats` means "the user had to repeat something already saved" → *miss* metric (§9). Every item is recorded in `candidates` with its curator `outcome`.
+7. **Notices**: created items become a notice; the next `SessionStart` shows it to the user (`systemMessage`) and tells Claude (context), then marks it delivered.
+8. **Cost**: `total_cost_usd` and tokens from the result go to `reviews`. If the month's total ≥ `monthly_budget_usd`, the worker doesn't run. Measured end to end: a 23-turn session tail produced 3 corrections and 4 well-formed memories for US$ 0.008.
+
+With `learning` off the worker runs in `measure` mode instead. `/ouroboros:backfill` always uses `measure`: past sessions are counted, never learned from.
 
 **Phase 1 mode (`measure`)**: the same worker runs over the whole session but only returns `corrections` and candidate learnings, which are recorded and never written. This produces the baseline. `/ouroboros:backfill` runs it over past transcripts (newest first, with a dry run and confirmation) so the baseline exists from day one instead of after 1–2 weeks.
 

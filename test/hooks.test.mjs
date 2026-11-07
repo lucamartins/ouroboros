@@ -27,12 +27,12 @@ before(() => {
   delete env.OUROBOROS_REVIEWER;
 });
 
-after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+after(() => fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }));
 
-function hook(event, input) {
+function hook(event, input, extraEnv = {}) {
   const r = spawnSync(process.execPath, ['--no-warnings', path.join(root, 'scripts', 'hook.mjs'), event], {
     input: JSON.stringify({ session_id: 's1', cwd: '/tmp/proj', transcript_path: path.join(fixtures, 'session.jsonl'), hook_event_name: event, ...input }),
-    env,
+    env: { ...env, ...extraEnv },
     encoding: 'utf8',
   });
   assert.equal(r.status, 0, r.stderr);
@@ -91,12 +91,12 @@ test('capture: turns, skills, memory writes, recovery and long turns', () => {
   d.close();
 });
 
-test('SessionEnd queues a measure review that records corrections and candidates', async () => {
+test('SessionEnd runs a background review that writes learnings and leaves a notice', async () => {
   hook('SessionEnd', { reason: 'prompt_input_exit' });
   const d = db();
   const review = await waitFor(() => d.prepare('SELECT * FROM reviews WHERE session_id = ?').get('s1'));
   assert.equal(review.status, 'ok', review.detail);
-  assert.equal(review.mode, 'measure');
+  assert.equal(review.mode, 'background');
   assert.equal(review.turns_reviewed, 2);
   assert.equal(review.corrections, 1);
   assert.equal(review.cost_usd, 0.0042);
@@ -105,8 +105,69 @@ test('SessionEnd queues a measure review that records corrections and candidates
     return row.queue_state === 'done' && row;
   });
   assert.ok(s.review_cursor > 0);
-  assert.equal(d.prepare('SELECT title FROM candidates').get().title, 'Use pnpm');
+  assert.deepEqual(d.prepare('SELECT outcome FROM candidates ORDER BY id').all().map((r) => r.outcome), ['created', 'created']);
+  assert.equal(d.prepare('SELECT learned FROM reviews WHERE session_id = ?').get('s1').learned, 2);
   d.close();
+  assert.ok(fs.existsSync(path.join(tmp, 'claude', 'projects', '-tmp-proj', 'memory', 'use-pnpm.md')));
+  assert.match(fs.readFileSync(path.join(tmp, 'ouroboros', 'user.md'), 'utf8'), /Hooks run under Git Bash on Windows/);
+
+  const first = JSON.parse(hook('SessionStart', { session_id: 's3', source: 'startup' }));
+  assert.match(first.systemMessage, /📝 learned: Use pnpm/);
+  assert.match(first.hookSpecificOutput.additionalContext, /Hooks run under Git Bash on Windows/);
+  const second = JSON.parse(hook('SessionStart', { session_id: 's3b', source: 'startup' }));
+  assert.equal(second.systemMessage, undefined);
+});
+
+test('with learning off the end-of-session review only measures', async () => {
+  const off = { CLAUDE_PLUGIN_OPTION_LEARNING: 'false' };
+  hook('UserPromptSubmit', { session_id: 's4' }, off);
+  hook('SessionEnd', { session_id: 's4', reason: 'other' }, off);
+  const d = db();
+  const review = await waitFor(() => d.prepare("SELECT * FROM reviews WHERE session_id = 's4'").get());
+  assert.equal(review.mode, 'measure', review.detail);
+  assert.equal(review.status, 'ok', review.detail);
+  const c = await waitFor(() => d.prepare("SELECT * FROM candidates WHERE session_id = 's4'").get());
+  assert.equal(c.outcome, null);
+  d.close();
+});
+
+test('periodic in-loop review: request, result line, cursor and skips', () => {
+  const every2 = { CLAUDE_PLUGIN_OPTION_REVIEW_EVERY_TURNS: '2' };
+  const sid = { session_id: 's5' };
+  hook('UserPromptSubmit', sid, every2);
+  assert.equal(hook('Stop', { ...sid, stop_hook_active: false }, every2), '');
+  hook('UserPromptSubmit', sid, every2);
+  const req = JSON.parse(hook('Stop', { ...sid, stop_hook_active: false }, every2));
+  assert.equal(req.hookSpecificOutput.hookEventName, 'Stop');
+  assert.match(req.hookSpecificOutput.additionalContext, /user turns 1–2/);
+  assert.match(req.hookSpecificOutput.additionalContext, /\[ouroboros\] reviewed=/);
+
+  const done = hook('Stop', { ...sid, stop_hook_active: true, last_assistant_message: '📝 learned: x\n[ouroboros] reviewed=2 corrections=1 learned=1 patched=0' }, every2);
+  assert.equal(done, '');
+  let d = db();
+  const r = d.prepare("SELECT * FROM reviews WHERE session_id = 's5' AND mode = 'inloop'").get();
+  assert.equal(r.status, 'ok');
+  assert.equal(r.corrections, 1);
+  assert.equal(r.learned, 1);
+  assert.equal(r.trigger, 'periodic');
+  const s = d.prepare("SELECT review_cursor, review_requested_at FROM sessions WHERE id = 's5'").get();
+  assert.equal(s.review_cursor, 12);
+  assert.equal(s.review_requested_at, null);
+  d.close();
+
+  // Next window: requested, but Claude ends without the result line.
+  hook('UserPromptSubmit', sid, every2);
+  hook('UserPromptSubmit', sid, every2);
+  assert.notEqual(hook('Stop', { ...sid, stop_hook_active: false }, every2), '');
+  hook('Stop', { ...sid, stop_hook_active: true, last_assistant_message: 'done' }, every2);
+  d = db();
+  assert.equal(d.prepare("SELECT status FROM reviews WHERE session_id = 's5' ORDER BY id DESC").get().status, 'skipped');
+  d.close();
+
+  // Learning off: no requests at all.
+  hook('UserPromptSubmit', sid, every2);
+  hook('UserPromptSubmit', sid, every2);
+  assert.equal(hook('Stop', { ...sid, stop_hook_active: false }, { ...every2, CLAUDE_PLUGIN_OPTION_LEARNING: 'false' }), '');
 });
 
 test('learning can be turned off; reads of learned items count as uses', () => {

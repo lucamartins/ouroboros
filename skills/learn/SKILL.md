@@ -76,3 +76,13 @@ The first lines are a human summary; the last line is JSON.
 - `rejected` → fix the cause it states, or drop the item.
 
 The user can revert any write with `/ouroboros:undo`.
+
+## Periodic reviews
+
+When Ouroboros asks for a periodic review (a Stop-hook message naming a range of user turns), review only that range, keep it short, and **always** end your message with the result line it asks for — even when nothing was saved:
+
+```
+[ouroboros] reviewed=<user turns reviewed> corrections=<n> learned=<items created> patched=<items updated>
+```
+
+Corrections are user turns in the range that redirected your approach, explicit ("no, use X") or implicit ("hmm, it broke again", "I prefer the other way").

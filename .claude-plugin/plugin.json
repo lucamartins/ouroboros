@@ -1,7 +1,7 @@
 {
   "name": "ouroboros",
   "displayName": "Ouroboros",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Self-learning for Claude Code: reviews your sessions, turns what is worth keeping into memories and skills, and shows usage, value and cost on a local dashboard.",
   "author": {
     "name": "Luca Martins",
@@ -14,35 +14,48 @@
     "learning": {
       "type": "boolean",
       "title": "Learning",
-      "description": "Inject the learning protocol and your global profile into each session, so Claude saves what it learns through /ouroboros:learn.",
+      "description": "Learn from sessions: inject the learning protocol and your global profile, run periodic reviews and let the background reviewer write. Off = measure only.",
       "default": true
     },
-    "measure_review": {
+    "inloop_review": {
       "type": "boolean",
-      "title": "End-of-session measurement",
-      "description": "After each session, a small isolated model call counts corrections and lists what could have been learned (nothing is written). Builds the baseline.",
+      "title": "Periodic in-session review",
+      "description": "Every N turns (and after long autonomous turns) Claude briefly reviews the recent turns and saves what is worth keeping.",
+      "default": true
+    },
+    "review_every_turns": {
+      "type": "number",
+      "title": "Turns between reviews",
+      "description": "User turns between periodic in-session reviews.",
+      "default": 10,
+      "min": 1
+    },
+    "long_turn_tool_calls": {
+      "type": "number",
+      "title": "Long turn threshold",
+      "description": "Tool calls in a single turn that trigger an early review.",
+      "default": 15,
+      "min": 1
+    },
+    "background_review": {
+      "type": "boolean",
+      "title": "End-of-session review",
+      "description": "When a session ends, a small isolated model call reviews the part not reviewed yet: it counts corrections and, with learning on, saves what is worth keeping.",
       "default": true
     },
     "reviewer_model": {
       "type": "string",
       "title": "Reviewer model",
-      "description": "Model used by the background reviewer.",
+      "description": "Model used by the end-of-session reviewer.",
       "options": ["haiku", "sonnet"],
       "default": "haiku"
     },
     "monthly_budget_usd": {
       "type": "number",
       "title": "Monthly reviewer budget (USD)",
-      "description": "Background reviews stop for the rest of the month once this is spent.",
+      "description": "End-of-session reviews stop for the rest of the month once this is spent.",
       "default": 5,
       "min": 0
-    },
-    "long_turn_tool_calls": {
-      "type": "number",
-      "title": "Long turn threshold",
-      "description": "Tool calls in a single turn that mark it as a long autonomous turn.",
-      "default": 15,
-      "min": 1
     }
   }
 }
