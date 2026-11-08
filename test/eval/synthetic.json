@@ -154,10 +154,12 @@
       },
       "expect": {
         "outcome": [
-          "queued"
+          "queued",
+          "suggested"
         ],
         "file": "shop-local/SKILL.md"
-      }
+      },
+      "note": "Either is right: document it in the skill, or suggest pinning the compose project name."
     },
     {
       "id": "conflict-a",

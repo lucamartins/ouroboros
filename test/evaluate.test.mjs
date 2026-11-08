@@ -201,3 +201,14 @@ test('patches Claude writes in session for one file join a single changeset', ()
   assert.equal(cs.applyChangeset(db, p.id).status, 'patched');
   assert.equal(fs.readFileSync(claudeMd, 'utf8'), '# P\n\nA small project with one service.\nUse Node 22.\n');
 });
+
+test('a stale flag counts only when it cites a real source of truth', () => {
+  fs.mkdirSync(path.join(proj, '.github', 'workflows'), { recursive: true });
+  const wf = path.join(proj, '.github', 'workflows', 'deploy.yml');
+  fs.writeFileSync(wf, 'on:\n  workflow_dispatch:\n');
+  assert.equal(path.resolve(ev.staleSource('.github/workflows/deploy.yml', proj)), path.resolve(wf));
+  assert.equal(path.resolve(ev.staleSource(wf, proj)), path.resolve(wf));
+  assert.equal(ev.staleSource(rules, proj), null, 'a knowledge file is not a source of truth');
+  assert.equal(ev.staleSource('the user said so', proj), null);
+  assert.equal(ev.staleSource('', proj), null);
+});

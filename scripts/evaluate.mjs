@@ -17,7 +17,7 @@ import { options } from './config.mjs';
 import { apply as curatorApply } from './curator.mjs';
 import { applyChangeset, applyEdits, changesetNeedsApproval, claimsOf, getChangeset, pendingChangeset, saveChangeset } from './changesets.mjs';
 import { logError } from './db.mjs';
-import { buildIndex, groundIdentifiers, identifiersIn, knowledgeKind, PATCHABLE, resolveOwner, tokenize } from './knowledge.mjs';
+import { buildIndex, groundIdentifiers, identifiersIn, knowledgeFiles, knowledgeKind, PATCHABLE, resolveOwner, tokenize } from './knowledge.mjs';
 import { insertReview, runModel, usageOf } from './review-worker.mjs';
 import { rubricText } from './rubric.mjs';
 import { describe, noteFor, rewriteItem, triage } from './triage.mjs';
@@ -124,6 +124,7 @@ EDITS:
 - Write as the file does: same language, tone and density, as short as its other entries. No dates, PR or issue numbers, session details or people's names unless the file already does that.
 - Only "corrects" edits may remove text, and only the wrong part. Never touch the frontmatter (the --- block at the top).
 - One edit may serve several claims: list their ids in "claims". Never write two edits that touch the same text.
+- Claims that say the same thing are not in conflict: give them the same status and implement them with one edit listing all their ids.
 - No edit for covered, contradicted or conflict claims. Answer once for every claim id.
 ${view.partial ? '- The file is large: you see its outline and the parts related to the claims. Copy "old" only from what you see.\n' : ''}
 FILE ${file}:
@@ -139,8 +140,8 @@ ${grounding.length ? grounding.map((g) => (g.hits.length
     ? `- \`${g.id}\`:\n${g.hits.map((h) => `    ${h.file}:${h.line}: ${h.text}`).join('\n')}`
     : `- \`${g.id}\`: ${g.exists ? 'exists' : 'not found'}`)).join('\n') : '(nothing to look up)'}
 
-ELSEWHERE (what other files the assistant reads say on these topics):
-${elsewhere.length ? elsewhere.map((e) => `<excerpt file="${e.file}"${e.heading ? ` heading="${e.heading}"` : ''}>\n${e.text.slice(0, 700)}\n</excerpt>`).join('\n') : '(nothing related)'}`;
+ELSEWHERE (what other files say on these topics; a "source of truth" excerpt is project evidence, the others are knowledge the assistant already reads):
+${elsewhere.length ? elsewhere.map((e) => `<excerpt file="${e.file}" kind="${e.kind === 'source' ? 'source of truth' : 'knowledge'}"${e.heading ? ` heading="${e.heading}"` : ''}>\n${e.text.slice(0, 700)}\n</excerpt>`).join('\n') : '(nothing related)'}`;
 }
 
 const ELSEWHERE_PER_CLAIM = 2;
@@ -159,7 +160,7 @@ export function elsewhereFor(file, claims, cwd) {
     let taken = 0;
     for (const hit of index.search(c.claim, ELSEWHERE_PER_CLAIM + 3)) {
       if (taken >= ELSEWHERE_PER_CLAIM) break;
-      if (path.resolve(hit.file).toLowerCase() === self || hit.kind === 'source' || hit.score < 3) continue;
+      if (path.resolve(hit.file).toLowerCase() === self || hit.score < 3) continue;
       const key = `${hit.file}#${hit.heading}#${hit.text.slice(0, 40)}`;
       if (seen.has(key)) continue;
       seen.add(key);
@@ -196,6 +197,18 @@ export async function composeFile({ file, claims, cwd, model }) {
   const unjustified = edits.filter((e) => !e.claims.some(writes)).map((edit) => ({ edit, reason: 'no learning justifies it' }));
   const { applied, rejected } = applyEdits(base, justified);
   return { status, applied, rejected: [...unjustified, ...rejected], base, usage: usageOf(result) };
+}
+
+/** The source-of-truth file a stale flag cites, if it really is one (exists, not knowledge). */
+export function staleSource(source, cwd) {
+  const raw = String(source || '').trim();
+  if (!raw) return null;
+  let file = path.isAbsolute(raw) && fs.existsSync(raw) ? path.resolve(raw) : null;
+  if (!file) {
+    const norm = (p) => p.replace(/\\/g, '/').toLowerCase();
+    file = knowledgeFiles(cwd).find((f) => norm(f).endsWith(`/${norm(raw).replace(/^\.?\//, '')}`)) || null;
+  }
+  return file && knowledgeKind(file) === 'source' ? file : null;
 }
 
 // ---------- outcomes ----------
@@ -322,14 +335,16 @@ export async function evaluate(db, rows, ctx) {
     if (v?.stale) {
       // The screen saw documentation a source of truth contradicts: a correction claim.
       const owner = resolveOwner(v.stale.file, ctx.cwd);
-      if (owner && PATCHABLE.has(knowledgeKind(owner)) && knowledgeKind(owner) !== 'profile') {
+      // Only a real source of truth (workflow, manifest, config) can flag a file as outdated.
+      const source = staleSource(v.stale.source, ctx.cwd);
+      if (owner && source && PATCHABLE.has(knowledgeKind(owner)) && knowledgeKind(owner) !== 'profile') {
         const r = db.prepare(`
           INSERT INTO candidates (review_id, session_id, project, kind, scope, title, summary, evidence, confidence, outcome, cwd, claim, target, payload, ts)
           VALUES (0, ?, ?, 'memory', 'project', ?, ?, ?, 0.7, 'queued', ?, ?, ?, ?, ?)`).run(
           row.session_id, row.project, `Outdated: ${path.basename(owner)}`.slice(0, 200), v.stale.claim.slice(0, 1500),
           `found while checking #${row.id}: ${v.reason}`.slice(0, 800), ctx.cwd || null, v.stale.claim, owner,
           JSON.stringify({ item: { op: 'create', kind: 'memory', title: `Outdated: ${path.basename(owner)}`, body: v.stale.claim }, cwd: ctx.cwd }), Date.now());
-        route(owner, { id: Number(r.lastInsertRowid), title: `Outdated: ${path.basename(owner)}`, claim: v.stale.claim, evidence: `flagged as outdated while screening #${row.id}: ${v.reason}`, confidence: 0.7, corrects: true });
+        route(owner, { id: Number(r.lastInsertRowid), title: `Outdated: ${path.basename(owner)}`, claim: v.stale.claim, evidence: `${source} contradicts it (found while screening #${row.id})`, confidence: 0.7, corrects: true });
         report.stale++;
       }
     }

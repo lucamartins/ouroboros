@@ -46,8 +46,8 @@ export const TRIAGE_SCHEMA = {
           stale: {
             type: 'object',
             additionalProperties: false,
-            required: ['file', 'claim'],
-            properties: { file: { type: 'string' }, claim: { type: 'string' } },
+            required: ['file', 'claim', 'source'],
+            properties: { file: { type: 'string' }, claim: { type: 'string' }, source: { type: 'string' } },
           },
           rewrite: {
             type: 'object',
@@ -130,7 +130,7 @@ VERDICTS (set "rule" to the id of the rubric rule that decided it):
 - "route": the topic has an owner — a skill or one of its reference files, a rule file, a CLAUDE.md, or a memory (from OWNERS or EXCERPTS) — and the proposal may add to it or correct it. Set owner = the owner's full path (a reference file is its skill's folder + the listed relative path), claim = the knowledge as ONE self-contained statement (what is true or what to do, and the reason when the proposal gives one), section = the heading it belongs under when obvious. Choose the owner an assistant would read when the topic comes up. Do not try to judge whether the owner already says it in parts you cannot see: the editor checks the whole file. Prefer this over "keep" whenever an owner exists.
 - "fix": the proposal documents a workaround for something the project could fix once (a generated file not ignored, a broken script, a missing config line). Set fix = the change to make in the project, in one sentence. Nothing is learned.
 - "keep": worth saving as new and no owner fits. Give a rewrite that picks the right kind ("profile" = one sentence valid on every project in "text", block user/environment; "memory" = one project's fact with "description" and a "body" holding the fact plus "**Why:**" and "**How to apply:**"; "skill" = a reusable multi-step procedure with description ≤ 250 chars saying when to use it), uses a short human-readable title (never a slug), and removes details that will go stale.
-- Stale owners: whatever the verdict, if an excerpt shows a skill, rule, CLAUDE.md or memory that a SOURCE OF TRUTH contradicts on this proposal's topic, also set stale = { file: that file's path, claim: the corrected statement, backed by the source }. This is how outdated documentation gets repaired.
+- Stale owners: whatever the verdict, if an excerpt shows a skill, rule, CLAUDE.md or memory that a SOURCE OF TRUTH contradicts on this proposal's topic, also set stale = { file: that file's path, claim: the corrected statement, source: the path of the SOURCE OF TRUTH excerpt that shows it }. Only a source-of-truth excerpt counts: a user preference, a session event or another doc is never a stale flag. This is how outdated documentation gets repaired.
 
 ${languageRule(lang)} Keep code identifiers, commands and file names as they are.
 Answer once for every proposal id in THIS BATCH.

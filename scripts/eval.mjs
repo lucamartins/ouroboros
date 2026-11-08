@@ -73,7 +73,7 @@ async function synthetic({ model }) {
     const r = row(ids.get(c.id));
     const e = c.expect;
     let ok = e.outcome.includes(r.outcome);
-    if (ok && e.file) ok = !!r.cs_file && r.cs_file.replace(/\\/g, '/').endsWith(e.file);
+    if (ok && e.file && r.outcome === 'queued') ok = !!r.cs_file && r.cs_file.replace(/\\/g, '/').endsWith(e.file);
     if (ok && e.corrects) ok = !!r.cs_corrects;
     if (ok && e.type === 'item') ok = !r.changeset_id;
     results.push({ id: c.id, ok, got: describeRow(r) });

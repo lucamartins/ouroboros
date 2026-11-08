@@ -344,6 +344,7 @@ export function identifiersIn(text) {
   for (const m of s.matchAll(/(?:^|[\s(])((?:[\w.-]+[\\/])+[\w.-]+\.\w{1,6})(?![\w\\/])/g)) push(m[1]);
   for (const m of s.matchAll(/\b([A-Z][A-Za-z0-9]+\.[A-Z][A-Za-z0-9]+(?:\.[A-Z][A-Za-z0-9]+)*)\b/g)) push(m[1]);
   for (const m of s.matchAll(/\b([A-Z][A-Z0-9]+(?:_[A-Z0-9]+){1,})\b/g)) push(m[1]);
+  for (const m of s.matchAll(/\b([a-z][a-z0-9]*(?:_[a-z0-9]+)+)\b/g)) if (m[1].length >= 6) push(m[1]);
   for (const m of s.matchAll(/\b([a-z]+[A-Z][A-Za-z0-9]{3,})\b/g)) push(m[1]);
   for (const m of s.matchAll(/\b([A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+){2,})\b/g)) push(m[1]);
   for (const m of s.matchAll(/(?:^|\s)(--[a-z][a-z0-9-]{4,})/g)) push(m[1]);
