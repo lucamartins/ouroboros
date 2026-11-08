@@ -166,6 +166,7 @@ export function applyChangeset(db, id, { actor = 'manual' } = {}) {
   const r = writeText(db, {
     file: cs.file, after, actor, expectBefore: current,
     title: claims.length === 1 ? claims[0].title : `${path.basename(cs.file)}: ${claims.length} updates`,
+    why: claims.map((c) => `- ${c.title}: ${String(c.claim || c.summary || '').replace(/\s+/g, ' ').slice(0, 300)}${c.evidence ? ` (${String(c.evidence).replace(/\s+/g, ' ').slice(0, 160)})` : ''}`).join('\n'),
     confidence: claims.length ? Math.max(...claims.map((c) => c.confidence ?? 0.6)) : 0.6,
   });
   if (r.status === 'stale') {

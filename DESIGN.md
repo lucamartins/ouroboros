@@ -305,7 +305,7 @@ Dropped, merged and suggested items stay visible in the dashboard with their rea
 ### 7.1 Lifecycle
 
 ```
-proposal ─► active (conf. 0.3–0.9) ─► reinforced (+0.1 per use; +0.2 if the user confirms)
+proposal ─► active (conf. 0.3–0.9) ─► reinforced (+0.1 per use) ─► kept (the user pins it: never archived automatically)
                      │
                      ├─► archived (60 days unused, or merged into another)
                      └─► reverted (user undo; counts as a negative signal for the reviewer)
@@ -315,7 +315,7 @@ Archive = move to `~/.ouroboros/archive/` (out of context), never delete.
 
 How each transition happens (phase 4):
 
-- **Reinforcement**: the first read of a learned memory or use of a learned skill in a session adds +0.1 (hooks); a background review that rediscovers an existing item adds +0.1; **Confirm** in the dashboard adds +0.2. Cap 0.9.
+- **Reinforcement**: the first read of a learned memory or use of a learned skill in a session adds +0.1 (hooks); a background review that rediscovers an existing item adds +0.1. Cap 0.9. Confidence only matters for what maintenance may archive (below), so the dashboard does not ask the user to "confirm" a learning; it offers **Keep** instead (`learnings.pinned`): a kept learning is never archived for being unused or trimmed for budget. Keep is shown only on learnings maintenance could archive (memories and skills Ouroboros created), with the date it would happen; files Ouroboros only added to (a skill, rule or CLAUDE.md it did not create) are never archived and cannot be: `forget` refuses them, since archiving would remove the whole file, and their changes are undone one by one instead.
 - **Merge on rediscovery**: when the background reviewer's item is a `duplicate` of a memory or skill file, it becomes a claim for that file and the editor (§7.0) folds in only what is new (usually nothing: `covered`).
 - **Promotion**: a `feedback`/`user` memory similar to one already saved in *another* project becomes a profile fact instead of a copy.
 - **Daily maintenance** (`review-worker.mjs --maintain`, started by `SessionStart` at most every 20 h, results shown as notices):
@@ -359,9 +359,10 @@ events    (id, session_id, agent_id, ts, kind, payload_json)
           -- kind: turn | tool_call | tool_fail | recovery | long_turn
           --       | skill_used | memory_read | memory_write | review_requested | session_end
 learnings (id, kind, scope, project, path, title, confidence, status,
-           trigger, origin_session, created_at, updated_at, uses, last_used_at)
+           trigger, origin_session, created_at, updated_at, uses, last_used_at, pinned)
           -- status: active | archived | reverted
-writes    (id, learning_id, ts, op, actor, session_id, diff)
+writes    (id, batch, learning_id, ts, op, actor, session_id, file, before, after, reverted_at, title, why)
+          -- title/why: what the batch learned and where it came from (v0.8.2); the learn skill passes the session id
           -- op: create | patch | archive | revert ; actor: inloop | background | manual | native
 reviews   (id, session_id, mode, trigger, model, turns_reviewed, corrections, learned, patched,
            input_tokens, output_tokens, cache_tokens, cost_usd, ts)
@@ -393,7 +394,7 @@ One page per question, in a sticky top bar; the Inbox carries a count of what wa
 |---|---|---|
 | **Inbox** | What needs my decision? | Conflicts (a learning vs a written rule: "it is a new rule" / "keep the current rule"), changes to files (one diff per file with the learnings behind it; approve, reject, remove one learning), new items, suggested fixes; bulk approve/reject; "check against knowledge" |
 | **Overview** | Is learning working? | Corrections per 100 turns before vs after learning with the delta, learned count, sessions using a learning, misses, month cost vs budget; trend charts with the "learning on" marker; recently learned |
-| **Knowledge** | What does Claude know? | Learned items (confirm, undo, archive), every skill, memory and instruction file, with a filter |
+| **Knowledge** | What does Claude know? | **Learned**: one row per thing learned (each ledger batch), not per file: what it says (the title the writer gave, or the first sentence it added), why (the evidence, or the learnings of an approved change), where, from which session and how, what it saved or changed (a diff that opens on click), how often the file was used; actions Undo (only that change, later edits stay), Archive (only what Ouroboros created), Keep. Then every skill, memory and instruction file, with a filter |
 | **Activity** | What happened? | Sessions, reviews (with cost), proposals and their outcome, what the knowledge check dropped (restorable), corrections |
 | **System** | Is it healthy, how good is it, what does it cost? | Capture and reviewer status, month cost; learning quality (outcome counts, approval and undo rates, why proposals were dropped, warnings); cost per review; context budgets; failed reviews and errors |
 
@@ -463,6 +464,6 @@ Visual system: warm neutrals with one blue accent (primary actions, selection, d
 | **1. Measure** | Full capture, `events.db`, `measure`-mode reviewer at session end, read-only dashboard (Overview, Inventory, Health) | 1–2 weeks of correction baseline; hooks with no noticeable latency |
 | **2. Manual learning** | `learn` skill, curator, ledger, `undo`/`forget`, `user.md` + protocol at `SessionStart` | `/ouroboros:learn` writes, dedupes, routes and undoes correctly |
 | **3. Self-learning** | Periodic in-loop review, background review of the tail, notices, Value and Cost screens | Correction rate drops vs baseline with cost under the cap |
-| **4. Lifecycle and distribution** | Confidence/decay, automatic consolidation, merge on rediscovery, promotion, autonomy queue, dashboard actions (confirm/undo/archive/approve/reject, token-protected), `excludeProjects`, CI (tests on Ubuntu + Windows, macOS on demand; `validate --strict`), README | Someone else installs it from scratch on Windows and macOS |
+| **4. Lifecycle and distribution** | Confidence/decay, automatic consolidation, merge on rediscovery, promotion, autonomy queue, dashboard actions (keep/undo/archive/approve/reject, token-protected), `excludeProjects`, CI (tests on Ubuntu + Windows, macOS on demand; `validate --strict`), README | Someone else installs it from scratch on Windows and macOS |
 | **v0.7 Evaluation** | Screen → ground → edit → validate; changesets per file with diffs in the dashboard; suggested fixes; skill reference files as owners; `eval.mjs` (synthetic + replay) | The same 60 real proposals give fewer, coherent changes, and the synthetic score holds |
 | **v0.8 Mechanism review** | §7.3: insertion-only additions, one validator for both write paths, single-consumer evaluation queue, surgical profile writes, added-text secret check, line-level undo, one memory-dir resolver, ancestor CLAUDE.md files, long sessions in parts, budget guard on every call, notices per project, merges that must land; harder eval cases | 15/15 on the synthetic suite; every finding has a regression test |

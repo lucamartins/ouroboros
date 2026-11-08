@@ -56,7 +56,7 @@ export function decay(db, settings, now = Date.now()) {
   const cutoff = now - (settings.archiveAfterDaysUnused || 60) * DAY;
   const stale = db.prepare(`
     SELECT * FROM learnings
-    WHERE status = 'active' AND origin_session IS NOT 'native' AND kind IN ('memory', 'skill')
+    WHERE status = 'active' AND origin_session IS NOT 'native' AND kind IN ('memory', 'skill') AND pinned = 0
       AND COALESCE(confidence, 0.5) < ? AND created_at < ? AND COALESCE(last_used_at, 0) < ?
     ORDER BY confidence, uses`).all(KEEP_CONFIDENCE, cutoff, cutoff);
   const archived = [];
@@ -109,7 +109,7 @@ export async function consolidate(db, settings, opts) {
   }
 
   // Project memories: per directory, archive the weakest Ouroboros memories.
-  const memories = db.prepare("SELECT * FROM learnings WHERE status = 'active' AND kind = 'memory' AND origin_session IS NOT 'native'").all();
+  const memories = db.prepare("SELECT * FROM learnings WHERE status = 'active' AND kind = 'memory' AND origin_session IS NOT 'native' AND pinned = 0").all();
   const byDir = new Map();
   for (const m of memories) {
     const dir = path.dirname(m.path);
@@ -126,7 +126,9 @@ export async function consolidate(db, settings, opts) {
   // Learned skills.
   const skills = db.prepare("SELECT * FROM learnings WHERE status = 'active' AND kind = 'skill' AND origin_session IS NOT 'native'").all();
   if (skills.length >= limits.learnedSkills * limits.consolidateAt) {
-    report.archived.push(...trimToTarget(db, skills, Math.floor(limits.learnedSkills * TARGET_RATIO)));
+    // Kept skills count against the budget but are never the ones trimmed.
+    const kept = skills.filter((s) => s.pinned).length;
+    report.archived.push(...trimToTarget(db, skills.filter((s) => !s.pinned), Math.max(0, Math.floor(limits.learnedSkills * TARGET_RATIO) - kept)));
   }
   return report;
 }

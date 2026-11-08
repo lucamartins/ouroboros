@@ -214,6 +214,8 @@ const why = (r) => `${r.status.replace(/_/g, ' ')}${r.reason ? `: ${r.reason}` :
 const ACTION_LABEL = {
   undo: (r) => (r.status === 'undone' ? `Undone: ${r.title || r.id}` : why(r)),
   undo_change: (r) => (r.status === 'undone' ? `Change undone: ${r.title || ''}` : why(r)),
+  undo_batch: (r) => (r.status === 'undone' ? `Undone: ${r.title || 'the change'}` : why(r)),
+  pin: (r) => (r.status === 'kept' ? 'Kept: it will not be archived automatically' : r.status === 'unkept' ? 'Maintenance may archive it if it goes unused' : why(r)),
   forget: (r) => (r.status === 'archived' ? `Archived: ${r.title}` : why(r)),
   confirm: (r) => (r.status === 'confirmed' ? 'Confidence raised' : why(r)),
   approve: (r) => (r.status === 'created' || r.status === 'patched' ? `Saved: ${r.title}${r.rebased ? ' (applied on top of the newer file)' : ''}` : why(r)),
@@ -578,15 +580,70 @@ function stat(k, v, d) {
 }
 
 // ---------- Knowledge ----------
+/** What one write changed in one file: removed lines struck, added lines highlighted. */
+function hunkDiff(hk) {
+  return h('pre', { class: 'diff' },
+    hk.before.map((l) => h('del', { class: 'line' }, l || ' ')),
+    hk.after.map((l) => h('ins', { class: 'line' }, l || ' ')),
+    hk.more ? h('span', { class: 'diff-label' }, `… ${hk.more} more line${hk.more > 1 ? 's' : ''}`) : null);
+}
+
+function changeKind(c) {
+  const l = c.learning;
+  const fixes = c.files.some((f) => (f.hunks || []).some((hk) => hk.before.length));
+  if (c.op === 'consolidate') return 'Consolidation';
+  if (c.op === 'create') return l?.kind === 'profile' ? `Profile fact · ${l.block}` : l?.kind === 'skill' ? 'New skill' : `New memory${l?.memory_type ? ` · ${l.memory_type}` : ''}`;
+  return `${fixes ? 'Correction' : 'Addition'} to ${KIND_NAME[l?.kind] || 'a file'}`;
+}
+
+const ORIGIN = { inloop: 'in session', background: 'end-of-session review', manual: 'you asked' };
+
+function lifecycleNote(c) {
+  const lc = c.lifecycle;
+  if (!lc) return null;
+  if (lc.state === 'kept') return h('span', { title: 'Never archived automatically' }, 'Kept');
+  if (lc.state === 'confident') return h('span', { title: 'Confident learnings are not archived when unused' }, 'Not archived when unused');
+  return h('span', { title: 'Unused, low-confidence learnings are archived to ~/.ouroboros/archive (restorable). Keep it to stop that.' },
+    lc.at > Date.now() ? `Archived ${fmt.date(lc.at)} if unused` : 'Archived at the next maintenance if unused');
+}
+
+function learnedRow(c) {
+  const l = c.learning;
+  const main = c.files[0];
+  const f = main ? fileLabel(main.file) : null;
+  const archived = l && l.status === 'archived' && c.op === 'create';
+  const used = l && l.uses ? `used ${fmt.plural(l.uses, 'time')}${l.last_used_at ? `, last ${fmt.ago(l.last_used_at)}` : ''}` : null;
+  const wrote = c.files.flatMap((x) => (x.created ? [h('pre', { class: 'diff' }, h('ins', { class: 'line' }, x.text || '(empty)'))]
+    : x.removed ? [h('div', { class: 'small muted' }, `Removed ${x.file}`)]
+      : x.hunks.map(hunkDiff)));
+  return h('li', { class: `learned${c.undone || archived ? ' faded' : ''}` },
+    h('div', { class: 'row-main' },
+      h('div', { class: 'row-title' }, c.title),
+      h('div', { class: 'item-meta' },
+        c.undone ? pill('Undone', 'bad', 'bad') : archived ? pill('Archived', '') : pill(changeKind(c), c.op === 'patch' && /^Correction/.test(changeKind(c)) ? 'warn' : ''),
+        f ? h('span', { class: 'mono', title: main.file }, `${f.dir}${f.name}`) : null,
+        h('span', { title: fmt.datetime(c.ts) }, fmt.ago(c.ts)),
+        h('span', {}, c.session ? `${ORIGIN[c.actor] || c.actor} · ${projectName(c.session.project, c.session.cwd)}` : ORIGIN[c.actor] || c.actor),
+        used ? h('span', {}, used) : null,
+        lifecycleNote(c)),
+      c.why ? h('div', { class: 'item-reason' }, clampText(c.why, 'div')) : null,
+      wrote.length ? disclose(c.op === 'create' ? 'What it saved' : 'What it changed', h('div', { class: 'diffs' }, wrote)) : null),
+    h('div', { class: 'btn-row row-actions' },
+      !c.undone ? actionButton('Undo', 'undo_batch', c.batch, { small: true, variant: 'quiet', iconName: 'undo', confirmText: 'Undo this change?', title: 'Revert only what this wrote; later edits to the file stay' }) : null,
+      c.lifecycle && ['decays', 'kept'].includes(c.lifecycle.state)
+        ? actionButton(c.lifecycle.state === 'kept' ? 'Stop keeping' : 'Keep', 'pin', `${l.id}:${c.lifecycle.state === 'kept' ? 'off' : 'on'}`, { small: true, variant: 'quiet', iconName: 'check', title: c.lifecycle.state === 'kept' ? 'Let maintenance archive it if it goes unused' : 'Never archive it automatically' })
+        : null,
+      c.canArchive ? actionButton('Archive', 'forget', l.id, { small: true, variant: 'quiet', iconName: 'archive', confirmText: 'Archive it?', title: 'Stop loading it; restorable with undo' }) : null));
+}
+
 async function renderKnowledge() {
-  const [{ learned }, inv] = await Promise.all([api('learnings'), api('inventory')]);
+  const [changes, inv] = await Promise.all([api('changes'), api('inventory')]);
   const ks = state.knowledge;
   const q = ks.q.toLowerCase();
   const match = (...xs) => !q || xs.some((x) => String(x || '').toLowerCase().includes(q));
-  const active = learned.filter((l) => l.status === 'active');
   const memories = inv.memories.filter((m) => !m.index);
   const lists = {
-    learned: active.filter((r) => match(r.title, r.path, r.kind)),
+    learned: changes.filter((c) => (ks.showUndone || !c.undone) && match(c.title, c.why, ...c.files.map((x) => x.file))),
     skills: inv.skills.filter((r) => match(r.name, r.description, r.scope)),
     memories: memories.filter((r) => match(r.name, r.description, r.project)),
     instructions: inv.instructions.filter((r) => match(r.file, r.scope)),
@@ -599,17 +656,21 @@ async function renderKnowledge() {
   });
 
   const tables = {
-    learned: () => table([
-      { label: 'Learning', render: (r) => cellMain(r.title, r.path) },
-      { label: 'Kind', render: (r) => pill(r.kind === 'profile' ? `profile · ${r.block}` : r.memory_type ? `${r.kind} · ${r.memory_type}` : (KIND_NAME[r.kind] || r.kind)) },
-      { label: 'Uses', num: true, render: (r) => fmt.int(r.uses) },
-      { label: 'Last used', render: (r) => (r.last_used_at ? fmt.ago(r.last_used_at) : h('span', { class: 'faint' }, 'not yet')) },
-      { label: 'Confidence', render: (r) => confidence(r.confidence) },
-      { label: '', cls: 'actions-cell', render: (r) => h('div', { class: 'btn-row', style: 'justify-content:flex-end' },
-        r.confidence < 0.9 ? actionButton('Confirm', 'confirm', r.id, { small: true, variant: 'quiet', iconName: 'check', title: 'This is right: raises its confidence' }) : null,
-        r.writes ? actionButton('Undo', 'undo', r.id, { small: true, variant: 'quiet', iconName: 'undo', confirmText: 'Undo last change?', title: 'Revert the last write of this learning' }) : null,
-        r.origin_session === 'native' ? null : actionButton('Archive', 'forget', r.id, { small: true, variant: 'quiet', iconName: 'archive', confirmText: 'Archive it?', title: 'Stop loading it; restorable with undo' })) },
-    ], lists.learned, { empty: q ? 'No learning matches the filter.' : 'Nothing learned yet. Ask Claude to remember something, or approve items in the inbox.', note: 'Undo reverts the last write; Archive stops loading an item (both reversible, also with /ouroboros:undo and /ouroboros:forget).' }),
+    learned: () => {
+      const undone = changes.filter((c) => c.undone).length;
+      const toggle = undone ? h('label', { class: 'small muted check' },
+        h('input', { type: 'checkbox', checked: !!ks.showUndone, onchange: (e) => { ks.showUndone = e.target.checked; renderKnowledge(); } }),
+        ` Show undone (${undone})`) : null;
+      if (!lists.learned.length) {
+        return h('div', {}, h('div', { class: 'empty' }, h('p', {}, q ? 'No learning matches the filter.' : 'Nothing learned yet. Ask Claude to remember something, or approve items in the inbox.')),
+          toggle ? h('div', { class: 'table-note' }, toggle) : null);
+      }
+      return h('div', {},
+        h('ul', { class: 'rows learned-list' }, lists.learned.map(learnedRow)),
+        h('div', { class: 'table-note' },
+          'One row per thing learned. Undo reverts only what that row wrote; Archive stops loading something Ouroboros created; Keep stops maintenance from archiving it when unused. All reversible.',
+          toggle ? h('span', { style: 'margin-left:12px' }, toggle) : null));
+    },
     skills: () => table([
       { label: 'Skill', render: (r) => cellMain(h('span', {}, r.name, r.origin ? h('span', { style: 'margin-left:8px' }, pill('learned', 'accent')) : null), r.description, { clamp: true }) },
       { label: 'Scope', render: (r) => (r.scope === 'project' ? `project · ${projectName(r.project)}` : r.scope) },

@@ -11,7 +11,7 @@ import { openDb } from '../scripts/db.mjs';
 import { dataDir } from '../scripts/paths.mjs';
 import { createApi } from './api.mjs';
 import { applyChangeset, rejectChangeset } from '../scripts/changesets.mjs';
-import { confirm, decideQueued, forget, undo } from '../scripts/curator.mjs';
+import { confirm, decideQueued, forget, pin, undo } from '../scripts/curator.mjs';
 
 /** Approve or reject one queue entry: "cs:<id>" is a change to a file, a number one proposal. */
 function decide(db, key, approve) {
@@ -68,6 +68,11 @@ async function runAction(db, action, id) {
       return r.changes ? { status: 'dismissed' } : { status: 'not_found' };
     }
     case 'undo': return undo(db, { id });
+    case 'undo_batch': return /^[0-9a-f]{6,32}$/.test(String(id)) ? undo(db, { batch: String(id) }) : { status: 'not_found' };
+    case 'pin': {
+      const [lid, on] = String(id).split(':');
+      return pin(db, lid, on !== 'off');
+    }
     case 'undo_change': {
       const cs = db.prepare("SELECT batch FROM changesets WHERE id = ? AND status = 'applied'").get(Number(id));
       return cs?.batch ? undo(db, { batch: cs.batch }) : { status: 'not_found', reason: 'no applied change with that id' };

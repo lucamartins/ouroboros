@@ -7,12 +7,64 @@ import { getMeta, monthSpend, monthStart } from '../scripts/db.mjs';
 import { blockChars, parseProfile, readProfileText } from '../scripts/profile.mjs';
 import { loadSettings } from '../scripts/settings.mjs';
 import { listInstructionFiles, listMemories, listSkills, userProfile } from '../scripts/inventory.mjs';
-import { dataDir, normalize } from '../scripts/paths.mjs';
+import { classifyPath, dataDir, normalize } from '../scripts/paths.mjs';
 import { sessionContext } from '../scripts/hook.mjs';
+import { lineDiff } from '../scripts/textdiff.mjs';
 
 const DAY = 86_400_000;
 const MEMORY_INDEX_LINE_LIMIT = 200; // Claude Code loads the first 200 lines / 25KB of MEMORY.md
 const MEMORY_INDEX_BYTE_LIMIT = 25_000;
+
+/** Unused learnings below this confidence are archived after `archiveAfterDaysUnused` (maintenance.mjs). */
+const KEEP_CONFIDENCE = 0.7;
+const MAX_HUNKS = 6;
+const MAX_HUNK_LINES = 12;
+
+function bodyOf(text) {
+  return String(text || '').replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '').trim();
+}
+
+/** What one write changed in one file, for display: hunks, or the new file's text. */
+function writeView(w) {
+  const name = path.basename(w.file);
+  const isLink = [w.before, w.after].some((x) => x && String(x).startsWith('@link:'));
+  if (isLink) return null;
+  if (name === 'MEMORY.md' && w.op !== 'consolidate') return null; // index lines mirror the memory itself
+  if (normalize(w.file).includes('/.ouroboros/archive/')) return null;
+  if (classifyPath(w.file) === 'profile' && w.after !== null) {
+    // The profile is one file of many facts: show only the bullets this write changed.
+    const bullet = (l) => /^[-*]\s/.test(l);
+    const clean = (l) => l.replace(/\s*<!--.*?-->\s*$/, '');
+    const hunks = lineDiff(w.before ?? '', w.after)
+      .map((h) => ({ before: h.before.filter(bullet).map(clean), after: h.after.filter(bullet).map(clean), more: 0 }))
+      .filter((h) => h.before.length || h.after.length);
+    return { file: w.file, hunks };
+  }
+  if (w.before === null) return { file: w.file, created: true, text: bodyOf(w.after).slice(0, 1500) };
+  if (w.after === null) return { file: w.file, removed: true };
+  const hunks = lineDiff(w.before, w.after).slice(0, MAX_HUNKS).map((h) => ({
+    before: h.before.slice(0, MAX_HUNK_LINES), after: h.after.slice(0, MAX_HUNK_LINES),
+    more: Math.max(0, h.before.length - MAX_HUNK_LINES) + Math.max(0, h.after.length - MAX_HUNK_LINES),
+  }));
+  return { file: w.file, hunks };
+}
+
+/** A readable title for a write recorded before writes carried one: its first added line. */
+function fallbackTitle(files, learning) {
+  for (const f of files) {
+    const line = (f.hunks || []).flatMap((h) => h.after).find((l) => l.replace(/[-*#|>\s]/g, '').length > 8)
+      || (f.text || '').split(/\r?\n/).find((l) => l.replace(/[-*#|>\s]/g, '').length > 8);
+    if (line) {
+      const text = line.replace(/^[\s>*#|-]+/, '').replace(/\s*<!--.*?-->\s*$/, '').replace(/`/g, '').replace(/\*\*/g, '');
+      // The first sentence, or a cut at a word boundary.
+      // A sentence ends before a capital letter (so "e.g. in" does not end it).
+      const sentence = /^(.{20,170}?[.!?])(?=\s+[A-Z]|\s*$)/.exec(text)?.[1];
+      if (sentence) return sentence;
+      return text.length > 160 ? `${text.slice(0, 160).replace(/\s+\S*$/, '')}…` : text;
+    }
+  }
+  return learning?.title || (files[0] ? path.basename(files[0].file) : 'change');
+}
 
 function readOptions() {
   try { return JSON.parse(fs.readFileSync(path.join(dataDir(), 'options.json'), 'utf8')); } catch { return null; }
@@ -249,6 +301,50 @@ export function createApi(db) {
         SELECT c.id, c.kind, c.title, c.summary, c.outcome, c.note, c.decided_at, s.started_at session_started_at, c.cwd, c.project
         FROM candidates c LEFT JOIN sessions s ON s.id = c.session_id
         WHERE c.outcome IN ('dropped', 'merged') ORDER BY c.decided_at DESC, c.id LIMIT 200`).all();
+    },
+
+    /**
+     * Everything Ouroboros learned, one entry per write (ledger batch): what it says, why,
+     * where, from which session, what it changed, and what can be done with it.
+     */
+    changes() {
+      const settings = loadSettings();
+      const days = settings.archiveAfterDaysUnused || 60;
+      const batches = db.prepare(`
+        SELECT w.batch, MIN(w.id) first_id, MIN(w.ts) ts, MAX(w.op) op, MAX(w.actor) actor, MAX(w.session_id) session_id,
+               MAX(w.reverted_at) reverted_at, MAX(w.title) title, MAX(w.why) why, MAX(w.learning_id) learning_id
+        FROM writes w WHERE w.op IN ('create', 'patch', 'consolidate')
+        GROUP BY w.batch ORDER BY first_id DESC LIMIT 200`).all();
+      const rows = db.prepare('SELECT * FROM writes WHERE batch = ? ORDER BY id');
+      const learning = db.prepare('SELECT * FROM learnings WHERE id = ?');
+      const session = db.prepare('SELECT started_at, project, cwd FROM sessions WHERE id = ?');
+      const changeset = db.prepare('SELECT id FROM changesets WHERE batch = ?');
+      return batches.map((b) => {
+        const l = b.learning_id ? learning.get(b.learning_id) : null;
+        const files = rows.all(b.batch).map(writeView).filter(Boolean);
+        const s = b.session_id ? session.get(b.session_id) : null;
+        const own = l && l.origin_session !== 'native';
+        // Only what Ouroboros created can be archived automatically: say when, or that it is kept.
+        let lifecycle = null;
+        if (l && own && l.status === 'active' && ['memory', 'skill'].includes(l.kind) && b.op === 'create') {
+          if (l.pinned) lifecycle = { state: 'kept' };
+          else if ((l.confidence ?? 0.5) >= KEEP_CONFIDENCE) lifecycle = { state: 'confident' };
+          else lifecycle = { state: 'decays', at: Math.max(l.created_at || 0, l.last_used_at || 0) + days * DAY };
+        }
+        return {
+          batch: b.batch, ts: b.ts, op: b.op, actor: b.actor, undone: !!b.reverted_at,
+          title: b.title || (b.op === 'create' && l ? l.title : fallbackTitle(files, l)),
+          why: b.why, files,
+          session: s ? { id: b.session_id, started_at: s.started_at, project: s.project, cwd: s.cwd } : null,
+          changeset: changeset.get(b.batch)?.id || null,
+          learning: l ? {
+            id: l.id, kind: l.kind, memory_type: l.memory_type, block: l.block, name: l.name, path: l.path, status: l.status,
+            own, pinned: !!l.pinned, uses: l.uses, last_used_at: l.last_used_at,
+          } : null,
+          canArchive: !!(l && own && l.status === 'active' && b.op === 'create' && !b.reverted_at),
+          lifecycle,
+        };
+      });
     },
 
     learnings() {

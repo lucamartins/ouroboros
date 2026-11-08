@@ -87,11 +87,14 @@ export { gitRoot, memoryDirFor };
 // ---------- ledger: transactional file writes ----------
 
 class Batch {
-  constructor(db, { actor, sessionId }) {
+  /** One ledger batch: the files of one operation, with what it learned (title) and why. */
+  constructor(db, { actor, sessionId, title = null, why = null }) {
     this.db = db;
     this.id = crypto.randomBytes(6).toString('hex');
     this.actor = actor;
     this.sessionId = sessionId || null;
+    this.title = title ? String(title).replace(/\s+/g, ' ').trim().slice(0, 300) : null;
+    this.why = why ? String(why).trim().slice(0, 2000) : null;
     this.writes = [];
   }
 
@@ -127,9 +130,9 @@ class Batch {
   commit() {
     const ts = Date.now();
     const stmt = this.db.prepare(`
-      INSERT INTO writes (batch, learning_id, ts, op, actor, session_id, file, before, after)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-    for (const w of this.writes) stmt.run(this.id, w.learningId ?? null, ts, w.op, this.actor, this.sessionId, w.file, w.before, w.after);
+      INSERT INTO writes (batch, learning_id, ts, op, actor, session_id, file, before, after, title, why)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    for (const w of this.writes) stmt.run(this.id, w.learningId ?? null, ts, w.op, this.actor, this.sessionId, w.file, w.before, w.after, this.title, this.why);
   }
 }
 
@@ -590,10 +593,10 @@ export function needsApproval(item, actor, autonomy) {
  * Write a validated changeset result (the whole new text of one knowledge file) in
  * its own transaction, through the ledger so it can be undone.
  */
-export function writeText(db, { file, after, title, confidence = 0.6, trigger = 'session_end', actor = 'background', sessionId = null, expectBefore }) {
+export function writeText(db, { file, after, title, why = null, confidence = 0.6, trigger = 'session_end', actor = 'background', sessionId = null, expectBefore }) {
   const kind = knowledgeKind(file);
   if (!PATCHABLE.has(kind)) return { status: 'rejected', reason: 'only memory, skill, profile, rule and CLAUDE.md files can be changed' };
-  const batch = new Batch(db, { actor, sessionId });
+  const batch = new Batch(db, { actor, sessionId, title, why });
   try {
     db.exec('BEGIN IMMEDIATE');
     // Read under the write lock: another writer may have changed the file meanwhile.
@@ -617,7 +620,7 @@ export function writeText(db, { file, after, title, confidence = 0.6, trigger = 
 
 /** Run one normalized item in its own transaction; a dry run undoes files and rows. */
 function runItem(db, item, settings, payload, actor, { dryRun = false } = {}) {
-  const batch = new Batch(db, { actor, sessionId: payload.session_id });
+  const batch = new Batch(db, { actor, sessionId: payload.session_id, title: item.title || item.text || item.description, why: item.why || item.evidence });
   try {
     db.exec('BEGIN IMMEDIATE');
     let result;
@@ -750,7 +753,7 @@ export function rewriteProfileBlock(db, block, bullets, { actor = 'background' }
     next.push({ id, text });
   }
   if (!next.length) return { status: 'rejected', reason: 'consolidation produced no bullets' };
-  const batch = new Batch(db, { actor });
+  const batch = new Batch(db, { actor, title: `Consolidated the profile "${BLOCKS[block]}" block`, why: 'The block was past its budget; similar facts were merged.' });
   try {
     db.exec('BEGIN IMMEDIATE');
     batch.write(file, profileWithBlock(current, block, next), { learningId: next[0].id, op: 'consolidate' });
@@ -795,6 +798,15 @@ export function decideQueued(db, candidateId, approve) {
   db.prepare('UPDATE candidates SET outcome = ?, learning_id = ?, decided_at = ? WHERE id = ?')
     .run(result.status === 'created' || result.status === 'patched' ? result.status : `approved_${result.status}`, result.id || null, Date.now(), candidateId);
   return result;
+}
+
+/**
+ * Keep a learning (or stop keeping it): a kept learning is never archived automatically
+ * (unused for a long time, or trimmed when a budget is full).
+ */
+export function pin(db, id, on = true) {
+  const r = db.prepare("UPDATE learnings SET pinned = ?, updated_at = ? WHERE id = ? AND status = 'active'").run(on ? 1 : 0, Date.now(), id);
+  return r.changes ? { status: on ? 'kept' : 'unkept', id } : { status: 'not_found', id };
 }
 
 /** The user vouches for a learning: +0.2 confidence (max 0.9). */
@@ -873,7 +885,12 @@ export function forget(db, { match }) {
       : { status: 'not_found', reason: `no active learning matches "${match}"` };
   }
   const l = found[0];
-  const batch = new Batch(db, { actor: 'manual' });
+  // A file Ouroboros did not create (a skill, rule or CLAUDE.md it only added to) is the
+  // user's: archiving would remove all of it. Its changes are undone one by one instead.
+  if (l.origin_session === 'native') {
+    return { status: 'refused', id: l.id, title: l.title, reason: `Ouroboros did not create ${l.path}; it only changed it. Undo those changes instead (dashboard: Knowledge, Learned).` };
+  }
+  const batch = new Batch(db, { actor: 'manual', title: `Archived: ${l.title}` });
   const archiveDir = path.join(ouroborosDir(), 'archive');
   try {
     db.exec('BEGIN IMMEDIATE');

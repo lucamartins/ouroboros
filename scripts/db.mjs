@@ -221,6 +221,12 @@ const MIGRATIONS = [
   ALTER TABLE changesets ADD COLUMN batch TEXT;       -- the ledger batch that applied it (undo)
   ALTER TABLE notices ADD COLUMN project TEXT;        -- NULL: for any project (maintenance)
   `,
+  // 8 — v0.8.2: each write says what it learned and why; learnings the user keeps
+  `
+  ALTER TABLE writes ADD COLUMN title TEXT;           -- what this write learned (one line)
+  ALTER TABLE writes ADD COLUMN why TEXT;             -- where it came from (evidence, the learnings of a change)
+  ALTER TABLE learnings ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;  -- kept by the user: never archived automatically
+  `,
 ];
 
 export function openDb(explicitDir) {

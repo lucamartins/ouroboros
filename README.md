@@ -22,7 +22,7 @@ For a local checkout: `/plugin marketplace add /path/to/ouroboros`.
 | `/ouroboros:learn [focus]` | Saves what was learned (Claude also uses it on its own) |
 | `/ouroboros:undo [id]` | Reverts the last (or a given) learning write |
 | `/ouroboros:forget <match>` | Archives a learning so it stops loading |
-| `/ouroboros:dashboard` | Opens the local dashboard (`http://127.0.0.1:4747`): overview, learnings (with confirm / undo / archive and the approval queue), value, cost, inventory, health |
+| `/ouroboros:dashboard` | Opens the local dashboard (`http://127.0.0.1:4747`): an inbox of what waits for you, what was learned (each item with what it changed, why and from which session; undo, archive, keep), value, activity, cost and health |
 | `/ouroboros:backfill [days] [limit]` | Reviews past sessions to build the baseline right away (asks before spending) |
 
 Everything else is automatic: capture hooks record turns, tool calls, error → fix recoveries, skill uses and memory reads/writes; a background reviewer runs when a session ends.
@@ -44,7 +44,7 @@ Everything else is automatic: capture hooks record turns, tool calls, error → 
 
 ## Lifecycle
 
-- **Reinforcement:** each first use in a session, each rediscovery and each **Confirm** in the dashboard raises a learning's confidence.
+- **Reinforcement:** each first use in a session and each rediscovery raises a learning's confidence. **Keep** (dashboard) protects something Ouroboros created from being archived when unused.
 - **One rubric:** every path that saves anything (in-session `learn`, end-of-session reviewer, knowledge check) applies the same nine rules — would it change behavior, is it a standing rule, is it not derivable, is it verified against what the project executes, will it last, does it go to the owner, does it correct stale knowledge, should the project be fixed instead, is it trusted. See `scripts/rubric.mjs`.
 - **Knowledge check, in two independent steps:** a *screen* drops what your CLAUDE.md files, `.claude/rules`, skills (and their reference files) and memories already say, merges duplicates (even when aimed at different files), turns workarounds for fixable problems into **suggested fixes**, and sends each learning to the file that owns its topic. Then an *editor* reads that whole file, with every learning pending for it and what the project's code says about the names they mention, and writes one coherent change: it skips what is covered, rejects what the code contradicts, corrects outdated lines, and hands learnings that contradict a written rule to you, in a *Conflicts* section, to say whether it is a new rule or the current one stands. Code validates every edit before it is applied or queued: exact fragments, frontmatter and headings intact, no secret in what it adds, and only a pure insertion counts as an addition. Any edit that rewrites existing text, even one word, is a correction and waits for you, whether the background editor or Claude in your session wrote it.
 - **One change per file:** pending changes to a file are always composed together, so two learnings never make conflicting edits. The dashboard shows each change as a diff with the learnings behind it; approving re-applies it to the current file, and removing one learning recomposes the rest. One process evaluates at a time (sessions that end together queue their proposals for it), so parallel sessions never overwrite each other's changes.

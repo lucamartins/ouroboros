@@ -243,6 +243,14 @@ details.disclose > summary:hover { color: var(--text-2); }
 .rows > li:last-child { border-bottom: 0; }
 .rows .row-main { min-width: 0; max-width: 80ch; }
 .rows .row-title { font-weight: 600; }
+.learned-list > li { align-items: flex-start; }
+.learned-list .row-main { flex: 1; max-width: 90ch; }
+.learned-list .row-actions { flex-shrink: 0; justify-content: flex-end; }
+.learned-list .item-reason { white-space: pre-line; }
+.learned-list .disclose { margin-top: var(--s2); }
+.learned-list li.faded .row-title { color: var(--text-3); }
+.diff .line { display: block; }
+.check { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
 
 /* ---------- empty / error ---------- */
 .empty { padding: var(--s7) var(--s5); text-align: center; }
@@ -393,6 +401,9 @@ dl.facts dd { margin: 2px 0 0; font-size: 20px; font-weight: 650; font-variant-n
   .item { padding: var(--s4); }
   .bar-row { grid-template-columns: 1fr 48px; }
   .bar-row .track { grid-column: 1 / -1; grid-row: 2; }
+  .learned-list > li { flex-direction: column; gap: var(--s2); }
+  .learned-list .row-actions { justify-content: flex-start; }
+  .learned-list .row-main { max-width: 100%; }
 }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }

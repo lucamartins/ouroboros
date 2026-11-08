@@ -56,6 +56,7 @@ node --no-warnings "${CLAUDE_PLUGIN_ROOT}/scripts/curator.mjs" apply --data "${C
   "cwd": "<current working directory>",
   "memory_dir": "<your auto-memory directory, if known>",
   "trigger": "manual",
+  "session_id": "${CLAUDE_SESSION_ID}",
   "actor": "<manual if the user explicitly asked you to remember or learn this; inloop otherwise>",
   "items": [
     { "op": "create", "kind": "profile", "block": "user", "text": "Prefers concise answers in Portuguese; files on disk in English.", "confidence": 0.8 },
@@ -65,14 +66,15 @@ node --no-warnings "${CLAUDE_PLUGIN_ROOT}/scripts/curator.mjs" apply --data "${C
     { "op": "create", "kind": "skill", "scope": "global", "name": "zip-for-linux-deploy",
       "title": "Build deploy zips for Linux from Windows", "description": "Build a Linux-compatible deploy zip on Windows (Compress-Archive breaks it). Use when packaging an App Service/zip deploy from Windows.",
       "body": "## Steps\n1. …\n\n## Pitfalls\n- …", "confidence": 0.7 },
-    { "op": "patch", "kind": "skill", "target": "<absolute path of the owning SKILL.md>", "section": "<heading or bold topic>", "append": "<the new detail, in that file's style>" },
+    { "op": "patch", "kind": "skill", "target": "<absolute path of the owning SKILL.md>", "section": "<heading or bold topic>", "append": "<the new detail, in that file's style>",
+      "title": "<what was learned, one short line>", "why": "<what happened in this session that taught it>" },
     { "op": "patch", "target": "<absolute path of a rule file or memory>", "old": "<exact outdated text>", "new": "<corrected text>", "corrects": true }
   ]
 }
 JSON
 ```
 
-Fields: `title` (short), `description` (one line; ≤ 250 chars for skills — say *when to use it*), `body` (memories: the fact plus **Why** / **How to apply**; skills: steps and pitfalls), `confidence` 0.3 tentative … 0.9 near-certain, `project_dir` (the repo the item is about; defaults to `cwd`). Write learnings in the language your Ouroboros session context asks for (English by default), with short human-readable titles.
+Fields: `title` (short; for a patch, what the patch teaches, not the file's name), `why` (one line: what happened in the session that taught it — the user shows it in the dashboard next to the change), `description` (one line; ≤ 250 chars for skills — say *when to use it*), `body` (memories: the fact plus **Why** / **How to apply**; skills: steps and pitfalls), `confidence` 0.3 tentative … 0.9 near-certain, `project_dir` (the repo the item is about; defaults to `cwd`). Write learnings in the language your Ouroboros session context asks for (English by default), with short human-readable titles.
 
 ## 5. Handle the results
 
