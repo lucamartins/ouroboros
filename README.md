@@ -37,6 +37,8 @@ For a local checkout: `/plugin marketplace add /path/to/ouroboros`.
 | `/ouroboros:dashboard` | Opens the local dashboard (`http://127.0.0.1:4747`): an inbox of what waits for you, what was learned (each item with what it changed, why and from which session; undo, archive, keep), a graph of how skills, memories and instruction files connect, value, activity, cost and health |
 | `/ouroboros:backfill [measure \| learn] [days] [limit]` | Reviews past sessions: `measure` builds the correction baseline right away, `learn` sends what they would have taught to the inbox (asks before spending) |
 
+![Ouroboros knowledge graph: skills, memories and instruction files grouped by project, with links, mentions and shared use](docs/screenshots/graph.png)
+
 <details>
 <summary>The inbox: what waits for your decision, as diffs</summary>
 
