@@ -13,7 +13,7 @@ process.stdin.on('end', () => {
     // contradicted; "FIX:<old>=><new>" -> corrects; anything else is added after the
     // file's last line, all additions in one edit.
     const file = /<file>\n([\s\S]*?)\n<\/file>/.exec(prompt)?.[1] || '';
-    const claims = [...prompt.matchAll(/<claim id="(\d+)"[^>]*>\n([\s\S]*?)\n<\/claim>/g)].map((m) => ({ id: Number(m[1]), text: m[2].split('\nevidence:')[0].trim() }));
+    const claims = [...prompt.matchAll(/<claim id="(\d+)"([^>]*)>\n([\s\S]*?)\n<\/claim>/g)].map((m) => ({ id: Number(m[1]), confirmed: m[2].includes('confirmed_by_user'), text: m[3].split('\nevidence:')[0].trim() }));
     const status = [];
     const edits = [];
     const adds = [];
@@ -23,7 +23,8 @@ process.stdin.on('end', () => {
       if (fix) {
         status.push({ id: c.id, status: 'corrects', reason: 'outdated' });
         edits.push({ old: fix[1], new: fix[2], claims: [c.id] });
-      } else if (first.includes('CONTRADICT')) status.push({ id: c.id, status: 'contradicted', reason: 'the code says otherwise' });
+      } else if (first.includes('CONFLICTME') && !c.confirmed) status.push({ id: c.id, status: 'conflict', reason: 'the file says otherwise' });
+      else if (first.includes('CONTRADICT')) status.push({ id: c.id, status: 'contradicted', reason: 'the code says otherwise' });
       else if (file.includes(first)) status.push({ id: c.id, status: 'covered', reason: 'already there' });
       else { status.push({ id: c.id, status: 'adds', reason: 'new detail' }); adds.push(c); }
     }

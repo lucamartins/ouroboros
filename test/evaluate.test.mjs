@@ -212,3 +212,18 @@ test('a stale flag counts only when it cites a real source of truth', () => {
   assert.equal(ev.staleSource('the user said so', proj), null);
   assert.equal(ev.staleSource('', proj), null);
 });
+
+test('a conflict waits for the user; "it is a new rule" sends it to the editor as confirmed', async () => {
+  await propose(rules, ['CONFLICTME deploy on Fridays after all']);
+  const c = db.prepare("SELECT * FROM candidates WHERE claim LIKE 'CONFLICTME%'").get();
+  assert.equal(c.outcome, 'conflict', 'never dropped silently');
+  assert.match(c.note, /^conflict:/);
+  // What the dashboard's "It is a new rule" does:
+  const payload = JSON.parse(c.payload);
+  db.prepare("UPDATE candidates SET outcome = 'queued', triaged_at = NULL, payload = ? WHERE id = ?").run(JSON.stringify({ ...payload, confirmed: true }), c.id);
+  await ev.tidyQueue(db);
+  const after = db.prepare('SELECT outcome, changeset_id FROM candidates WHERE id = ?').get(c.id);
+  assert.equal(after.outcome, 'queued');
+  assert.ok(after.changeset_id);
+  assert.match(cs.getChangeset(db, after.changeset_id).edits, /CONFLICTME deploy on Fridays/);
+});

@@ -186,7 +186,7 @@ export function createApi(db) {
         candidates: Object.fromEntries(candidates.map((c) => [c.kind, c.n])),
         misses,
         learned: { ...learned, patchedNative, enabledAt },
-        queued: db.prepare("SELECT COUNT(*) n FROM candidates WHERE outcome = 'queued'").get().n,
+        queued: db.prepare("SELECT COUNT(*) n FROM candidates WHERE outcome IN ('queued', 'conflict')").get().n,
         maintenance: db.prepare('SELECT ts, archived, merged, cost_usd FROM maintenance ORDER BY id DESC LIMIT 1').get() || null,
         cost: { month: monthSpend(db), budget: opts?.monthlyBudgetUsd ?? null, monthStart: monthStart() },
         options: opts,
@@ -212,6 +212,13 @@ export function createApi(db) {
       const changes = db.prepare("SELECT * FROM changesets WHERE status IN ('pending', 'stale') ORDER BY id").all().map((cs) => changesetView(db, cs));
       // Natural order: by when the originating session happened, oldest first.
       return [...items, ...changes].sort((a, b) => (a.session_started_at || a.ts || a.created_at || 0) - (b.session_started_at || b.ts || b.created_at || 0));
+    },
+
+    conflicts() {
+      return db.prepare(`
+        SELECT c.id, c.title, c.claim, c.summary, c.note, c.evidence, c.target, c.cwd, c.project, s.started_at session_started_at
+        FROM candidates c LEFT JOIN sessions s ON s.id = c.session_id
+        WHERE c.outcome = 'conflict' ORDER BY COALESCE(s.started_at, c.ts), c.id LIMIT 100`).all();
     },
 
     suggestions() {
@@ -289,6 +296,7 @@ export function createApi(db) {
         proposed: outcomes.length,
         saved: count('created') + count('patched'),
         queued: count('queued'),
+        conflicts: count('conflict'),
         dropped: count('dropped'),
         merged: count('merged'),
         rejectedByUser: count('rejected_by_user'),

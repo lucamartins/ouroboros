@@ -298,6 +298,7 @@ async function applyLearnings(db, session, reviewId, out, opts, { notices = true
     ...results.filter((r) => r.status === 'created').map((r) => `📝 learned: ${r.title}`),
     ...results.filter((r) => r.status === 'patched').map((r) => `📝 updated: ${r.title}`),
     ...results.filter((r) => r.status === 'queued').map((r) => `⏳ waiting for approval: ${r.title}`),
+    ...results.filter((r) => r.status === 'conflict').map((r) => `⚖ conflicts with a written rule, decide in the dashboard: ${r.title}`),
   ];
   if (notices && lines.length) db.prepare('INSERT INTO notices (ts, session_id, text) VALUES (?, ?, ?)').run(Date.now(), session.id, lines.join('\n'));
   db.prepare('UPDATE reviews SET learned = ?, patched = ? WHERE id = ?').run(report.created || 0, report.patched || 0, reviewId);

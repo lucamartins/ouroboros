@@ -114,7 +114,8 @@ STATUS of each claim:
 - "contradicted": the PROJECT EVIDENCE (tracked code, scripts, config) shows the claim is false or outdated, or it names things that do not exist. No edit.
 - "adds": true, lasting, passes the rubric, and missing from the file. Add it where it belongs.
 - "corrects": the file states something wrong or outdated, shown by the project evidence or by the user explicitly changing a standing rule ("from now on", "that changed"). A request made once, for one situation, never overturns a rule the file states: that claim is "conflict". Replace the wrong text.
-- "conflict": it contradicts another claim or the file, and neither the project evidence nor an explicit change of rule settles it (set conflicts_with when it is another claim). No edit.
+- "conflict": it contradicts another claim or the file, and neither the project evidence nor an explicit change of rule settles it (set conflicts_with when it is another claim). No edit; the user will decide.
+A claim marked confirmed_by_user="yes" is the user's explicit decision after seeing the conflict: it is never "conflict"; write it ("corrects" when it replaces what the file says, otherwise "adds").
 When two claims disagree, prefer the one the project evidence confirms, then an explicit change of rule, then the one from the more recent session.
 Read the whole file for each claim: text elsewhere in the file that says the opposite must be corrected by the same edits, or the file would contradict itself.
 
@@ -133,7 +134,7 @@ ${view.text}
 </file>
 
 CLAIMS:
-${claims.map((c) => `<claim id="${c.id}"${c.when ? ` session="${c.when}"` : ''}${c.confidence ? ` confidence="${c.confidence}"` : ''}${c.corrects ? ' reported_stale="yes"' : ''}>\n${c.claim}${c.evidence ? `\nevidence: ${c.evidence}` : ''}\n</claim>`).join('\n')}
+${claims.map((c) => `<claim id="${c.id}"${c.when ? ` session="${c.when}"` : ''}${c.confidence ? ` confidence="${c.confidence}"` : ''}${c.corrects ? ' reported_stale="yes"' : ''}${c.confirmed ? ' confirmed_by_user="yes"' : ''}>\n${c.claim}${c.evidence ? `\nevidence: ${c.evidence}` : ''}\n</claim>`).join('\n')}
 
 PROJECT EVIDENCE (where the project's tracked code and config mention what the claims name; "not found" means no tracked file mentions it):
 ${grounding.length ? grounding.map((g) => (g.hits.length
@@ -226,10 +227,14 @@ function when(row) {
 
 /** A claim the editor can judge, from a candidate row. */
 function claimFrom(row, overrides = {}) {
-  let item = {};
-  try { item = JSON.parse(row.payload || '{}').item || {}; } catch { /* ignore */ }
+  let payload = {};
+  try { payload = JSON.parse(row.payload || '{}'); } catch { /* ignore */ }
+  const item = payload.item || {};
   const text = row.claim || item.append || item.new || [item.description, item.text, item.body].filter(Boolean).join('\n') || row.summary || row.title;
-  return { id: row.id, title: row.title, claim: String(text).slice(0, 2000), evidence: row.evidence, when: when(row), confidence: row.confidence, ...overrides };
+  return {
+    id: row.id, title: row.title, claim: String(text).slice(0, 2000), evidence: row.evidence, when: when(row), confidence: row.confidence,
+    confirmed: !!payload.confirmed || undefined, ...overrides,
+  };
 }
 
 /**
@@ -274,7 +279,9 @@ export async function composeRoutes(db, routes, ctx) {
         setOutcome(db, c.id, 'dropped', `unverified [editor]: ${s.reason}`, { target: file, changeset_id: null });
       } else if (s.status === 'conflict') {
         report.conflicts++;
-        setOutcome(db, c.id, 'dropped', `conflict [editor]${s.conflicts_with ? ` with #${s.conflicts_with}` : ''}: ${s.reason}`, { target: file, changeset_id: null });
+        report.results.push({ status: 'conflict', title: c.title });
+        // Never dropped silently: the user decides (dashboard → Conflicts).
+        setOutcome(db, c.id, 'conflict', `conflict${s.conflicts_with ? ` with #${s.conflicts_with}` : ''}: ${s.reason}`, { target: file, changeset_id: null, claim: c.claim });
       } else if (!appliedFor(c.id)) {
         report.unwritten++;
         setOutcome(db, c.id, 'dropped', `not written to ${where}: ${rejectedFor(c.id).join('; ') || 'no edit was given'}`, { target: file, changeset_id: null });
@@ -427,15 +434,18 @@ export async function tidyQueue(db, { force = false, autonomy = 'queue' } = {}) 
     SELECT c.*, s.started_at session_started_at FROM candidates c LEFT JOIN sessions s ON s.id = c.session_id
     WHERE c.outcome = 'queued' AND c.changeset_id IS NULL AND c.triaged_at IS NULL
     ORDER BY COALESCE(s.started_at, c.ts), c.id`).all();
+  // A conflict the user settled ("it's a new rule") goes straight to its file's editor.
+  const confirmed = rows.filter((r) => r.target && /"confirmed":true/.test(r.payload || ''));
+  rows.splice(0, rows.length, ...rows.filter((r) => !confirmed.includes(r)));
   const staleSets = db.prepare("SELECT * FROM changesets WHERE status = 'stale'").all();
   const report = { total: rows.length, recomposed: 0, kept: 0, created: 0, dropped: 0, merged: 0, routed: 0, suggested: 0, stale: 0, queued: 0, patched: 0, cost: 0, byRule: {} };
-  if (!rows.length && !staleSets.length) return report;
+  if (!rows.length && !staleSets.length && !confirmed.length) return report;
 
   // Retrieval and grounding depend on the project, so evaluate one directory at a time.
   const groups = new Map();
   const group = (cwd) => {
     const key = cwd || '';
-    if (!groups.has(key)) groups.set(key, { rows: [], stale: [] });
+    if (!groups.has(key)) groups.set(key, { rows: [], stale: [], confirmed: [] });
     return groups.get(key);
   };
   for (const r of rows) {
@@ -444,6 +454,7 @@ export async function tidyQueue(db, { force = false, autonomy = 'queue' } = {}) 
     group(payload.cwd || r.cwd).rows.push(r);
   }
   for (const cs of staleSets) group(cs.cwd).stale.push(cs);
+  for (const r of confirmed) group(r.cwd).confirmed.push(r);
 
   for (const [cwd, g] of groups) {
     const ctx = { cwd: cwd || undefined, actor: 'background', autonomy, lang: opts.learningLanguage, model: opts.reviewerModel, payload: { trigger: 'session_end' } };
@@ -452,9 +463,13 @@ export async function tidyQueue(db, { force = false, autonomy = 'queue' } = {}) 
       for (const k of ['kept', 'created', 'dropped', 'merged', 'routed', 'suggested', 'stale', 'queued', 'patched', 'cost']) report[k] += r[k] || 0;
       for (const [rule, n] of Object.entries(r.byRule)) report.byRule[rule] = (report.byRule[rule] || 0) + n;
     }
-    if (g.stale.length) {
+    if (g.stale.length || g.confirmed.length) {
       const routes = new Map();
       for (const cs of g.stale) if (!routes.has(cs.file)) routes.set(cs.file, []);
+      for (const r of g.confirmed) {
+        if (!routes.has(r.target)) routes.set(r.target, []);
+        routes.get(r.target).push(claimFrom(r));
+      }
       const r = await composeRoutes(db, routes, ctx);
       report.recomposed += g.stale.length;
       report.cost += r.cost;

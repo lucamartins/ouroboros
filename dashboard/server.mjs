@@ -33,6 +33,25 @@ async function runAction(db, action, id) {
         WHERE id = ? AND outcome IN ('dropped', 'merged', 'suggested', 'duplicate')`).run(Number(id));
       return r.changes ? { status: 'restored' } : { status: 'not_found' };
     }
+    case 'resolve_conflict': {
+      // The user settles a conflict: "new" = it is a new rule (write it, replacing what
+      // contradicts it); "keep" = the current rule stands (the learning is rejected).
+      const [cid, choice] = String(id).split(':');
+      const c = db.prepare("SELECT * FROM candidates WHERE id = ? AND outcome = 'conflict'").get(Number(cid));
+      if (!c) return { status: 'not_found' };
+      if (choice !== 'new') {
+        db.prepare("UPDATE candidates SET outcome = 'rejected_by_user', decided_at = ? WHERE id = ?").run(Date.now(), c.id);
+        return { status: 'rejected_by_user', title: c.title };
+      }
+      let payload = {};
+      try { payload = JSON.parse(c.payload || '{}'); } catch { /* ignore */ }
+      db.prepare("UPDATE candidates SET outcome = 'queued', triaged_at = NULL, decided_at = NULL, payload = ?, note = ? WHERE id = ?")
+        .run(JSON.stringify({ ...payload, confirmed: true }), 'you said it is a new rule', c.id);
+      const { tidyQueue } = await import('../scripts/evaluate.mjs');
+      await tidyQueue(db);
+      const after = db.prepare('SELECT outcome FROM candidates WHERE id = ?').get(c.id);
+      return { status: after.outcome === 'queued' ? 'composed' : after.outcome, title: c.title };
+    }
     case 'dismiss': {
       const r = db.prepare("UPDATE candidates SET outcome = 'dismissed', decided_at = ? WHERE id = ? AND outcome = 'suggested'").run(Date.now(), Number(id));
       return r.changes ? { status: 'dismissed' } : { status: 'not_found' };

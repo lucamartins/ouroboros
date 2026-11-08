@@ -137,6 +137,7 @@ const ACTION_LABEL = {
   reject: (r) => (r.status === 'rejected_by_user' ? 'rejected' : `${r.status}${r.reason ? ` — ${r.reason}` : ''}`),
   triage_queue: (r) => `checked ${r.total}${r.recomposed ? ` + ${r.recomposed} changes` : ''}: ${r.kept} new, ${r.routed} to existing files, ${r.dropped} dropped, ${r.merged} merged, ${r.suggested} fixes (${fmt.usd(r.cost)})`,
   dismiss: () => 'dismissed',
+  resolve_conflict: (r) => (r.status === 'composed' ? `📝 composed as a change to approve: ${r.title}` : r.status === 'rejected_by_user' ? 'the current rule stands' : `${r.status}${r.reason ? ` — ${r.reason}` : ''}`),
   restore: () => 'back in the queue',
   approve_many: (r) => `📝 saved ${r.saved} of ${r.total}${r.other ? ` (${r.other} skipped: duplicate or over budget)` : ''}`,
   reject_many: (r) => `rejected ${r.rejected}`,
@@ -377,7 +378,7 @@ function learnedSection(learned, writes) {
 const OUTCOME_LABEL = {
   dropped: 'dropped by the knowledge check', merged: 'merged by the knowledge check', suggested: 'suggested as a fix',
   created: 'saved', patched: 'merged into existing', duplicate: 'already known', rejected: 'rejected',
-  over_budget: 'over budget', queued: 'waiting for approval', rejected_by_user: 'rejected by you', error: 'error',
+  over_budget: 'over budget', queued: 'waiting for approval', conflict: 'conflict: you decide', rejected_by_user: 'rejected by you', error: 'error',
 };
 
 /** Word-level diff of two texts: [{ op: '=', '-' or '+', text }]. */
@@ -468,6 +469,28 @@ function queueSection(queue) {
   ];
 }
 
+function conflictsSection(conflicts) {
+  if (!conflicts.length) return [];
+  return [
+    h('div', { class: 'section-head' },
+      h('div', {}, h('h2', {}, `Conflicts — you decide (${conflicts.length})`),
+        h('div', { class: 'muted small' }, 'These learnings contradict a rule already written (or another learning), and nothing in the project settles it. Nothing was written. Is it a new rule, or does the current one stand?'))),
+    h('div', { class: 'cards' }, conflicts.map((c) => h('article', { class: 'card lcard' },
+      h('div', { class: 'meta' },
+        h('span', { class: 'badge' }, 'conflict'),
+        h('span', { title: 'When the session this came from happened' }, `${projectName(c.project, c.cwd)} · ${fmt.datetime(c.session_started_at)}`)),
+      h('div', { class: 'title' }, c.title),
+      c.target ? h('div', { class: 'file', title: c.target }, c.target) : null,
+      h('div', { class: 'summary' }, c.claim || c.summary),
+      c.note ? h('div', { class: 'small warn-text' }, c.note.replace(/^conflict(\s+with\s+#\d+)?:\s*/, '')) : null,
+      c.evidence ? h('div', { class: 'evidence' }, c.evidence) : null,
+      h('div', { class: 'actions' },
+        actionButton('It is a new rule', 'resolve_conflict', `${c.id}:new`, { title: 'Write it, correcting what the file says now (shown as a change to approve)' }),
+        actionButton('Keep the current rule', 'resolve_conflict', `${c.id}:keep`, { title: 'Reject this learning' }))))),
+    h('div', { style: 'height:28px' }),
+  ];
+}
+
 function suggestionsSection(suggestions) {
   if (!suggestions.length) return [];
   return [
@@ -494,7 +517,7 @@ function droppedSection(dropped) {
 }
 
 async function renderLearnings() {
-  const [{ learned, writes, candidates, corrections }, queue, dropped, suggestions] = await Promise.all([api('learnings'), api('queue'), api('dropped'), api('suggestions')]);
+  const [{ learned, writes, candidates, corrections }, queue, dropped, suggestions, conflicts] = await Promise.all([api('learnings'), api('queue'), api('dropped'), api('suggestions'), api('conflicts')]);
   const f = state.filters;
   const chipGroup = (key, options) => h('div', { class: 'chips', role: 'group' }, options.map(([value, label]) =>
     h('button', { class: 'chip', 'aria-pressed': String(f[key] === value), onclick: () => { f[key] = value; renderLearnings(); } }, label)));
@@ -521,6 +544,7 @@ async function renderLearnings() {
     : h('p', { class: 'muted small' }, 'No corrections recorded.'));
 
   view.replaceChildren(
+    ...conflictsSection(conflicts),
     ...queueSection(queue),
     ...suggestionsSection(suggestions),
     ...droppedSection(dropped),
@@ -674,7 +698,7 @@ function qualityCard(q) {
   if (stale >= 3) signals.push(`${stale} changes went stale (their files changed before approval): approve or re-check the queue more often.`);
   return h('div', { class: 'card' },
     h('h3', {}, `Learning quality (last ${q.days} days)`),
-    h('div', {}, `${fmt.int(q.proposed)} proposed · ${fmt.int(q.saved)} saved · ${fmt.int(q.queued)} waiting · ${fmt.int(q.dropped)} dropped · ${fmt.int(q.merged)} merged · ${fmt.int(q.duplicates || 0)} already known · ${fmt.int(q.suggested || 0)} fixes suggested · ${fmt.int(q.rejectedByUser)} rejected by you`),
+    h('div', {}, `${fmt.int(q.proposed)} proposed · ${fmt.int(q.saved)} saved · ${fmt.int(q.queued)} waiting · ${fmt.int(q.conflicts || 0)} conflicts for you · ${fmt.int(q.dropped)} dropped · ${fmt.int(q.merged)} merged · ${fmt.int(q.duplicates || 0)} already known · ${fmt.int(q.suggested || 0)} fixes suggested · ${fmt.int(q.rejectedByUser)} rejected by you`),
     h('div', { class: 'muted small' }, `Approval rate ${pct(q.approvalRate)} · undo rate ${pct(q.undoRate)} of ${fmt.int(q.writes)} writes · changes to files: ${fmt.int(changes.applied || 0)} applied, ${fmt.int(changes.pending || 0)} waiting, ${fmt.int(changes.rejected || 0)} rejected, ${fmt.int(changes.superseded || 0)} recomposed`),
     reasons.length ? h('div', { class: 'faint small', style: 'margin-top:6px' }, `Dropped because: ${reasons.map(([r, n]) => `${r} (${n})`).join(', ')}`) : null,
     ...signals.map((s) => h('div', { class: 'small warn-text', style: 'margin-top:6px' }, s)),
