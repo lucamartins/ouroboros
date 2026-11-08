@@ -13,7 +13,7 @@
 // `#knowledge/learned?q=nisus&project=…` or `#activity/proposals?kind=skill&days=90`.
 // Lists are paged by the server ("Showing 50 of 1,240" and "Load more").
 
-import { forceLayout } from './force.js';
+import * as d3 from './d3.min.js';
 
 const view = document.getElementById('view');
 const tooltip = document.getElementById('tooltip');
@@ -1134,16 +1134,24 @@ const ZOOM_MIN = 0.2;
 const ZOOM_MAX = 4;
 /** Above this zoom every skill and memory shows its name, not only hubs and the focused ones. */
 const ZOOM_LABELS = 1.5;
-/** Layout work per animation frame, and before the first paint. */
-const FRAME_BUDGET_MS = 6;
-const WARMUP_MS = 60;
+/** Kinds always drawn with their name (the rest on zoom); the layout keeps room for it. */
+const GRAPH_LABELLED = new Set(['project', 'skill']);
+/** Rest length and stiffness of each kind of connection in the layout. */
+const GRAPH_LINK = {
+  belongs: { dist: 80, k: 0.25 },
+  contains: { dist: 38, k: 0.9 },
+  link: { dist: 70, k: 0.7 },
+  mention: { dist: 90, k: 0.5 },
+  used: { dist: 100, k: 0.3 },
+  similar: { dist: 120, k: 0.08 },
+};
 
 const listParam = (k) => new Set(param(k).split(',').filter(Boolean));
 
 function nodeRadius(n) {
-  if (n.kind === 'project') return 11;
-  const base = { skill: 6.5, reference: 3.5, memory: 5.5, instructions: 6, rules: 4.5 }[n.kind] || 5;
-  return Math.min(base + Math.sqrt(n.uses || 0) * 0.9 + Math.min(n.degree || 0, 12) * 0.15, 15);
+  if (n.kind === 'project') return 13;
+  const base = { skill: 8, reference: 4.5, memory: 7, instructions: 7.5, rules: 5.5 }[n.kind] || 6;
+  return Math.min(base + Math.sqrt(n.uses || 0) * 1.1 + Math.min(n.degree || 0, 12) * 0.2, 19);
 }
 
 /** Where an item lives in the Knowledge lists, to see it there. */
@@ -1217,200 +1225,211 @@ function graphView(data) {
 
 function drawGraph({ nodes, edges, all, holder, side }) {
   const saved = (state.graphPos ||= new Map());
-  const sim = nodes.map((n) => {
-    const p = saved.get(n.id);
-    return { ...n, x: p?.x, y: p?.y, r: nodeRadius(n), charge: n.kind === 'project' ? -420 : -(55 + Math.min(n.degree || 0, 12) * 12) };
-  });
+  const motion = !reducedMotion();
+  const neighbors = new Map(nodes.map((n) => [n.id, new Set()]));
+  const degree = new Map();
+  for (const e of edges) {
+    neighbors.get(e.source)?.add(e.target);
+    neighbors.get(e.target)?.add(e.source);
+    for (const id of [e.source, e.target]) degree.set(id, (degree.get(id) || 0) + 1);
+  }
+  const sim = nodes.map((n) => ({ ...n, r: nodeRadius(n), charge: n.kind === 'project' ? -560 : -(80 + Math.min(n.degree || 0, 12) * 14) }));
   const byId = new Map(sim.map((n) => [n.id, n]));
   const allById = new Map(all.nodes.map((n) => [n.id, n]));
-  const neighbors = new Map(sim.map((n) => [n.id, new Set()]));
-  for (const e of edges) { neighbors.get(e.source)?.add(e.target); neighbors.get(e.target)?.add(e.source); }
-  const layout = forceLayout(sim, edges);
-  if (sim.every((n) => saved.has(n.id))) layout.reheat(0.05);
 
-  const view = { k: 1, x: 0, y: 0 };
+  // Saved positions survive filter changes. A newcomer starts next to a placed neighbor;
+  // with nothing placed, d3 packs everything in a small spiral that the forces unfold.
+  let fresh = 0;
+  sim.forEach((n, i) => {
+    const p = saved.get(n.id);
+    if (p) { n.x = p.x; n.y = p.y; return; }
+    fresh++;
+    const near = [...neighbors.get(n.id)].map((id) => saved.get(id)).find(Boolean);
+    if (near) { n.x = near.x + Math.cos(i * 2.4) * 14; n.y = near.y + Math.sin(i * 2.4) * 14; }
+  });
+
+  const links = edges.map((e) => ({ e, source: e.source, target: e.target, ...(GRAPH_LINK[e.type] || GRAPH_LINK.link) }));
+  const simulation = d3.forceSimulation(sim)
+    .force('link', d3.forceLink(links).id((n) => n.id).distance((l) => l.dist)
+      .strength((l) => l.k / Math.min(degree.get(l.e.source) || 1, degree.get(l.e.target) || 1)))
+    .force('charge', d3.forceManyBody().strength((n) => n.charge).distanceMax(700))
+    .force('collide', d3.forceCollide((n) => n.r + (GRAPH_LABELLED.has(n.kind) ? 16 : 5)).strength(0.75))
+    .force('x', d3.forceX(0).strength(0.035))
+    .force('y', d3.forceY(0).strength(0.035))
+    .alpha(!fresh ? 0.06 : fresh === sim.length ? 1 : 0.5)
+    .stop();
+
   const svg = s('svg', { class: 'graph', role: 'img', 'aria-label': `Knowledge graph: ${fmt.plural(sim.filter((n) => n.kind !== 'project').length, 'item')} and ${fmt.plural(edges.length, 'connection')}. Use the panel to browse them.` });
+  // A dot grid that pans and zooms with the drawing, so moving the view reads as moving.
+  const pattern = s('pattern', { id: 'graph-grid', width: 26, height: 26, patternUnits: 'userSpaceOnUse' }, s('circle', { class: 'grid-dot', cx: 13, cy: 13, r: 0.9 }));
+  const grid = s('rect', { class: 'graph-grid', fill: 'url(#graph-grid)' });
   const viewport = s('g', {});
   const edgeLayer = s('g', { class: 'edges' });
   const nodeLayer = s('g', { class: 'nodes' });
   viewport.append(edgeLayer, nodeLayer);
-  svg.append(viewport);
+  svg.append(s('defs', {}, pattern), grid, viewport);
 
-  const lineEls = edges.map((e) => {
-    const el = s('line', { class: `e-${e.type}` });
+  const edgeEls = links.map((l) => {
+    const el = s('path', { class: `edge e-${l.e.type} k-${byId.get(l.e.source)?.kind}` });
     edgeLayer.append(el);
-    return { e, el, a: byId.get(e.source), b: byId.get(e.target) };
+    return { l, el };
   });
   const nodeEls = new Map();
-  for (const n of sim) {
+  sim.forEach((n, i) => {
     const g = s('g', { class: `node k-${n.kind}${n.learned ? ' learned' : ''}${n.degree || n.kind === 'project' ? '' : ' lonely'}`, 'data-id': n.id });
-    g.append(s('circle', { r: n.r }), s('text', { y: n.r + 2 }, n.kind === 'project' ? n.label : shortLabel(n)));
+    const body = s('g', { class: 'body' }, s('circle', { class: 'halo', r: n.r + 6 }), s('circle', { class: 'core', r: n.r }));
+    g.append(body, s('text', { y: n.r + 4 }, n.kind === 'project' ? n.label : shortLabel(n)));
+    if (motion && !saved.has(n.id)) {
+      g.classList.add('enter');
+      body.style.animationDelay = `${Math.min(i * 7, 520)}ms`; // CSSOM: allowed under the CSP
+    }
     nodeLayer.append(g);
     nodeEls.set(n.id, g);
-  }
+  });
 
   const controls = h('div', { class: 'graph-controls' },
-    h('button', { type: 'button', class: 'btn icon small', 'aria-label': 'Zoom in', title: 'Zoom in', onclick: () => zoomBy(1.4) }, '+'),
-    h('button', { type: 'button', class: 'btn icon small', 'aria-label': 'Zoom out', title: 'Zoom out', onclick: () => zoomBy(1 / 1.4) }, '−'),
-    h('button', { type: 'button', class: 'btn small', title: 'Fit everything in view', onclick: () => fit(true) }, 'Fit'));
+    h('button', { type: 'button', class: 'btn icon small', 'aria-label': 'Zoom in', title: 'Zoom in', onclick: () => zoomBy(1.5) }, '+'),
+    h('button', { type: 'button', class: 'btn icon small', 'aria-label': 'Zoom out', title: 'Zoom out', onclick: () => zoomBy(1 / 1.5) }, '−'),
+    h('button', { type: 'button', class: 'btn small', title: 'Fit everything in view', onclick: () => { userMoved = true; moveTo(frameOf(sim)); } }, 'Fit'));
   const hint = h('p', { class: 'graph-hint' }, 'Drag to move · scroll to zoom · click an item');
   holder.replaceChildren(svg, controls, hint);
 
   let size = { w: holder.clientWidth || 800, h: holder.clientHeight || GRAPH_HEIGHT.wide };
-  const setBox = () => svg.setAttribute('viewBox', `${-size.w / 2} ${-size.h / 2} ${size.w} ${size.h}`);
+  const setBox = () => {
+    svg.setAttribute('viewBox', `${-size.w / 2} ${-size.h / 2} ${size.w} ${size.h}`);
+    for (const [k, v] of Object.entries({ x: -size.w / 2, y: -size.h / 2, width: size.w, height: size.h })) grid.setAttribute(k, v);
+  };
   setBox();
-  let observed = false;
+
+  // Camera: d3-zoom owns pan, wheel, pinch and the animated moves. Until the user takes
+  // the view over, it follows the layout as it unfolds.
+  let view = d3.zoomIdentity;
+  let userMoved = false;
+  const zoom = d3.zoom().scaleExtent([ZOOM_MIN, ZOOM_MAX]).on('zoom', (ev) => {
+    if (ev.sourceEvent) { userMoved = true; hideTip(); }
+    view = ev.transform;
+    const t = view.toString();
+    viewport.setAttribute('transform', t);
+    pattern.setAttribute('patternTransform', t);
+    svg.style.setProperty('--zoom', String(view.k));
+    svg.classList.toggle('zoomed', view.k >= ZOOM_LABELS);
+  });
+  const svgSel = d3.select(svg).call(zoom).on('dblclick.zoom', null);
+
+  function frameOf(list, maxK = 1.6) {
+    if (!list.length) return view;
+    const xs = list.map((n) => n.x);
+    const ys = list.map((n) => n.y);
+    const [x0, x1, y0, y1] = [Math.min(...xs) - 40, Math.max(...xs) + 40, Math.min(...ys) - 40, Math.max(...ys) + 50];
+    const k = Math.min(Math.max(Math.min(size.w / (x1 - x0), size.h / (y1 - y0)), ZOOM_MIN), maxK);
+    return d3.zoomIdentity.translate(-((x0 + x1) / 2) * k, -((y0 + y1) / 2) * k).scale(k);
+  }
+  function moveTo(t, ms = 700) {
+    if (motion && ms) svgSel.transition().duration(ms).ease(d3.easeCubicInOut).call(zoom.transform, t);
+    else svgSel.interrupt().call(zoom.transform, t);
+  }
+  const zoomBy = (f) => { userMoved = true; if (motion) svgSel.transition().duration(250).ease(d3.easeCubicOut).call(zoom.scaleBy, f); else svgSel.call(zoom.scaleBy, f); };
+  /** Ease the view toward the whole drawing, a little each tick. */
+  function follow() {
+    if (userMoved) return;
+    const t = frameOf(sim);
+    const f = 0.1;
+    svgSel.call(zoom.transform, d3.zoomIdentity.translate(view.x + (t.x - view.x) * f, view.y + (t.y - view.y) * f).scale(view.k + (t.k - view.k) * f));
+  }
+
   const ro = new ResizeObserver(() => {
     if (!svg.isConnected) { ro.disconnect(); return; }
     size = { w: holder.clientWidth || size.w, h: holder.clientHeight || size.h };
     setBox();
-    // The drawing is built before it is on the page: fit it once its real size is known.
-    if (!observed) { observed = true; if (!userMoved) fit(); }
+    if (!userMoved) moveTo(frameOf(sim), 0);
   });
   ro.observe(holder);
 
-  function applyView() {
-    viewport.setAttribute('transform', `translate(${view.x} ${view.y}) scale(${view.k})`);
-    // Labels keep a readable size on screen whatever the zoom.
-    svg.style.setProperty('--zoom', String(view.k));
-    svg.classList.toggle('zoomed', view.k >= ZOOM_LABELS);
+  function arc(a, b, type) {
+    // Straight for structure (project, contains), a slight bend for relations.
+    const bend = type === 'belongs' || type === 'contains' ? 0 : 0.13;
+    const mx = (a.x + b.x) / 2 - (b.y - a.y) * bend;
+    const my = (a.y + b.y) / 2 + (b.x - a.x) * bend;
+    return `M${a.x.toFixed(1)},${a.y.toFixed(1)}Q${mx.toFixed(1)},${my.toFixed(1)} ${b.x.toFixed(1)},${b.y.toFixed(1)}`;
   }
   function paintPositions() {
-    for (const l of lineEls) {
-      l.el.setAttribute('x1', l.a.x.toFixed(1)); l.el.setAttribute('y1', l.a.y.toFixed(1));
-      l.el.setAttribute('x2', l.b.x.toFixed(1)); l.el.setAttribute('y2', l.b.y.toFixed(1));
-    }
+    for (const { l, el } of edgeEls) el.setAttribute('d', arc(l.source, l.target, l.e.type));
     for (const n of sim) nodeEls.get(n.id).setAttribute('transform', `translate(${n.x.toFixed(1)} ${n.y.toFixed(1)})`);
   }
-  function fit(animate = false) {
-    if (!sim.length) return;
-    const xs = sim.map((n) => n.x);
-    const ys = sim.map((n) => n.y);
-    const [x0, x1, y0, y1] = [Math.min(...xs) - 30, Math.max(...xs) + 30, Math.min(...ys) - 30, Math.max(...ys) + 40];
-    const k = Math.min(Math.max(Math.min(size.w / (x1 - x0), size.h / (y1 - y0)), ZOOM_MIN), 1.6);
-    Object.assign(view, { k, x: -((x0 + x1) / 2) * k, y: -((y0 + y1) / 2) * k });
-    svg.classList.toggle('animate', animate && !reducedMotion());
-    applyView();
-  }
-  /** Client point → drawing coordinates (the viewBox is centered and 1:1 with pixels). */
-  function toGraph(clientX, clientY) {
-    const r = svg.getBoundingClientRect();
-    const sx = clientX - r.left - r.width / 2;
-    const sy = clientY - r.top - r.height / 2;
-    return { x: (sx - view.x) / view.k, y: (sy - view.y) / view.k, sx, sy };
-  }
-  function zoomAt(factor, sx = 0, sy = 0) {
-    const k = Math.min(Math.max(view.k * factor, ZOOM_MIN), ZOOM_MAX);
-    view.x = sx - ((sx - view.x) * k) / view.k;
-    view.y = sy - ((sy - view.y) * k) / view.k;
-    view.k = k;
-    svg.classList.remove('animate');
-    applyView();
-  }
-  const zoomBy = (f) => { userMoved = true; zoomAt(f); };
-  function centerOn(n) {
-    view.x = -n.x * view.k;
-    view.y = -n.y * view.k;
-    svg.classList.toggle('animate', !reducedMotion());
-    applyView();
-  }
-
-  // Simulation loop: animated, or computed at once when the user prefers less motion.
-  let running = true;
-  /** Once the user pans, zooms or drags, the view is theirs: no automatic fitting. */
-  let userMoved = false;
-  let fitted = sim.every((n) => saved.has(n.id));
   const save = () => { for (const n of sim) saved.set(n.id, { x: n.x, y: n.y }); };
+
+  // Layout: unfolds on screen, or is computed at once when the user prefers less motion.
   let seen = false;
   let waited = 0;
-  function frame() {
-    if (svg.isConnected) seen = true;
-    // Stop once the drawing left the page (or never reached it).
-    if (!running || (seen && !svg.isConnected) || (!seen && ++waited > 120)) { running = false; ro.disconnect(); return; }
-    const until = performance.now() + FRAME_BUDGET_MS;
-    while (!layout.done() && performance.now() < until) layout.tick();
+  if (motion) {
+    simulation.on('tick', () => {
+      if (!svg.isConnected) {
+        // Stop once the drawing left the page (or never reached it).
+        if (seen || ++waited > 120) { simulation.stop(); ro.disconnect(); }
+        return;
+      }
+      seen = true;
+      paintPositions();
+      follow();
+    }).on('end', save);
     paintPositions();
-    if (!fitted && layout.alpha() < 0.08) { fitted = true; if (!userMoved) fit(true); }
-    if (layout.done()) { save(); return; }
-    requestAnimationFrame(frame);
-  }
-  const kick = () => { if (!svg.isConnected) return; const was = !layout.done(); layout.reheat(0.25); if (!was) requestAnimationFrame(frame); };
-  if (reducedMotion()) {
-    for (let i = 0; i < 500 && !layout.done(); i++) layout.tick();
-    paintPositions();
-    fit();
-    save();
+    moveTo(frameOf(sim), 0);
+    simulation.restart();
   } else {
-    // Most of the settling happens before the first paint; the rest is animated.
-    const until = performance.now() + WARMUP_MS;
-    while (!fitted && layout.alpha() > 0.3 && performance.now() < until) layout.tick();
+    simulation.tick(Math.ceil(Math.log(simulation.alphaMin()) / Math.log(1 - simulation.alphaDecay())));
     paintPositions();
-    fit();
-    requestAnimationFrame(frame);
+    moveTo(frameOf(sim), 0);
+    save();
   }
 
-  // Pointer: drag a node to move it, drag the background to pan, click to select.
-  let drag = null;
-  svg.addEventListener('pointerdown', (ev) => {
-    const g = ev.target.closest('.node');
-    const p = toGraph(ev.clientX, ev.clientY);
-    drag = { node: g ? byId.get(g.dataset.id) : null, start: { x: ev.clientX, y: ev.clientY }, view: { ...view }, moved: false };
-    svg.setPointerCapture(ev.pointerId);
-    if (drag.node) { drag.node.fx = p.x; drag.node.fy = p.y; }
-    hideTip();
+  // Dragging an item pulls its neighbors along while the layout stays warm.
+  let dragging = false;
+  const drag = d3.drag()
+    .on('start', (ev, n) => { n.fx = n.x; n.fy = n.y; })
+    .on('drag', (ev, n) => {
+      if (!dragging) {
+        dragging = true;
+        svg.classList.add('dragging');
+        hideTip();
+        hover(null);
+        if (motion) simulation.alphaTarget(0.3).restart();
+      }
+      userMoved = true;
+      n.fx = ev.x; n.fy = ev.y;
+      if (!motion) { n.x = ev.x; n.y = ev.y; paintPositions(); }
+    })
+    .on('end', (ev, n) => {
+      n.fx = null; n.fy = null;
+      if (dragging) { simulation.alphaTarget(0); save(); }
+      dragging = false;
+      svg.classList.remove('dragging');
+    });
+  for (const n of sim) d3.select(nodeEls.get(n.id)).datum(n).call(drag);
+
+  // d3 swallows the click that ends a drag or a pan, so a click here is a real one.
+  svg.addEventListener('click', (ev) => {
+    const g = ev.target.closest?.('.node');
+    select(g ? g.dataset.id : null, { center: !!g });
   });
-  svg.addEventListener('pointermove', (ev) => {
-    if (!drag) return;
-    const dx = ev.clientX - drag.start.x;
-    const dy = ev.clientY - drag.start.y;
-    if (Math.abs(dx) + Math.abs(dy) > 3) { drag.moved = true; userMoved = true; }
-    if (!drag.moved) return;
-    if (drag.node) {
-      const p = toGraph(ev.clientX, ev.clientY);
-      drag.node.fx = p.x; drag.node.fy = p.y;
-      kick();
-    } else {
-      view.x = drag.view.x + dx;
-      view.y = drag.view.y + dy;
-      svg.classList.remove('animate');
-      applyView();
-    }
-  });
-  const endDrag = (ev) => {
-    if (!drag) return;
-    const d = drag;
-    drag = null;
-    if (d.node) { d.node.fx = null; d.node.fy = null; }
-    if (!d.moved && ev.type === 'pointerup') select(d.node ? d.node.id : null);
-    else if (d.node) save();
-  };
-  svg.addEventListener('pointerup', endDrag);
-  svg.addEventListener('pointercancel', endDrag);
-  svg.addEventListener('wheel', (ev) => {
-    ev.preventDefault();
-    const p = toGraph(ev.clientX, ev.clientY);
-    userMoved = true;
-    zoomAt(Math.exp(-ev.deltaY * 0.0015), p.sx, p.sy);
-  }, { passive: false });
   svg.addEventListener('pointerover', (ev) => {
     const g = ev.target.closest?.('.node');
-    if (!g || drag) return;
+    if (!g || dragging) return;
     const n = byId.get(g.dataset.id);
     hover(n.id);
     showTip(g, h('b', {}, n.label), h('div', { class: 'faint' }, [GRAPH_KIND_ONE[n.kind], n.project_name].filter(Boolean).join(' · ')));
   });
   svg.addEventListener('pointerout', (ev) => {
-    if (ev.target.closest?.('.node')) { hover(null); hideTip(); }
+    if (ev.target.closest?.('.node') && !ev.relatedTarget?.closest?.('.node')) { hover(null); hideTip(); }
   });
 
   function hover(id) {
     svg.classList.toggle('hovering', !!id);
-    for (const g of nodeLayer.querySelectorAll('.hot')) g.classList.remove('hot');
-    for (const l of lineEls) l.el.classList.remove('hot');
+    for (const g of nodeLayer.querySelectorAll('.hot')) g.classList.remove('hot', 'pointed');
+    for (const { el } of edgeEls) el.classList.remove('hot');
     if (!id) return;
-    nodeEls.get(id)?.classList.add('hot');
+    nodeEls.get(id)?.classList.add('hot', 'pointed');
     for (const m of neighbors.get(id) || []) nodeEls.get(m)?.classList.add('hot');
-    for (const l of lineEls) if (l.e.source === id || l.e.target === id) l.el.classList.add('hot');
+    for (const { l, el } of edgeEls) if (l.e.source === id || l.e.target === id) el.classList.add('hot');
   }
 
   let selected = null;
@@ -1420,11 +1439,16 @@ function drawGraph({ nodes, edges, all, holder, side }) {
     setNav({ set: { sel: selected || '' }, push: false });
     svg.classList.toggle('focusing', !!selected);
     for (const g of nodeEls.values()) g.classList.remove('on', 'sel');
-    for (const l of lineEls) l.el.classList.toggle('on', !!selected && (l.e.source === selected || l.e.target === selected));
+    for (const { l, el } of edgeEls) el.classList.toggle('on', !!selected && (l.e.source === selected || l.e.target === selected));
     if (selected) {
       nodeEls.get(selected).classList.add('on', 'sel');
       for (const m of neighbors.get(selected)) nodeEls.get(m)?.classList.add('on');
-      if (center) centerOn(byId.get(selected));
+      if (center) {
+        // Glide to the item and its neighbors, zooming in no further than needed.
+        userMoved = true;
+        const group = [byId.get(selected), ...[...neighbors.get(selected)].map((m) => byId.get(m))];
+        moveTo(frameOf(group, Math.max(view.k, 1.3)));
+      }
     }
     side.replaceChildren(...(selected ? detailPanel(byId.get(selected)) : summaryPanel()).filter(Boolean));
   }
@@ -1502,7 +1526,7 @@ function drawGraph({ nodes, edges, all, holder, side }) {
   if (param('q')) search(param('q'));
 
   return {
-    stop() { running = false; ro.disconnect(); },
+    stop() { simulation.stop(); svgSel.interrupt(); ro.disconnect(); if (seen) save(); },
     search(q) {
       // A search replaces the selection: one highlight at a time.
       if (selected && q) select(null);

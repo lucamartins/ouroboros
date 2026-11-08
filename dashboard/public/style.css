@@ -534,41 +534,65 @@ th.num .sort { flex-direction: row-reverse; }
 .edge-sample { width: 18px; height: 6px; overflow: visible; flex: none; }
 .chip[aria-pressed="false"] .edge-sample { opacity: .4; }
 
-line[class^="e-"] { stroke: var(--text-3); stroke-opacity: .45; stroke-width: 1; fill: none; }
-.e-link { stroke: var(--text-2); stroke-opacity: .6; stroke-width: 1.2; }
-.e-mention { stroke-opacity: .55; }
-.e-contains { stroke: var(--k-reference); stroke-opacity: .75; }
-.e-used { stroke: var(--accent); stroke-opacity: .85; stroke-width: 1.8; stroke-dasharray: 0.5 3.5; stroke-linecap: round; }
-.e-similar { stroke-dasharray: 4 3; stroke-opacity: .4; }
-.e-belongs { stroke: var(--border-strong); stroke-opacity: .7; stroke-width: .8; }
+/* Edges: the stroke tells the kind of connection; links and mentions take the color of
+   the item they start from, so each region of the drawing keeps its hue. */
+:where(.edge, .edge-sample line) { stroke: var(--text-3); stroke-opacity: .4; stroke-width: 1; fill: none; stroke-linecap: round; }
+.e-link { stroke: color-mix(in srgb, var(--k, var(--text-2)) 65%, var(--text-2)); stroke-opacity: .55; stroke-width: 1.4; }
+.e-mention { stroke: color-mix(in srgb, var(--k, var(--text-3)) 55%, var(--text-3)); stroke-opacity: .45; stroke-width: 1.1; }
+.e-contains { stroke: var(--k-reference); stroke-opacity: .6; stroke-width: 1.2; }
+.e-used { stroke: var(--accent); stroke-opacity: .75; stroke-width: 2; stroke-dasharray: 0.5 4; }
+.e-similar { stroke-dasharray: 4 4; stroke-opacity: .3; }
+.e-belongs { stroke: var(--k-project); stroke-opacity: .3; stroke-width: .9; }
 
 .graph-body { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: var(--s4); align-items: start; }
 .graph-holder {
   position: relative; height: min(72vh, 680px); min-height: 420px; overflow: hidden;
-  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow);
+  background: radial-gradient(ellipse at center, color-mix(in srgb, var(--accent) 6%, var(--surface)) 0%, var(--surface) 72%);
+  border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow);
 }
 .graph { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; user-select: none; -webkit-user-select: none; }
-.graph:active { cursor: grabbing; }
-.graph.animate > g { transition: transform .35s ease; }
-.graph .node { cursor: pointer; transition: opacity .15s; }
-.graph .node circle { fill: var(--k); stroke: var(--surface); stroke-width: 1.5; }
-.graph .node.learned circle { stroke: var(--text); stroke-width: 2; }
-.graph .node.k-project circle { fill: var(--surface-2); stroke: var(--k-project); stroke-width: 2; }
+.graph:active, .graph.dragging { cursor: grabbing; }
+.grid-dot { fill: var(--text-3); opacity: .25; }
+
+.graph .node { cursor: pointer; transition: opacity .25s ease; }
+.graph .node .body, .graph .node .halo { transform-box: fill-box; transform-origin: center; }
+.graph .node .body { transition: transform .3s cubic-bezier(.34, 1.56, .64, 1); }
+.graph .node .core { fill: var(--k); stroke: var(--surface); stroke-width: 1.5; }
+.graph .node .halo { fill: var(--k); opacity: .13; transition: opacity .25s ease; }
+.graph .node.k-reference .halo { opacity: .05; }
+.graph .node.k-project .core { fill: var(--surface); stroke: var(--k-project); stroke-width: 2.5; }
+.graph .node.k-project .halo { opacity: .1; }
+/* What Ouroboros wrote or changed breathes. */
+.graph .node.learned .core { stroke: var(--accent); stroke-width: 2.5; }
+.graph .node.learned .halo { fill: var(--accent); animation: graph-pulse 2.8s ease-in-out infinite; }
+.graph .node.enter .body { animation: graph-enter .65s cubic-bezier(.34, 1.56, .64, 1) both; }
+.graph .node.pointed .body { transform: scale(1.3); }
+.graph .node:is(.hot, .on) .halo { opacity: .32; }
+.graph .node.match .core { stroke: var(--warning); stroke-width: 3; }
+.graph .node.sel .core { stroke: var(--accent); stroke-width: 3; }
+.graph .node.sel .halo { fill: var(--accent); animation: graph-pulse 1.8s ease-in-out infinite; }
+
 .graph .node text {
-  display: none; font-size: calc(10.5px / var(--zoom, 1)); fill: var(--text-2); text-anchor: middle; dominant-baseline: hanging; pointer-events: none;
+  opacity: 0; transition: opacity .25s ease; font-size: calc(10.5px / var(--zoom, 1)); fill: var(--text-2); text-anchor: middle; dominant-baseline: hanging; pointer-events: none;
   paint-order: stroke; stroke: var(--surface); stroke-width: calc(3px / var(--zoom, 1)); stroke-linejoin: round;
 }
-.graph .node.k-project text { display: block; font-size: calc(11.5px / var(--zoom, 1)); font-weight: 600; fill: var(--text); }
-/* Skills are few and named for what they do: always labelled. The rest on zoom. */
-.graph .node.k-skill text,
+.graph .node.k-project text { font-size: calc(12px / var(--zoom, 1)); font-weight: 600; fill: var(--text); letter-spacing: .01em; }
+/* Projects and skills are few and named for what they do: always labelled. The rest on zoom. */
+.graph .node:is(.k-project, .k-skill) text,
 .graph.zoomed .node:is(.k-memory, .k-instructions, .k-rules) text,
-.graph .node:is(.hot, .on, .match) text { display: block; }
-.graph line { transition: stroke-opacity .15s; }
-.graph.hovering .node:not(.hot), .graph.focusing:not(.hovering) .node:not(.on), .graph.searching:not(.hovering):not(.focusing) .node:not(.match) { opacity: .2; }
-.graph.hovering line:not(.hot), .graph.focusing:not(.hovering) line:not(.on), .graph.searching:not(.hovering):not(.focusing) line { stroke-opacity: .07; }
-.graph line.hot, .graph line.on { stroke-opacity: .95; }
-.graph .node.match circle { stroke: var(--warning); stroke-width: 2.5; }
-.graph .node.sel circle { stroke: var(--accent); stroke-width: 3; }
+.graph .node:is(.hot, .on, .match) text { opacity: 1; }
+.graph .node:is(.pointed, .sel) text { fill: var(--text); font-weight: 600; }
+
+.graph .edge { transition: stroke-opacity .25s ease, stroke-width .25s ease; }
+.graph.hovering .node:not(.hot), .graph.focusing:not(.hovering) .node:not(.on), .graph.searching:not(.hovering):not(.focusing) .node:not(.match) { opacity: .15; }
+.graph.hovering .edge:not(.hot), .graph.focusing:not(.hovering) .edge:not(.on), .graph.searching:not(.hovering):not(.focusing) .edge { stroke-opacity: .05; }
+/* The connections of the item in focus flow from where they start to where they point. */
+.graph .edge:is(.hot, .on) { stroke-opacity: .95; stroke-width: 2; stroke-dasharray: 5 5; animation: graph-flow .8s linear infinite; }
+
+@keyframes graph-enter { from { transform: scale(0); opacity: 0; } }
+@keyframes graph-pulse { 0%, 100% { opacity: .1; transform: scale(1); } 50% { opacity: .32; transform: scale(1.4); } }
+@keyframes graph-flow { to { stroke-dashoffset: -10; } }
+
 .graph-controls { position: absolute; top: var(--s3); right: var(--s3); display: flex; gap: 4px; }
 .graph-controls .btn.icon { width: 28px; font-size: 16px; line-height: 1; }
 .graph-hint { position: absolute; left: var(--s3); bottom: var(--s2); margin: 0; font-size: 12px; color: var(--text-3); pointer-events: none; }
@@ -602,5 +626,5 @@ line[class^="e-"] { stroke: var(--text-3); stroke-opacity: .45; stroke-width: 1;
   .graph-side { max-height: none; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .graph.animate > g, .graph .node, .graph line { transition: none; }
+  .graph .node, .graph .node .body, .graph .node .halo, .graph .node text, .graph .edge { transition: none; animation: none; }
 }
