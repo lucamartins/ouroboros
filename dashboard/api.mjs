@@ -1,6 +1,7 @@
 // Read-only JSON API for the dashboard.
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { changesetView } from '../scripts/changesets.mjs';
 import { getMeta, monthSpend, monthStart } from '../scripts/db.mjs';
 import { blockChars, parseProfile, readProfileText } from '../scripts/profile.mjs';
@@ -55,6 +56,21 @@ const HITS_SQL = `
 export function createApi(db) {
   const routes = {
     ping: () => ({ app: 'ouroboros' }),
+
+    /** What waits for the user, for the navigation badge; plus the plugin version. */
+    counts() {
+      const n = (sql) => db.prepare(sql).get().n;
+      let version = null;
+      try { version = JSON.parse(fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '.claude-plugin', 'plugin.json'), 'utf8')).version; } catch { /* unknown */ }
+      return {
+        version,
+        options: readOptions(),
+        conflicts: n("SELECT COUNT(*) n FROM candidates WHERE outcome = 'conflict'"),
+        items: n("SELECT COUNT(*) n FROM candidates WHERE outcome = 'queued' AND changeset_id IS NULL"),
+        changes: n("SELECT COUNT(*) n FROM changesets WHERE status IN ('pending', 'stale')"),
+        fixes: n("SELECT COUNT(*) n FROM candidates WHERE outcome = 'suggested'"),
+      };
+    },
 
     value(params) {
       const { days, since } = rangeStart(params, 90);
@@ -113,7 +129,7 @@ export function createApi(db) {
       const recent = db.prepare(`
         SELECT r.ts, r.mode, r.trigger, r.status, r.detail, r.turns_reviewed, r.corrections, r.learned, r.patched,
                r.input_tokens + r.cache_write_tokens input, r.cache_read_tokens cache_read, r.output_tokens output, r.cost_usd, s.cwd, s.project
-        FROM reviews r LEFT JOIN sessions s ON s.id = r.session_id ORDER BY r.ts DESC LIMIT 30`).all();
+        FROM reviews r LEFT JOIN sessions s ON s.id = r.session_id WHERE r.trigger IS NOT 'triage-summary' ORDER BY r.ts DESC LIMIT 40`).all();
       const sessions = db.prepare('SELECT COUNT(*) n FROM sessions WHERE started_at >= ?').get(since).n;
       const hits = db.prepare(HITS_SQL).all(since).length;
       const contextChars = opts?.learning === false ? 0 : (overheadChars() || 0);

@@ -352,13 +352,17 @@ WAL + `busy_timeout` for concurrent sessions. Versioned migrations in `db.mjs`.
 
 ### 9.1 Screens
 
-| Screen | Content |
-|---|---|
-| **Overview** | Weekly KPIs: new learnings, utilization rate, correction rate vs baseline, month cost vs cap; timeline of recent writes |
-| **Inventory** | All memories/skills (learned and native), filter by scope/project/type/status; confidence, uses, last use; actions: view diff, edit, archive, undo |
-| **Value** | Corrections per turn over time (marking when learning was enabled); *misses*; sessions with ≥ 1 learned item used |
-| **Cost** | Reviews (USD/tokens per day, in-loop vs background), fixed context overhead; month projection |
-| **Health** | Budget bars (`user.md` blocks, `MEMORY.md`, skill count, skill listing), stale items, suspected duplicates, hook/worker errors |
+One page per question, in a sticky top bar; the Inbox carries a count of what waits for the user, and the dashboard opens on it whenever something does.
+
+| Page | Question | Content |
+|---|---|---|
+| **Inbox** | What needs my decision? | Conflicts (a learning vs a written rule: "it is a new rule" / "keep the current rule"), changes to files (one diff per file with the learnings behind it; approve, reject, remove one learning), new items, suggested fixes; bulk approve/reject; "check against knowledge" |
+| **Overview** | Is learning working? | Corrections per 100 turns before vs after learning with the delta, learned count, sessions using a learning, misses, month cost vs budget; trend charts with the "learning on" marker; recently learned |
+| **Knowledge** | What does Claude know? | Learned items (confirm, undo, archive), every skill, memory and instruction file, with a filter |
+| **Activity** | What happened? | Sessions, reviews (with cost), proposals and their outcome, what the knowledge check dropped (restorable), corrections |
+| **System** | Is it healthy, how good is it, what does it cost? | Capture and reviewer status, month cost; learning quality (outcome counts, approval and undo rates, why proposals were dropped, warnings); cost per review; context budgets; failed reviews and errors |
+
+Visual system: warm neutrals with one blue accent (primary actions, selection, data), system sans, light and dark from the same tokens; lists and tables over card grids, cards only for decisions; one stroke icon set drawn in `app.js`; status always pairs a color with a word.
 
 ### 9.2 Metrics (definitions)
 
