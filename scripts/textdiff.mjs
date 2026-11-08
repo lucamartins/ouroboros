@@ -63,6 +63,39 @@ export function lineDiff(a, b) {
   return hunks;
 }
 
+/**
+ * Word diff of two lines as segments { type: 'same' | 'del' | 'add', text }, so a long
+ * line that gains one sentence reads as that sentence instead of the line twice.
+ * Words, runs of whitespace and runs of punctuation are separate tokens; a removal comes
+ * before the addition that replaces it.
+ */
+export function wordDiff(a, b) {
+  const tok = (s) => String(s ?? '').match(/[\p{L}\p{N}_]+|\s+|[^\p{L}\p{N}_\s]+/gu) || [];
+  const A = tok(a);
+  const B = tok(b);
+  const n = A.length;
+  const m = B.length;
+  if (n * m > 1_000_000) return [{ type: 'del', text: A.join('') }, { type: 'add', text: B.join('') }];
+  const lcs = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) lcs[i][j] = A[i] === B[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+  }
+  const out = [];
+  const push = (type, text) => {
+    const last = out[out.length - 1];
+    if (last?.type === type) last.text += text;
+    else out.push({ type, text });
+  };
+  let i = 0;
+  let j = 0;
+  while (i < n || j < m) {
+    if (i < n && j < m && A[i] === B[j]) { push('same', A[i]); i++; j++; }
+    else if (i < n && (j >= m || lcs[i + 1][j] >= lcs[i][j + 1])) push('del', A[i++]);
+    else push('add', B[j++]);
+  }
+  return out;
+}
+
 /** Start indexes where the line sequence `seq` occurs in `lines`. */
 function findLines(lines, seq) {
   const hits = [];

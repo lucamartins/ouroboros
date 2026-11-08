@@ -16,7 +16,7 @@ import { options } from './config.mjs';
 import { knowledgeKind } from './knowledge.mjs';
 import { dataDir, memoryDirFor, projectKey } from './paths.mjs';
 import { citedTurns, quotesFor, readTranscript, userTurnsOfReview } from './transcript.mjs';
-import { lineDiff } from './textdiff.mjs';
+import { lineDiff, wordDiff } from './textdiff.mjs';
 
 const CONTEXT_LINES = 2;
 
@@ -107,22 +107,72 @@ export function listText(entries) {
 
 // ---------- detail ----------
 
-/** A unified diff of two texts with a little context, for reading in the terminal. */
+const KEEP = 40; // characters of unchanged text kept on each side of a change inside a line
+
+/** Cut unchanged text to `KEEP` characters at a word boundary, marking the cut with "…". */
+function clip(text, side) {
+  if (text.length <= KEEP * 2 + 10) return text;
+  const head = () => { const s = text.slice(0, KEEP); const k = s.lastIndexOf(' '); return `${(k > KEEP / 2 ? s.slice(0, k) : s)}…`; };
+  const tail = () => { const s = text.slice(-KEEP); const k = s.indexOf(' '); return `…${(k >= 0 && k < KEEP / 2 ? s.slice(k + 1) : s)}`; };
+  if (side === 'start') return tail();
+  if (side === 'end') return head();
+  return `${head()} ${tail()}`;
+}
+
+/**
+ * One line that changed, as its changed words: "[-removed-]" and "{+added+}" inside the
+ * unchanged text, which is cut to a little context ("…" marks what was left out).
+ * Null when the two lines share too little for a word diff to help.
+ */
+export function changedLine(before, after) {
+  const segs = wordDiff(before, after);
+  const same = segs.filter((s) => s.type === 'same').reduce((n, s) => n + s.text.trim().length, 0);
+  if (same < 0.4 * Math.min(before.trim().length, after.trim().length) || same < 8) return null;
+  return segs.map((s, i) => {
+    if (s.type === 'del') return `[-${s.text}-]`;
+    if (s.type === 'add') return `{+${s.text}+}`;
+    return clip(s.text, i === 0 ? 'start' : i === segs.length - 1 ? 'end' : 'middle');
+  }).join('');
+}
+
+/**
+ * A diff of two texts with a little context, for reading in the terminal: "+ " a line
+ * added, "- " a line removed, "~ " a line changed inside (see `changedLine`), "  " context.
+ */
 export function unifiedDiff(before, after, { context = CONTEXT_LINES } = {}) {
   const A = String(before ?? '').split('\n');
   const hunks = lineDiff(before ?? '', after ?? '');
   if (!hunks.length) return '(no change)';
+  // Hunks whose context would overlap print as one block, so a context line is never
+  // the old version of a line the next hunk changes.
+  const groups = [];
+  for (const h of hunks) {
+    const last = groups[groups.length - 1];
+    const prev = last?.[last.length - 1];
+    if (prev && h.at - (prev.at + prev.before.length) <= context * 2) last.push(h);
+    else groups.push([h]);
+  }
   const out = [];
   let shift = 0;
-  for (const h of hunks) {
-    const from = Math.max(0, h.at - context);
-    const to = Math.min(A.length, h.at + h.before.length + context);
-    out.push(`@@ line ${h.at + 1 + shift} @@`);
-    for (const l of A.slice(from, h.at)) out.push(`  ${l}`);
-    for (const l of h.before) out.push(`- ${l}`);
-    for (const l of h.after) out.push(`+ ${l}`);
-    for (const l of A.slice(h.at + h.before.length, to)) out.push(`  ${l}`);
-    shift += h.after.length - h.before.length;
+  for (const g of groups) {
+    const first = g[0];
+    const end = g[g.length - 1].at + g[g.length - 1].before.length;
+    out.push(`@@ line ${first.at + 1 + shift} @@`);
+    let pos = Math.max(0, first.at - context);
+    for (const h of g) {
+      for (const l of A.slice(pos, h.at)) out.push(`  ${l}`);
+      const pairs = Math.min(h.before.length, h.after.length);
+      for (let i = 0; i < pairs; i++) {
+        const w = changedLine(h.before[i], h.after[i]);
+        if (w !== null) out.push(`~ ${w}`);
+        else out.push(`- ${h.before[i]}`, `+ ${h.after[i]}`);
+      }
+      for (const l of h.before.slice(pairs)) out.push(`- ${l}`);
+      for (const l of h.after.slice(pairs)) out.push(`+ ${l}`);
+      pos = h.at + h.before.length;
+      shift += h.after.length - h.before.length;
+    }
+    for (const l of A.slice(end, Math.min(A.length, end + context))) out.push(`  ${l}`);
   }
   return out.join('\n');
 }

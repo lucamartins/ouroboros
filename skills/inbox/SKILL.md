@@ -38,11 +38,13 @@ Then present the card in this exact shape, translated, without dropping fields:
 **Came from:** session of 2026-11-01 in repos (end-of-session review) — you said: "<the quote, shortened to the part that matters>"
 **Waited because:** <from the card>
 **Diff:**
-<a diff code block: the changed lines with one line of context; for a new item, the text it would save>
+<the diff from `show`, in a plain code block>
 **My view:** <recommendation and the reason, one to three lines; what you checked>
 ```
 
-With several learnings in one change, list each one's "teaches / came from" in a short numbered list. When the card has no quote, say so ("your words from that session were not found") instead of citing "USER #n".
+Each field is one short line with one kind of information: what it teaches never carries where it came from, and the origin never carries the reasoning. With several learnings in one change, give each its own numbered entry with a `Teaches:` line and a `Came from:` line under it. When the card has no quote, say so in `Came from` ("your words from that session were not found") instead of citing "USER #n".
+
+**The diff.** Copy the diff lines that `show` (or `preview`) printed, unchanged, into a plain code block; drop only the `@@ line N @@` headers. Never retype, shorten or summarize them, never add your own `...` or `(...)`, and never write a diff by hand: a hand-made fragment is what makes a diff unreadable. The first time a diff appears, give its legend in one line: `+` a line added, `-` a line removed, `~` a line changed inside it, with `{+…+}` the words added and `[-…-]` the words removed; `…` marks unchanged text left out. For a new item, show the text it would save instead.
 
 ## 3. Ask
 
@@ -51,11 +53,13 @@ Use the AskUserQuestion tool (when it is unavailable, ask in plain text with the
 - `header`: the position, e.g. `3/13`.
 - `question`: key, the file's short name and what it teaches in a few words — e.g. "cs:26 · windows-gotchas.md (skill nisus): add 'bash in PowerShell opens WSL; use Git Bash by full path'?"
 - `options` (your recommendation first, marked as recommended), **each with a `preview`** that shows what happens if chosen:
-  - **Approve** — preview: the diff exactly as it would be written (file path on the first line).
-  - **Edit** — preview: the version you would propose instead, as a diff; if you have no concrete edit in mind, the parts the user could change.
+  - **Approve** — preview: the file's short path on the first line, then the diff lines from `show`, unchanged.
+  - **Edit** — preview: the diff that `preview` printed for the version you would propose (run it before asking); if you have no concrete edit in mind, the parts the user could change, in words.
   - **Reject** — preview: "Nothing is written." plus the reason you would record.
   - **Skip** — preview: "It keeps waiting in the inbox."
   - For a conflict: **New rule** (preview: the correction you would write, as a diff), **Keep current rule**, **Skip**. For a suggested fix: **Fix it now** (preview: what you would change in the project), **Already fixed**, **Dismiss**.
+
+Each option decides this entry and nothing else. When your check finds that another file must change too (a skill that contradicts the learning, for instance), say so in **My view**, and after acting on the entry offer that change as its own question; never fold it into an option ("Approve + fix X").
 
 If the user answers with a comment or question, discuss it — that is the point of doing this here — and ask again when it is settled.
 

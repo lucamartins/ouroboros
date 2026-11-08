@@ -214,3 +214,16 @@ test('describeFile names what a knowledge file is', () => {
   assert.match(inbox.describeFile(path.join(home, '.ouroboros', 'user.md')), /global profile/);
   assert.equal(inbox.shortPath(path.join(home, 'a', 'b.md')), '~/a/b.md');
 });
+
+test('the diff shows a long line that changed as its changed words, not the line twice', () => {
+  const long = 'Front: `cd web && pnpm dev` (first time in a worktree: `pnpm install --frozen-lockfile`).';
+  const before = ['## Start', long, '', '- Drop the task database at the end. Exact commands, in order:', '- Other.'].join('\n');
+  const after = ['## Start', `${long} Open it on \`localhost\`, not \`127.0.0.1\`.`, '', '- Drop the task database at the end of the feature. Exact commands, in order:', '- Other.', '- New bullet.'].join('\n');
+  const d = inbox.unifiedDiff(before, after);
+  assert.match(d, /^~ .*\{\+ Open it on `localhost`, not `127\.0\.0\.1`\.\+\}$/m, 'only the added sentence is marked');
+  assert.match(d, /^~ .*the end\{\+ of the feature\+\}\. Exact/m, 'punctuation stays outside the insertion');
+  assert.match(d, /^\+ - New bullet\.$/m, 'a new line is still a + line');
+  assert.equal((d.match(/^@@/gm) || []).length, 1, 'nearby changes form one block');
+  assert.doesNotMatch(d, /^- /m, 'no line is shown removed and added again');
+  assert.match(inbox.unifiedDiff('alpha beta gamma delta', 'one two three four'), /^- alpha beta gamma delta\n\+ one two three four$/m, 'unrelated lines stay -/+');
+});
