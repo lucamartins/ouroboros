@@ -194,6 +194,14 @@ export function spawnWorker(args, env = process.env) {
   child.unref();
 }
 
+/** How many inbox entries wait for the user in a project (global entries included). */
+export function inboxCount(db, project) {
+  const mine = '(project IS NULL OR project = ?)';
+  return db.prepare(`SELECT
+      (SELECT COUNT(*) FROM candidates WHERE ${mine} AND (outcome IN ('conflict', 'suggested') OR (outcome = 'queued' AND changeset_id IS NULL)))
+    + (SELECT COUNT(*) FROM changesets WHERE ${mine} AND status IN ('pending', 'stale')) n`).get(project, project).n;
+}
+
 const handlers = {
   SessionStart(db, input, now) {
     ensureSession(db, input, now);
@@ -210,9 +218,19 @@ const handlers = {
         db.prepare(`UPDATE notices SET delivered_at = ? WHERE id IN (${notices.map(() => '?').join(',')})`).run(now, ...notices.map((n) => n.id));
       }
       const learnedText = notices.map((n) => n.text).join('\n');
+      // What waits for the user's decision (this project's and global entries): said with
+      // the notices, otherwise at most once a day.
+      const waiting = inboxCount(db, projectKey(input.cwd));
+      const remind = waiting && (learnedText || now - (Number(dbApi.getMeta(db, 'inbox_hint_at')) || 0) > 20 * 60 * 60 * 1000);
+      if (remind) dbApi.setMeta(db, 'inbox_hint_at', now);
+      const inboxLine = remind ? `${waiting} waiting for your decision: /ouroboros:inbox (or the dashboard)` : '';
+      const message = [
+        learnedText ? `Ouroboros, since your last session:\n${learnedText}\n(/ouroboros:undo or /ouroboros:forget to revert)` : '',
+        inboxLine ? `${learnedText ? '' : 'Ouroboros: '}${inboxLine}` : '',
+      ].filter(Boolean).join('\n');
       // Synchronous hook: stdout becomes session context; systemMessage is shown to the user.
       process.stdout.write(JSON.stringify({
-        ...(learnedText ? { systemMessage: `Ouroboros, since your last session:\n${learnedText}\n(/ouroboros:undo or /ouroboros:forget to revert)` } : {}),
+        ...(message ? { systemMessage: message } : {}),
         hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: sessionContext(learnedText) },
       }));
     }

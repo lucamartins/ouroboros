@@ -10,14 +10,12 @@ import { fileURLToPath } from 'node:url';
 import { openDb } from '../scripts/db.mjs';
 import { dataDir } from '../scripts/paths.mjs';
 import { createApi } from './api.mjs';
-import { applyChangeset, rejectChangeset } from '../scripts/changesets.mjs';
-import { confirm, decideQueued, forget, pin, undo } from '../scripts/curator.mjs';
+import { confirm, forget, pin, undo } from '../scripts/curator.mjs';
+import * as inbox from '../scripts/inbox.mjs';
 
 /** Approve or reject one queue entry: "cs:<id>" is a change to a file, a number one proposal. */
 function decide(db, key, approve) {
-  const m = /^cs:(\d+)$/.exec(String(key));
-  if (m) return approve ? applyChangeset(db, Number(m[1]), { actor: 'manual' }) : rejectChangeset(db, Number(m[1]));
-  return decideQueued(db, Number(key), approve);
+  return approve ? inbox.approve(db, key) : inbox.reject(db, key);
 }
 
 /** Totals of a queue drain (several rounds) for the dashboard's message. */
@@ -44,29 +42,18 @@ async function runAction(db, action, id) {
       return r.changes ? { status: 'restored' } : { status: 'not_found' };
     }
     case 'resolve_conflict': {
-      // The user settles a conflict: "new" = it is a new rule (write it, replacing what
-      // contradicts it); "keep" = the current rule stands (the learning is rejected).
+      // The user settles a conflict: "new" = it is a new rule (the editor writes it,
+      // replacing what contradicts it); "keep" = the current rule stands.
       const [cid, choice] = String(id).split(':');
-      const c = db.prepare("SELECT * FROM candidates WHERE id = ? AND outcome = 'conflict'").get(Number(cid));
-      if (!c) return { status: 'not_found' };
-      if (choice !== 'new') {
-        db.prepare("UPDATE candidates SET outcome = 'rejected_by_user', decided_at = ? WHERE id = ?").run(Date.now(), c.id);
-        return { status: 'rejected_by_user', title: c.title };
-      }
-      let payload = {};
-      try { payload = JSON.parse(c.payload || '{}'); } catch { /* ignore */ }
-      db.prepare("UPDATE candidates SET outcome = 'queued', triaged_at = NULL, decided_at = NULL, payload = ?, note = ? WHERE id = ?")
-        .run(JSON.stringify({ ...payload, confirmed: true }), 'you said it is a new rule', c.id);
+      const r = inbox.resolveConflict(db, `cf:${Number(cid)}`, choice === 'new' ? 'new' : 'keep');
+      if (r.status !== 'requeued') return r;
       const { drainQueue } = await import('../scripts/evaluate.mjs');
-      const r = await drainQueue(db);
-      if (r.status !== 'done') return { status: 'waiting', reason: r.reason, title: c.title };
-      const after = db.prepare('SELECT outcome FROM candidates WHERE id = ?').get(c.id);
-      return { status: after.outcome === 'queued' ? 'composed' : after.outcome, title: c.title };
+      const d = await drainQueue(db);
+      if (d.status !== 'done') return { status: 'waiting', reason: d.reason, title: r.title };
+      const after = db.prepare('SELECT outcome FROM candidates WHERE id = ?').get(Number(cid));
+      return { status: after.outcome === 'queued' ? 'composed' : after.outcome, title: r.title };
     }
-    case 'dismiss': {
-      const r = db.prepare("UPDATE candidates SET outcome = 'dismissed', decided_at = ? WHERE id = ? AND outcome = 'suggested'").run(Date.now(), Number(id));
-      return r.changes ? { status: 'dismissed' } : { status: 'not_found' };
-    }
+    case 'dismiss': return inbox.dismiss(db, `sg:${Number(id)}`);
     case 'undo': return undo(db, { id });
     case 'undo_batch': return /^[0-9a-f]{6,32}$/.test(String(id)) ? undo(db, { batch: String(id) }) : { status: 'not_found' };
     case 'pin': {

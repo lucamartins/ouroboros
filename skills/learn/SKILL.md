@@ -81,7 +81,7 @@ Fields: `title` (short; for a patch, what the patch teaches, not the file's name
 The first lines are a human summary; the last line is JSON.
 
 - `created` / `patched` → tell the user one line per item: `📝 learned: <title>` (or `📝 updated: …`).
-- `queued` → the user's autonomy setting holds it for approval: say `⏳ waiting for approval: <title>` (approve in `/ouroboros:dashboard`).
+- `queued` → the user's autonomy setting holds it for approval: say `⏳ waiting for approval: <title>` (decide with `/ouroboros:inbox` or in `/ouroboros:dashboard`).
 - `duplicate` → read the existing item it names and, if the new information adds something, re-submit as a `patch` to that target.
 - `over_budget` → consolidate first: merge or shorten items with patches, or archive a stale one with `/ouroboros:forget`, then retry.
 - `rejected` → fix the cause it states, or drop the item.

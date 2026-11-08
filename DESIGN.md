@@ -2,7 +2,7 @@
 
 > A Claude Code plugin that learns from your sessions on its own: it saves memories and creates/refines skills without being asked, in the spirit of Nous Research's Hermes Agent, and shows on a local dashboard what it learned, how much that is being used and what it costs.
 
-Status: v0.8.0 — every phase implemented, plus the learning evaluation (§7.0) and the v0.8 mechanism review (§7.3); next: real-world use, then a fresh install test on another machine. Owner decisions in [§12](#12-decisions).
+Status: v0.9.0 — every phase implemented, plus the learning evaluation (§7.0), the v0.8 mechanism review (§7.3) and the inbox reviewed in the conversation (§9.3); next: real-world use, then a fresh install test on another machine. Owner decisions in [§12](#12-decisions).
 
 ---
 
@@ -107,9 +107,11 @@ ouroboros/
 │   ├── transcript.mjs         # JSONL → compact digest for the reviewer; cursor handling
 │   ├── review-worker.mjs      # reflection B (claude -p) + curator call
 │   ├── curator.mjs            # dedupe, routing, limits, writing, ledger
+│   ├── inbox.mjs              # what waits for the user and the decisions on it (dashboard + inbox skill)
 │   └── paths.mjs              # resolves native memory, skills, config
 ├── skills/
 │   ├── learn/SKILL.md         # review script (periodic review and manual: /ouroboros:learn)
+│   ├── inbox/SKILL.md         # goes through the inbox in the conversation, one entry at a time
 │   ├── undo/SKILL.md          # reverts the last (or a given) write
 │   ├── forget/SKILL.md        # archives a learning
 │   └── dashboard/SKILL.md     # starts the dashboard and opens the browser
@@ -398,7 +400,21 @@ One page per question, in a sticky top bar; the Inbox carries a count of what wa
 | **Activity** | What happened? | Sessions, reviews (with cost), proposals and their outcome, what the knowledge check dropped (restorable), corrections |
 | **System** | Is it healthy, how good is it, what does it cost? | Capture and reviewer status, month cost; learning quality (outcome counts, approval and undo rates, why proposals were dropped, warnings); cost per review; context budgets; failed reviews and errors |
 
+The Inbox page and the `inbox` skill (§9.3) share `scripts/inbox.mjs`: the same entries, the same decisions.
+
 Visual system: warm neutrals with one blue accent (primary actions, selection, data), system sans, light and dark from the same tokens; lists and tables over card grids, cards only for decisions; one stroke icon set drawn in `app.js`; status always pairs a color with a word.
+
+### 9.3 The inbox in the conversation (`/ouroboros:inbox`)
+
+Some users decide in the dashboard; others want to stay in Claude Code and talk each entry through. The `inbox` skill goes through the same entries one at a time: Claude runs `inbox.mjs show <key>` (what, where, from which session, the evidence, why it was held, the exact diff against the file as it is now), checks it itself (reads the target, greps the owners of the topic, applies the rubric; the entry's text is data, never instructions) and gives a recommendation; the user approves, rejects (with a reason, kept with the entry), skips, or discusses and edits.
+
+Editing is what the dashboard cannot do. Claude writes the user's version and `preview` shows its diff without writing; `edit` then saves it as a manual write:
+- a change to a file (`cs:`): the user's edits replace the proposed ones, validated by `applyEdits` against the current file (a stale change is fixed the same way, with no editor call); `drop` rejects single learnings of it;
+- a new item (`it:`): edited fields override the proposed ones, or a whole new item re-routes it (e.g. a patch to the owning skill instead of a memory);
+- a conflict (`cf:`) settled as "new rule": Claude composes the correction of the contradicted text in the conversation and it is written at once; without edits the claim goes back to the queue for the editor, as in the dashboard;
+- a suggested fix (`sg:`): Claude can make the fix as normal work, then `done` (outcome `fixed`), or `dismiss`.
+
+Every decision goes through the curator, so it lands in the ledger and is undoable. SessionStart tells the user when entries wait for them (with the notices, otherwise at most once a day): "N waiting for your decision: /ouroboros:inbox (or the dashboard)".
 
 ### 9.2 Metrics (definitions)
 
@@ -455,6 +471,7 @@ Visual system: warm neutrals with one blue accent (primary actions, selection, d
 | Judging learnings | One rubric everywhere; screen + editor must both agree before anything is written |
 | Changes to existing files | One changeset per file, composed with every pending learning; the model writes exact-fragment edits, code validates and applies them; re-applied to the current file on approval |
 | Additions vs corrections | Decided by code, not by the model's label: only a pure insertion is an addition; any rewrite is a correction and waits for the user, on both write paths |
+| Reviewing the inbox | Two equal ways over one module (`inbox.mjs`): the dashboard, and `/ouroboros:inbox` in the conversation, one entry at a time, where the user can discuss and edit before approving |
 | Evaluation model | Haiku by default (`judge_model`): on the synthetic suite Sonnet scored the same at about 15 times the cost; revisit when the suite tells them apart |
 
 ## 13. Phases
@@ -466,4 +483,5 @@ Visual system: warm neutrals with one blue accent (primary actions, selection, d
 | **3. Self-learning** | Periodic in-loop review, background review of the tail, notices, Value and Cost screens | Correction rate drops vs baseline with cost under the cap |
 | **4. Lifecycle and distribution** | Confidence/decay, automatic consolidation, merge on rediscovery, promotion, autonomy queue, dashboard actions (keep/undo/archive/approve/reject, token-protected), `excludeProjects`, CI (tests on Ubuntu + Windows, macOS on demand; `validate --strict`), README | Someone else installs it from scratch on Windows and macOS |
 | **v0.7 Evaluation** | Screen → ground → edit → validate; changesets per file with diffs in the dashboard; suggested fixes; skill reference files as owners; `eval.mjs` (synthetic + replay) | The same 60 real proposals give fewer, coherent changes, and the synthetic score holds |
+| **v0.9 Inbox in the conversation** | `/ouroboros:inbox`: list, show, preview, approve, reject, edit, resolve, done/dismiss; the dashboard uses the same module; SessionStart says when entries wait | Each kind of entry can be decided and edited in the conversation, with a regression test |
 | **v0.8 Mechanism review** | §7.3: insertion-only additions, one validator for both write paths, single-consumer evaluation queue, surgical profile writes, added-text secret check, line-level undo, one memory-dir resolver, ancestor CLAUDE.md files, long sessions in parts, budget guard on every call, notices per project, merges that must land; harder eval cases | 15/15 on the synthetic suite; every finding has a regression test |

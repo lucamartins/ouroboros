@@ -413,7 +413,7 @@ export function createApi(db) {
         dropped: count('dropped'),
         merged: count('merged'),
         rejectedByUser: count('rejected_by_user'),
-        suggested: count('suggested') + count('dismissed'),
+        suggested: count('suggested') + count('dismissed') + count('fixed'),
         duplicates: count('duplicate'),
         changes: db.prepare("SELECT status, COUNT(*) n FROM changesets WHERE created_at >= ? GROUP BY status").all(since),
         dropReasons,

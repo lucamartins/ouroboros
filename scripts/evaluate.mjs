@@ -456,7 +456,7 @@ export function noticeLines(results) {
     ...results.filter((r) => r.status === 'created').map((r) => `📝 learned: ${r.title}`),
     ...results.filter((r) => r.status === 'patched').map((r) => `📝 updated: ${r.title}`),
     ...results.filter((r) => r.status === 'queued').map((r) => `⏳ waiting for approval: ${r.title}`),
-    ...results.filter((r) => r.status === 'conflict').map((r) => `⚖ conflicts with a written rule, decide in the dashboard: ${r.title}`),
+    ...results.filter((r) => r.status === 'conflict').map((r) => `⚖ conflicts with a written rule, decide with /ouroboros:inbox or in the dashboard: ${r.title}`),
   ];
 }
 
