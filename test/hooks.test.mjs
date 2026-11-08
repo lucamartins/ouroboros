@@ -105,15 +105,21 @@ test('SessionEnd runs a background review that writes learnings and leaves a not
     return row.queue_state === 'done' && row;
   });
   assert.ok(s.review_cursor > 0);
-  assert.deepEqual(d.prepare('SELECT outcome FROM candidates ORDER BY id').all().map((r) => r.outcome), ['created', 'created']);
-  assert.equal(d.prepare('SELECT learned FROM reviews WHERE session_id = ?').get('s1').learned, 2);
+  // The project fact is written; the global one waits as a change to the global CLAUDE.md.
+  const rows = d.prepare('SELECT outcome, target, changeset_id FROM candidates ORDER BY id').all();
+  assert.deepEqual(rows.map((r) => r.outcome), ['created', 'queued']);
+  assert.equal(path.resolve(rows[1].target), path.join(tmp, 'claude', 'CLAUDE.md'));
+  assert.equal(d.prepare('SELECT status FROM changesets WHERE id = ?').get(rows[1].changeset_id).status, 'pending');
+  assert.equal(d.prepare('SELECT learned FROM reviews WHERE session_id = ?').get('s1').learned, 1);
   d.close();
   assert.ok(fs.existsSync(path.join(tmp, 'claude', 'projects', '-tmp-proj', 'memory', 'use-pnpm.md')));
-  assert.match(fs.readFileSync(path.join(tmp, 'ouroboros', 'user.md'), 'utf8'), /Hooks run under Git Bash on Windows/);
+  assert.equal(fs.existsSync(path.join(tmp, 'ouroboros', 'user.md')), false);
+  assert.doesNotMatch(fs.readFileSync(path.join(tmp, 'claude', 'CLAUDE.md'), 'utf8'), /Git Bash/);
 
   const first = JSON.parse(hook('SessionStart', { session_id: 's3', source: 'startup' }));
   assert.match(first.systemMessage, /📝 learned: Use pnpm/);
-  assert.match(first.hookSpecificOutput.additionalContext, /Hooks run under Git Bash on Windows/);
+  assert.match(first.systemMessage, /waiting for approval: CLAUDE\.md/);
+  assert.doesNotMatch(first.hookSpecificOutput.additionalContext, /Git Bash/);
   const second = JSON.parse(hook('SessionStart', { session_id: 's3b', source: 'startup' }));
   assert.equal(second.systemMessage, undefined);
 });
@@ -124,8 +130,9 @@ test('a repeated finding reinforces what was saved; the editor finds nothing new
   hook('UserPromptSubmit', { session_id: 's6' });
   hook('SessionEnd', { session_id: 's6', reason: 'other' });
   await waitFor(() => d.prepare("SELECT queue_state FROM sessions WHERE id = 's6'").get()?.queue_state === 'done');
-  const rows = d.prepare("SELECT kind, outcome, note FROM candidates WHERE session_id = 's6' ORDER BY id").all();
-  assert.deepEqual(rows.map((r) => r.outcome), ['duplicate', 'duplicate']);
+  // The global fact is already waiting for approval: merged into the waiting one.
+  const rows = d.prepare("SELECT kind, outcome, note FROM candidates WHERE session_id = 's6' AND outcome != 'queued' ORDER BY id").all();
+  assert.deepEqual(rows.map((r) => r.outcome), ['duplicate', 'merged']);
   assert.match(rows[0].note, /covered \[editor\]/);
   assert.ok(d.prepare("SELECT confidence FROM learnings WHERE path LIKE '%use-pnpm.md'").get().confidence > before);
   assert.equal(d.prepare("SELECT COUNT(*) n FROM reviews WHERE session_id = 's6' AND trigger = 'editor'").get().n, 1);

@@ -3,7 +3,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { claudeDir, memoryDirFor, ouroborosDir, projectKey } from './paths.mjs';
-import { profileForContext, readProfileText } from './profile.mjs';
 
 export function parseFrontmatter(text) {
   const m = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text);
@@ -182,20 +181,9 @@ export function listInstructionFiles(cwds = []) {
     .filter(Boolean);
 }
 
-export function userProfile() {
-  const file = path.join(ouroborosDir(), 'user.md');
-  const text = safeRead(file);
-  return text === null ? null : { file, chars: text.length };
-}
-
 /** Short text listing of what exists, for the reviewer prompt. */
 export function inventoryForPrompt(cwd) {
   const lines = [];
-  const profile = readProfileText();
-  if (profile) {
-    const ctx = profileForContext(profile);
-    if (ctx) lines.push('Global profile (user.md):', ctx);
-  }
   const mems = listMemoriesIn(memoryDirFor({ cwd })).filter((m) => !m.index);
   if (mems.length) {
     lines.push('Project memories:');

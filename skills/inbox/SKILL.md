@@ -21,7 +21,7 @@ node --no-warnings "${CLAUDE_PLUGIN_ROOT}/scripts/inbox.mjs" <command> --data "$
 
 Run `list` (add `--project "<current working directory>"` when `$ARGUMENTS` says "this project", and pass the same flag to every `show`; start at the given key when `$ARGUMENTS` is one). Tell the user in one or two lines how many entries wait and of which kinds, then start with the first. They can stop at any time; what is left keeps waiting.
 
-Keys: `cf:` a conflict with a written rule, `cs:` a change to an existing file (one per file, possibly several learnings), `it:` a new memory, skill or profile fact, `sg:` a fix the project could make once instead of learning a workaround.
+Keys: `cf:` a conflict with a written rule, `cs:` a change to an existing file (one per file, possibly several learnings), `it:` a new memory or skill, `sg:` a fix the project could make once instead of learning a workaround.
 
 ## 2. One entry at a time
 

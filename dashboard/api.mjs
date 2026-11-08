@@ -9,10 +9,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { changesetView, fileDisplayName, getChangeset } from '../scripts/changesets.mjs';
 import { getMeta, monthSpend, monthStart } from '../scripts/db.mjs';
-import { blockChars, parseProfile, readProfileText } from '../scripts/profile.mjs';
 import { loadSettings } from '../scripts/settings.mjs';
-import { listInstructionFiles, listMemories, listPluginSkills, listSkills, userProfile } from '../scripts/inventory.mjs';
-import { claudeDir, classifyPath, dataDir, home, normalize, ouroborosDir, projectKey, repoRoot } from '../scripts/paths.mjs';
+import { listInstructionFiles, listMemories, listPluginSkills, listSkills } from '../scripts/inventory.mjs';
+import { claudeDir, dataDir, home, normalize, ouroborosDir, projectKey, repoRoot } from '../scripts/paths.mjs';
 import { inboxCounts, sessionContext } from '../scripts/hook.mjs';
 import { inboxEntries } from '../scripts/inbox.mjs';
 import { buildGraph, focusGraph } from '../scripts/graph.mjs';
@@ -48,15 +47,6 @@ function writeView(w) {
   if (isLink) return null;
   if (name === 'MEMORY.md' && w.op !== 'consolidate') return null; // index lines mirror the memory itself
   if (normalize(w.file).includes('/.ouroboros/archive/')) return null;
-  if (classifyPath(w.file) === 'profile' && w.after !== null) {
-    // The profile is one file of many facts: show only the bullets this write changed.
-    const bullet = (l) => /^[-*]\s/.test(l);
-    const clean = (l) => l.replace(/\s*<!--.*?-->\s*$/, '');
-    const hunks = lineDiff(w.before ?? '', w.after)
-      .map((h) => ({ before: h.before.filter(bullet).map(clean), after: h.after.filter(bullet).map(clean), more: 0 }))
-      .filter((h) => h.before.length || h.after.length);
-    return { file: w.file, hunks };
-  }
   if (w.before === null) return { file: w.file, created: true, text: bodyOf(w.after).slice(0, 1500) };
   if (w.after === null) return { file: w.file, removed: true };
   const hunks = lineDiff(w.before, w.after).slice(0, MAX_HUNKS).map((h) => ({
@@ -92,7 +82,7 @@ function dayKey(ts) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
-/** Characters Ouroboros adds to every session's context (protocol + profile). */
+/** Characters Ouroboros adds to every session's context (the learning protocol). */
 function overheadChars() {
   try { return sessionContext().length; } catch { return null; }
 }
@@ -164,7 +154,7 @@ function listOf(db, { select, from, where = [], args = [], order, limit, offset 
   return { rows, total };
 }
 
-/** Sessions that used at least one learned memory or skill (profile facts are always in context). */
+/** Sessions that used at least one learned memory or skill. */
 const HITS_SQL = `
   SELECT e.session_id, MIN(e.ts) ts FROM events e
   JOIN learnings l ON l.status = 'active' AND l.origin_session IS NOT 'native' AND (
@@ -172,7 +162,7 @@ const HITS_SQL = `
     (e.kind = 'memory_read' AND lower(e.target) = lower(l.path)))
   WHERE e.ts >= ? GROUP BY e.session_id`;
 
-const GROUP_LABEL = { 'new:memory': 'New memories', 'new:skill': 'New skills', 'new:profile': 'New profile facts', fixes: 'Suggested fixes' };
+const GROUP_LABEL = { 'new:memory': 'New memories', 'new:skill': 'New skills', fixes: 'Suggested fixes' };
 
 export function createApi(db) {
   // ---------- projects ----------
@@ -334,7 +324,7 @@ export function createApi(db) {
     const idx = projects();
     const cwds = knownCwds(db);
     const reads = new Map();
-    for (const r of db.prepare("SELECT target, COUNT(*) n, MAX(ts) last FROM events WHERE kind IN ('memory_read','profile_read') GROUP BY target").all()) {
+    for (const r of db.prepare("SELECT target, COUNT(*) n, MAX(ts) last FROM events WHERE kind = 'memory_read' GROUP BY target").all()) {
       reads.set(normalize(r.target), r);
     }
     const uses = new Map();
@@ -425,7 +415,7 @@ export function createApi(db) {
       // A repository first seen here (a child repo's rule file) has no display name yet: its folder.
       const project_name = 'project_name' in m ? m.project_name
         : project_id ? idx.byId.get(project_id)?.name || path.basename(repoRoot(path.dirname(file)) || '') || project_id : null;
-      const label = m.label || (kind === 'profile' ? 'Profile (user.md)' : kind === 'instructions' ? tilde(file) : kind === 'rules' ? `rules/${path.basename(file)}` : undefined);
+      const label = m.label || (kind === 'instructions' ? tilde(file) : kind === 'rules' ? `rules/${path.basename(file)}` : undefined);
       items.push({ ...m, file, kind, label, project_id, project_name, learned: learned.has(id) });
     }
 
@@ -455,7 +445,7 @@ export function createApi(db) {
     const idx = projects();
     return inboxEntries(db).map((e) => {
       const pid = idx.idOf(e.project) || '';
-      const gkey = e.type === 'suggestion' ? 'fixes' : e.file ? `file:${normalize(e.file)}` : `new:${e.kind === 'profile' ? 'profile' : e.kind}`;
+      const gkey = e.type === 'suggestion' ? 'fixes' : e.file ? `file:${normalize(e.file)}` : `new:${e.kind}`;
       return { ...e, pid, gkey, gid: `${pid}|${gkey}` };
     }).filter((e) => (!project || e.pid === project) && (!group || e.gid === group));
   }
@@ -853,7 +843,7 @@ export function createApi(db) {
       const list = [...groups.values()].filter((g) => g.list.length);
       if (!order.length) list.sort((a, b) => b.list.length - a.list.length || a.label.localeCompare(b.label));
       return {
-        kind, total: rows.length, profile: userProfile(),
+        kind, total: rows.length,
         groups: list.map(({ list: l, ...g }) => ({ ...g, total: l.length, rows: l.slice(0, per) })),
       };
     },
@@ -925,12 +915,9 @@ export function createApi(db) {
       const queue = db.prepare('SELECT COALESCE(queue_state, \'none\') state, COUNT(*) n FROM sessions GROUP BY queue_state').all();
       const capture = db.prepare("SELECT MAX(ts) last, SUM(CASE WHEN ts >= ? THEN 1 ELSE 0 END) day FROM events").get(Date.now() - DAY);
       const settings = loadSettings();
-      const blocks = parseProfile(readProfileText() ?? '');
       const learnedSkills = db.prepare("SELECT COUNT(*) n FROM learnings WHERE kind = 'skill' AND status = 'active' AND origin_session IS NOT 'native'").get().n;
       return {
         budgets: {
-          userBlock: { used: blockChars(blocks.user), limit: settings.limits.userBlockChars, items: blocks.user.length },
-          environmentBlock: { used: blockChars(blocks.environment), limit: settings.limits.environmentBlockChars, items: blocks.environment.length },
           learnedSkills: { used: learnedSkills, limit: settings.limits.learnedSkills },
           memoryIndexLines: settings.limits.memoryIndexLines,
         },
@@ -938,7 +925,6 @@ export function createApi(db) {
         skillListing: { skills: skills.length, chars: listingChars, tokens: Math.round(listingChars / 4) },
         queue,
         capture: { lastEventAt: capture.last, eventsLast24h: capture.day || 0 },
-        profile: userProfile(),
         options: readOptions(),
       };
     },

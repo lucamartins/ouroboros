@@ -1,6 +1,6 @@
 ---
 name: forget
-description: Archive something Ouroboros learned (a profile fact, memory or skill) so it stops loading into sessions. Use when the user says a learning is wrong, outdated or unwanted.
+description: Archive something Ouroboros learned (a memory or skill it created) so it stops loading into sessions. Use when the user says a learning is wrong, outdated or unwanted.
 argument-hint: "<learning id, name or words from its title>"
 allowed-tools: Bash(node:*)
 ---

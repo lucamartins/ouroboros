@@ -500,23 +500,22 @@ th.num .sort { flex-direction: row-reverse; }
    One color per kind of item, readable on both themes; edges differ by stroke, not hue,
    except "used together" (the accent). */
 :root {
-  --k-skill: #2a78d6; --k-reference: #86b1e6; --k-memory: #13896b; --k-profile: #8250c8;
+  --k-skill: #2a78d6; --k-reference: #86b1e6; --k-memory: #13896b;
   --k-instructions: #bf7413; --k-rules: #b84a66; --k-project: #77756d;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --k-skill: #4b93ea; --k-reference: #5b82b3; --k-memory: #3dbd98; --k-profile: #a681e6;
+    --k-skill: #4b93ea; --k-reference: #5b82b3; --k-memory: #3dbd98;
     --k-instructions: #e3a243; --k-rules: #e07a95; --k-project: #8f8e86;
   }
 }
 :root[data-theme="dark"] {
-  --k-skill: #4b93ea; --k-reference: #5b82b3; --k-memory: #3dbd98; --k-profile: #a681e6;
+  --k-skill: #4b93ea; --k-reference: #5b82b3; --k-memory: #3dbd98;
   --k-instructions: #e3a243; --k-rules: #e07a95; --k-project: #8f8e86;
 }
 .k-skill { --k: var(--k-skill); }
 .k-reference { --k: var(--k-reference); }
 .k-memory { --k: var(--k-memory); }
-.k-profile { --k: var(--k-profile); }
 .k-instructions { --k: var(--k-instructions); }
 .k-rules { --k: var(--k-rules); }
 .k-project { --k: var(--k-project); }
@@ -560,8 +559,8 @@ line[class^="e-"] { stroke: var(--text-3); stroke-opacity: .45; stroke-width: 1;
   paint-order: stroke; stroke: var(--surface); stroke-width: calc(3px / var(--zoom, 1)); stroke-linejoin: round;
 }
 .graph .node.k-project text { display: block; font-size: calc(11.5px / var(--zoom, 1)); font-weight: 600; fill: var(--text); }
-/* Skills and the profile are few and named for what they do: always labelled. The rest on zoom. */
-.graph .node:is(.k-skill, .k-profile) text,
+/* Skills are few and named for what they do: always labelled. The rest on zoom. */
+.graph .node.k-skill text,
 .graph.zoomed .node:is(.k-memory, .k-instructions, .k-rules) text,
 .graph .node:is(.hot, .on, .match) text { display: block; }
 .graph line { transition: stroke-opacity .15s; }

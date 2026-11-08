@@ -1,5 +1,5 @@
 {
-  "description": "Ouroboros hooks: SessionStart injects the learning protocol and the global profile; the others record session activity for reviews and the dashboard. None of them blocks anything.",
+  "description": "Ouroboros hooks: SessionStart injects the learning protocol; the others record session activity for reviews and the dashboard. None of them blocks anything.",
   "hooks": {
     "SessionStart": [
       {

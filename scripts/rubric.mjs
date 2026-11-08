@@ -33,7 +33,7 @@ export const RULES = [
   {
     id: 'owner',
     test: 'Is it going where it belongs?',
-    fail: 'Prefer, in order: the skill, rule file or doc that already owns the topic (add to it); a project memory; a global profile fact only if it holds across projects. Never a second copy next to an owner.',
+    fail: 'Prefer, in order: the skill, rule file or doc that already owns the topic (add to it); a project memory; the global CLAUDE.md only if it holds across projects. Never a second copy next to an owner.',
   },
   {
     id: 'correct-stale',

@@ -117,8 +117,7 @@ export const LEARN_SCHEMA = {
         additionalProperties: false,
         required: ['kind', 'title', 'confidence', 'evidence'],
         properties: {
-          kind: { type: 'string', enum: ['profile', 'memory', 'skill'] },
-          block: { type: 'string', enum: ['user', 'environment'] },
+          kind: { type: 'string', enum: ['global', 'memory', 'skill'] },
           scope: { type: 'string', enum: ['global', 'project'] },
           memory_type: { type: 'string', enum: ['feedback', 'project', 'reference'] },
           title: { type: 'string' },
@@ -141,7 +140,7 @@ export function learnPrompt({ digest, inventory, part = null, lang = options().l
 1. "corrections": every user turn that pushes back on or redirects something the assistant did, said or assumed (explicit or implicit). Not corrections: new tasks, follow-ups, answers to questions, approvals, first-time standing instructions. Quote briefly with the USER # number.
 
 2. "items": what to save for future sessions (at most 5; an empty list is a good answer). Each item is written as-is, so make it ready to use:
-   - kind "profile": one short fact valid on every project. block "user" for who the user is and how they like to work; block "environment" for OS/shell/tool facts. Put the fact in "text" (one sentence).
+   - kind "global": one short fact valid on every project (who the user is, how they like to work, OS/shell/tool facts). Put the fact in "text" (one sentence); it is proposed as an addition to the user's global CLAUDE.md.
    - kind "memory": a fact about this project. memory_type "feedback" (how to work here), "project" (decision, convention) or "reference" (pointer to an external resource). Give "title", a one-line "description", and a "body" with the fact plus "**Why:**" and "**How to apply:**" lines.
    - kind "skill": a reusable procedure (multi-step workflow, the working path found after errors, an approach the user corrected). scope "global" if it works anywhere, "project" otherwise. Give "title", a "description" of at most 250 characters that says when to use it, and a "body" in Markdown with steps and pitfalls.
    - Keep an item only if it passes every rule of the rubric below. Proposing nothing is better than proposing noise; a later knowledge check drops what fails.
@@ -276,7 +275,7 @@ async function applyLearnings(db, session, reviewId, items, opts, { notify = tru
     INSERT INTO candidates (review_id, session_id, project, kind, scope, memory_type, title, summary, evidence, confidence, repeats, outcome, payload, cwd, quotes, ts)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`);
   for (const raw of items) {
-    const item = { op: 'create', ...raw, scope: raw.kind === 'profile' ? 'global' : raw.scope || 'project' };
+    const item = { op: 'create', ...raw, scope: raw.kind === 'global' ? 'global' : raw.scope || 'project' };
     insert.run(reviewId, session.id, session.project, item.kind, item.scope, item.memory_type ?? null,
       String(item.title || item.text || '').slice(0, 200), String(item.text || item.body || item.description || '').slice(0, 1500),
       String(item.evidence || '').slice(0, 800), item.confidence ?? null, item.repeats || null,

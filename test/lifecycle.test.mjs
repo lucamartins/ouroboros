@@ -26,7 +26,7 @@ before(async () => {
   for (const d of [cwdA, cwdB]) fs.mkdirSync(path.join(d, '.git'), { recursive: true });
   fs.mkdirSync(process.env.OUROBOROS_HOME, { recursive: true });
   fs.writeFileSync(path.join(process.env.OUROBOROS_HOME, 'config.json'), JSON.stringify({
-    limits: { userBlockChars: 160, learnedSkills: 4, consolidateAt: 0.8 },
+    limits: { learnedSkills: 4, consolidateAt: 0.8 },
     archiveAfterDaysUnused: 60,
     excludeProjects: ['**/secret-*'],
   }));
@@ -41,7 +41,7 @@ after(() => {
 
 test('autonomy: hybrid queues skills and tentative items; manual always writes; approve/reject', () => {
   const items = [
-    { kind: 'profile', block: 'user', text: 'Prefers small PRs', confidence: 0.8 },
+    { kind: 'memory', memory_type: 'project', title: 'Small PRs', description: 'This project prefers small PRs', confidence: 0.8 },
     { kind: 'memory', memory_type: 'project', title: 'Tentative fact', description: 'Maybe true', confidence: 0.4 },
     { kind: 'skill', scope: 'global', title: 'Bisect flaky tests', description: 'Find the commit that made a test flaky with git bisect. Use when a test started failing intermittently.', body: 'Steps', confidence: 0.9 },
   ];
@@ -67,31 +67,25 @@ test('autonomy: hybrid queues skills and tentative items; manual always writes; 
 });
 
 test('confirm raises confidence up to 0.9', () => {
-  const l = db.prepare("SELECT id, confidence FROM learnings WHERE kind = 'profile'").get();
+  const l = db.prepare("SELECT id, confidence FROM learnings WHERE title = 'Small PRs'").get();
   curator.confirm(db, l.id);
   curator.confirm(db, l.id);
   assert.equal(db.prepare('SELECT confidence FROM learnings WHERE id = ?').get(l.id).confidence, 0.9);
 });
 
-test('a way-of-working rule already saved in another project is promoted to the profile', () => {
+test('a way-of-working rule already saved in another project becomes a global fact', () => {
   const [a] = curator.apply(db, { cwd: cwdA, items: [{ kind: 'memory', memory_type: 'feedback', title: 'English names in code', description: 'Name folders, routes and files in English, never Portuguese' }] });
   assert.equal(a.status, 'created');
   assert.equal(a.kind, 'memory');
   const [b] = curator.apply(db, { cwd: cwdB, items: [{ kind: 'memory', memory_type: 'feedback', title: 'English names', description: 'Name folders, routes and files in English, never in Portuguese' }] });
-  assert.equal(b.status, 'created', b.reason);
-  assert.equal(b.kind, 'profile');
-  assert.match(b.note, /promoted/);
+  assert.equal(b.status, 'patched', b.reason);
+  assert.equal(b.kind, 'instructions');
+  assert.match(b.note, /global fact/);
+  assert.match(fs.readFileSync(path.join(tmp, 'claude', 'CLAUDE.md'), 'utf8'), /- Name folders, routes and files in English, never in Portuguese/);
 });
 
-test('maintenance consolidates a full profile block (undoable) and archives unused learnings', async () => {
+test('maintenance archives unused learnings', async () => {
   const { maintain } = await import('../scripts/maintenance.mjs');
-  curator.apply(db, { cwd: cwdA, items: [
-    { kind: 'profile', block: 'user', text: 'Talks to Claude in Portuguese', confidence: 0.8 },
-    { kind: 'profile', block: 'user', text: 'Wants files on disk in English', confidence: 0.8 },
-  ] });
-  const file = path.join(process.env.OUROBOROS_HOME, 'user.md');
-  const before = fs.readFileSync(file, 'utf8');
-
   // An old, never used, low-confidence memory decays.
   const [old] = curator.apply(db, { cwd: cwdA, items: [{ kind: 'memory', memory_type: 'project', title: 'Old trivia', description: 'Something nobody reads', confidence: 0.4 }] });
   db.prepare('UPDATE learnings SET created_at = ? WHERE id = ?').run(Date.now() - 90 * 86_400_000, old.id);
@@ -99,20 +93,9 @@ test('maintenance consolidates a full profile block (undoable) and archives unus
   const report = await maintain(db, { force: true });
   assert.equal(report.status, 'ok');
   assert.deepEqual(report.decayed, ['Old trivia']);
-  const user = report.consolidated.find((c) => c.block === 'user');
-  assert.equal(user.status, 'consolidated', user.reason);
-  assert.ok(user.after < user.before);
-  assert.notEqual(fs.readFileSync(file, 'utf8'), before);
   assert.equal(db.prepare("SELECT status FROM learnings WHERE id = ?").get(old.id).status, 'archived');
   assert.match(db.prepare('SELECT text FROM notices ORDER BY id DESC').get().text, /🧹/);
 
-  // Undo of the consolidation restores the block and reactivates merged facts.
-  const consolidateWrite = db.prepare("SELECT learning_id FROM writes WHERE op = 'consolidate' ORDER BY id DESC").get();
-  const u = curator.undo(db, { id: consolidateWrite.learning_id });
-  assert.equal(u.status, 'undone', u.reason);
-  assert.equal(fs.readFileSync(file, 'utf8'), before);
-  const ids = [...before.matchAll(/<!-- (lrn_[a-z0-9]+) -->/g)].map((m) => m[1]);
-  for (const id of ids) assert.equal(db.prepare('SELECT status FROM learnings WHERE id = ?').get(id).status, 'active');
 });
 
 test('learned skills past the budget are trimmed, weakest first', async () => {

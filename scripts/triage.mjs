@@ -54,8 +54,7 @@ export const TRIAGE_SCHEMA = {
             type: 'object',
             additionalProperties: false,
             properties: {
-              kind: { type: 'string', enum: ['profile', 'memory', 'skill'] },
-              block: { type: 'string', enum: ['user', 'environment'] },
+              kind: { type: 'string', enum: ['global', 'memory', 'skill'] },
               memory_type: { type: 'string', enum: ['feedback', 'project', 'reference'] },
               scope: { type: 'string', enum: ['global', 'project'] },
               title: { type: 'string' },
@@ -116,7 +115,7 @@ export function describe(p) {
 
 const KIND_LABEL = {
   skill: 'skill (owner)', rules: 'rule file (owner, needs approval)', instructions: 'CLAUDE.md (owner, needs approval)',
-  memory: 'memory (owner)', profile: 'global profile', source: 'SOURCE OF TRUTH (read-only)', rejected: 'REJECTED BEFORE by the user',
+  memory: 'memory (owner)', source: 'SOURCE OF TRUTH (read-only)', rejected: 'REJECTED BEFORE by the user',
 };
 
 export function triagePrompt({ batch, others, excerpts, owners, lang }) {
@@ -130,7 +129,7 @@ VERDICTS (set "rule" to the id of the rubric rule that decided it):
 - "merge" with merge_into: another proposal (in THIS BATCH or OTHER PROPOSALS) says the same thing in any language, kind or target. The one it merges into must not be dropped.
 - "route": the topic has an owner — a skill or one of its reference files, a rule file, a CLAUDE.md, or a memory (from OWNERS or EXCERPTS) — and the proposal may add to it or correct it. Set owner = the owner's full path (a reference file is its skill's folder + the listed relative path), claim = the knowledge as ONE self-contained statement (what is true or what to do, and the reason when the proposal gives one), section = the heading it belongs under when obvious. Choose the owner an assistant would read when the topic comes up. Do not try to judge whether the owner already says it in parts you cannot see: the editor checks the whole file. Prefer this over "keep" whenever an owner exists.
 - "fix": the proposal documents a workaround for something the project could fix once (a generated file not ignored, a broken script, a missing config line). Set fix = the change to make in the project, in one sentence. Nothing is learned.
-- "keep": worth saving as new and no owner fits. Give a rewrite that picks the right kind ("profile" = one sentence valid on every project in "text", block user/environment; "memory" = one project's fact with "description" and a "body" holding the fact plus "**Why:**" and "**How to apply:**"; "skill" = a reusable multi-step procedure with description ≤ 250 chars saying when to use it), uses a short human-readable title (never a slug), and removes details that will go stale.
+- "keep": worth saving as new and no owner fits. Give a rewrite that picks the right kind ("global" = one sentence valid on every project in "text", added to the user's global CLAUDE.md; "memory" = one project's fact with "description" and a "body" holding the fact plus "**Why:**" and "**How to apply:**"; "skill" = a reusable multi-step procedure with description ≤ 250 chars saying when to use it), uses a short human-readable title (never a slug), and removes details that will go stale.
 - Stale owners: whatever the verdict, if an excerpt shows a skill, rule, CLAUDE.md or memory that a SOURCE OF TRUTH contradicts on this proposal's topic, also set stale = { file: that file's path, claim: the corrected statement, source: the path of the SOURCE OF TRUTH excerpt that shows it }. Only a source-of-truth excerpt counts: a user preference, a session event or another doc is never a stale flag. This is how outdated documentation gets repaired.
 
 ${languageRule(lang)} Keep code identifiers, commands and file names as they are.
@@ -152,7 +151,7 @@ ${batch.map((p) => `<proposal id="${p.id}">\n${describe(p)}\n</proposal>`).join(
 export function dedupePrompt({ items, lang }) {
   return `These learnings are about to be saved for an AI coding assistant, as new notes or as changes to an existing file (→ owner). Find groups that state the same rule or fact (in any language, kind, wording or owner) and should be saved ONCE. Do not group items that merely share a topic but say different things.
 
-For each group: "keep" is the id to keep — when they go to different owners, the one whose owner an assistant would read when the topic comes up — and "merge" the ids folded into it. Give the combined "claim" (changes to an owner) or "title", "description" and "body" (new memories) or "text" (profile facts), with every detail of the group. Return an empty list if there are no duplicates. ${languageRule(lang)}
+For each group: "keep" is the id to keep — when they go to different owners, the one whose owner an assistant would read when the topic comes up — and "merge" the ids folded into it. Give the combined "claim" (changes to an owner) or "title", "description" and "body" (new memories) or "text" (global facts), with every detail of the group. Return an empty list if there are no duplicates. ${languageRule(lang)}
 
 ${items.map((i) => [`#${i.id} [${i.kind}${i.owner ? ` → ${i.owner}` : ''}] ${i.title}`, i.claim, i.description, i.text, i.body && String(i.body).slice(0, 600)].filter(Boolean).join('\n')).join('\n\n')}`;
 }
@@ -274,7 +273,7 @@ export function resolveMerges(verdicts, proposals) {
 export function rewriteItem(item, v) {
   const r = v?.rewrite || {};
   const next = { ...item };
-  for (const k of ['kind', 'block', 'memory_type', 'scope', 'title', 'description', 'text', 'body']) {
+  for (const k of ['kind', 'memory_type', 'scope', 'title', 'description', 'text', 'body']) {
     if (r[k] !== undefined && r[k] !== '') next[k] = r[k];
   }
   // A re-screened change to an owner that is now kept as new starts as a plain create.
@@ -283,13 +282,14 @@ export function rewriteItem(item, v) {
     if (!next.body && !next.text) next.body = next.append ?? next.new ?? next.claim ?? '';
     for (const k of ['target', 'targetKind', 'append', 'section', 'old', 'new', 'corrects']) delete next[k];
   }
-  if (next.kind === 'profile') {
+  if (next.kind === 'profile') next.kind = 'global';
+  if (next.kind === 'global') {
     next.scope = 'global';
     delete next.memory_type;
-    // A profile fact is its text; keep the title in step with it.
+    // A global fact is its text; keep the title in step with it.
     if (r.text) next.title = r.text.length > 90 ? `${r.text.slice(0, 87)}…` : r.text;
   }
-  if (next.kind !== 'profile') delete next.block;
+  delete next.block;
   return next;
 }
 

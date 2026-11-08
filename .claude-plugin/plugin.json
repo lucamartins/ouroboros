@@ -1,7 +1,7 @@
 {
   "name": "ouroboros",
   "displayName": "Ouroboros",
-  "version": "0.11.1",
+  "version": "0.12.0",
   "description": "Self-learning for Claude Code: reviews your sessions, turns what is worth keeping into memories and skills, and shows usage, value and cost on a local dashboard.",
   "author": {
     "name": "Luca Martins",
@@ -14,7 +14,7 @@
     "learning": {
       "type": "boolean",
       "title": "Learning",
-      "description": "Learn from sessions: inject the learning protocol and your global profile, run periodic reviews and let the background reviewer write. Off = measure only.",
+      "description": "Learn from sessions: inject the learning protocol, run periodic reviews and let the background reviewer write. Off = measure only.",
       "default": true
     },
     "autonomy": {
@@ -27,7 +27,7 @@
     "learning_language": {
       "type": "string",
       "title": "Language of learnings",
-      "description": "Language memories, profile facts and skills are written in. en: English (recommended: matches most repo conventions and works in every session). pt-BR: Brazilian Portuguese. auto: the language of the conversation.",
+      "description": "Language memories, skills and CLAUDE.md additions are written in. en: English (recommended: matches most repo conventions and works in every session). pt-BR: Brazilian Portuguese. auto: the language of the conversation.",
       "options": ["en", "pt-BR", "auto"],
       "default": "en"
     },

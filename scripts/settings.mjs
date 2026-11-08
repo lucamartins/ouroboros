@@ -6,8 +6,6 @@ import { home, normalize, ouroborosDir } from './paths.mjs';
 export const DEFAULT_SETTINGS = {
   routing: [],
   limits: {
-    userBlockChars: 1500,
-    environmentBlockChars: 2000,
     memoryIndexLines: 150,
     learnedSkills: 30,
     skillDescriptionChars: 250,

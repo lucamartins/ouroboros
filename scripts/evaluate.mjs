@@ -14,10 +14,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { options } from './config.mjs';
-import { apply as curatorApply } from './curator.mjs';
+import { apply as curatorApply, DUPLICATE_THRESHOLD, similarity } from './curator.mjs';
 import { applyChangeset, applyEdits, changesetNeedsApproval, claimsOf, getChangeset, pendingChangeset, saveChangeset } from './changesets.mjs';
 import { acquireLease, assertBudget, BudgetError, logError, releaseLease } from './db.mjs';
 import { buildIndex, groundIdentifiers, identifiersIn, knowledgeFiles, knowledgeKind, PATCHABLE, resolveOwner, tokenize } from './knowledge.mjs';
+import { ensureGlobalInstructions } from './paths.mjs';
 import { insertReview, runModel, usageOf } from './review-worker.mjs';
 import { rubricText } from './rubric.mjs';
 import { describe, noteFor, rewriteItem, triage } from './triage.mjs';
@@ -64,7 +65,7 @@ export const EDITOR_SCHEMA = {
 const KIND_DESC = {
   skill: 'a skill (a procedure the assistant loads when the task matches) or one of its reference files',
   rules: 'a project rule file (loaded when the assistant works on matching files)',
-  instructions: 'a CLAUDE.md (instructions loaded in every session of the project)',
+  instructions: 'a CLAUDE.md (instructions loaded in every session of the project; the one in the Claude config folder is loaded in every session of every project)',
   memory: 'a project memory note',
 };
 
@@ -324,6 +325,11 @@ export async function composeRoutes(db, routes, ctx) {
   return report;
 }
 
+/** A new fact valid on every project ("profile" is the kind used before v0.12). */
+function isGlobalFact(item) {
+  return item.op !== 'patch' && (['global', 'profile'].includes(item.kind) || (item.kind === 'memory' && item.scope === 'global'));
+}
+
 /**
  * Evaluate candidate rows (already recorded, with their proposal in `payload`).
  * ctx: { cwd, sessionId, sessionStartedAt, actor, autonomy, lang, model, payload }.
@@ -359,7 +365,7 @@ export async function evaluate(db, rows, ctx) {
       const owner = resolveOwner(v.stale.file, ctx.cwd);
       // Only a real source of truth (workflow, manifest, config) can flag a file as outdated.
       const source = staleSource(v.stale.source, ctx.cwd);
-      if (owner && source && PATCHABLE.has(knowledgeKind(owner)) && knowledgeKind(owner) !== 'profile') {
+      if (owner && source && PATCHABLE.has(knowledgeKind(owner))) {
         const r = db.prepare(`
           INSERT INTO candidates (review_id, session_id, project, kind, scope, title, summary, evidence, confidence, outcome, cwd, claim, target, payload, ts)
           VALUES (0, ?, ?, 'memory', 'project', ?, ?, ?, 0.7, 'queued', ?, ?, ?, ?, ?)`).run(
@@ -381,9 +387,7 @@ export async function evaluate(db, rows, ctx) {
       const owner = resolveOwner(v.owner, ctx.cwd);
       const kind = owner && knowledgeKind(owner);
       const claim = v.claim || describe(item);
-      if (owner && kind === 'profile') {
-        creates.push({ row, item: rewriteItem(item, { rewrite: { kind: 'profile', block: /user/i.test(v.section || '') ? 'user' : 'environment', text: claim } }) });
-      } else if (owner && PATCHABLE.has(kind)) {
+      if (owner && PATCHABLE.has(kind)) {
         report.routed++;
         db.prepare('UPDATE candidates SET claim = ?, target = ? WHERE id = ?').run(claim, owner, row.id);
         route(owner, { ...claimFrom({ ...row, claim }), title: row.title });
@@ -397,6 +401,23 @@ export async function evaluate(db, rows, ctx) {
 
   // New items go through the curator (dedupe, budgets, approval rules).
   for (const { row, item, note } of creates) {
+    if (isGlobalFact(item)) {
+      // A fact valid on every project belongs in the global CLAUDE.md: the editor places it.
+      const file = ensureGlobalInstructions();
+      const claim = [item.text, item.description, item.body].filter(Boolean).join('\n') || item.title;
+      // The same fact already waiting for that file (another session proposed it): keep one.
+      const pending = pendingChangeset(db, file);
+      const same = pending && claimsOf(db, pending.id).find((c) => c.id !== row.id && similarity(String(c.claim || c.summary || ''), claim) >= DUPLICATE_THRESHOLD);
+      if (same) {
+        report.merged++;
+        setOutcome(db, row.id, 'merged', `merged into #${same.id}: the same global fact is already waiting for approval`, { changeset_id: null });
+        db.prepare('UPDATE candidates SET confidence = MAX(COALESCE(confidence, 0), ?), session_id = ?, ts = ? WHERE id = ?').run(row.confidence ?? 0, row.session_id, Date.now(), same.id);
+        continue;
+      }
+      db.prepare('UPDATE candidates SET claim = ?, target = ? WHERE id = ?').run(claim, file, row.id);
+      route(file, { ...claimFrom({ ...row, claim }), title: row.title });
+      continue;
+    }
     if (item.op === 'patch') {
       // An unscreened change to a file: let the editor compose it.
       const owner = resolveOwner(item.target, ctx.cwd);
