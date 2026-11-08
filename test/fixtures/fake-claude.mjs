@@ -64,7 +64,7 @@ process.stdin.on('end', () => {
       items: [
         { kind: 'memory', memory_type: 'feedback', title: 'Use pnpm', description: 'This repo uses pnpm, not npm',
           body: 'Use pnpm.\n\n**Why:** lockfile.', confidence: 0.8, evidence: 'USER #2' },
-        { kind: 'profile', block: 'environment', title: 'Shell', text: 'Hooks run under Git Bash on Windows', confidence: 0.6, evidence: 'USER #1' },
+        { kind: 'global', title: 'Shell', text: 'Hooks run under Git Bash on Windows', confidence: 0.6, evidence: 'USER #1' },
       ],
     };
   } else {

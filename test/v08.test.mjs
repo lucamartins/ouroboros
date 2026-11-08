@@ -17,7 +17,7 @@ let dbApi;
 let curator;
 let cs;
 let ev;
-let profile;
+let migrate;
 let paths;
 let proj;
 
@@ -36,7 +36,7 @@ before(async () => {
   curator = await import('../scripts/curator.mjs');
   cs = await import('../scripts/changesets.mjs');
   ev = await import('../scripts/evaluate.mjs');
-  profile = await import('../scripts/profile.mjs');
+  migrate = await import('../scripts/migrate.mjs');
   paths = await import('../scripts/paths.mjs');
   db = dbApi.openDb();
 });
@@ -61,31 +61,30 @@ test('revertChange undoes one write and keeps later edits elsewhere in the file'
   assert.equal(revertChange(`top\n${a2}`, b2, a2), `top\n${b2}`);
 });
 
-test('profile writes are surgical: prose, other sections and long bullets survive', () => {
-  const file = profile.profileFile();
+test('the retired profile (user.md) becomes proposals for the global CLAUDE.md and moves to the archive', async () => {
+  const file = path.join(process.env.OUROBOROS_HOME, 'user.md');
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const original = [
-    '# Ouroboros profile', '', '## User', '', '- Prefers short answers', '  with examples when useful', '',
-    'A paragraph the user wrote.', '', '## My notes', '', '- keep this', '', '## Environment & lessons', '', '- Windows 11', '',
-  ].join('\n');
-  fs.writeFileSync(file, original);
-  const [r] = curator.apply(db, { items: [{ kind: 'profile', block: 'environment', text: 'Git Bash is the hook shell' }] });
-  assert.equal(r.status, 'created', r.reason);
-  let text = read(file);
-  for (const keep of ['A paragraph the user wrote.', '## My notes', '- keep this', '  with examples when useful']) assert.ok(text.includes(keep), keep);
-  assert.match(text, /- Windows 11\n- Git Bash is the hook shell <!-- lrn_/);
-  assert.equal(profile.parseProfile(text).user[0].text, 'Prefers short answers with examples when useful');
+  fs.writeFileSync(file, [
+    '# Ouroboros profile', '', '## User', '', '- Prefers short answers <!-- lrn_p1 -->', '  with examples when useful', '',
+    'A paragraph the user wrote.', '', '## Environment & lessons', '', '- Git Bash is the hook shell <!-- lrn_p2 -->', '',
+  ].join('\n'));
+  db.prepare("INSERT INTO learnings (id, kind, scope, block, name, title, path, confidence, status, created_at, updated_at) VALUES ('lrn_p1', 'profile', 'global', 'user', 'x', 'Prefers short answers', ?, 0.6, 'active', 0, 0)").run(file);
+  assert.deepEqual(migrate.profileBullets(fs.readFileSync(file, 'utf8')), ['Prefers short answers with examples when useful', 'Git Bash is the hook shell']);
 
-  const f = curator.forget(db, { match: r.id });
-  assert.equal(f.status, 'archived', f.reason);
-  text = read(file);
-  assert.ok(!text.includes('Git Bash'));
-  assert.ok(text.includes('A paragraph the user wrote.') && text.includes('- keep this'));
+  assert.equal(migrate.retireProfile(db), 2);
+  assert.equal(fs.existsSync(file), false);
+  assert.equal(fs.readdirSync(path.join(process.env.OUROBOROS_HOME, 'archive')).filter((f) => f.endsWith('-user.md')).length, 1);
+  assert.equal(db.prepare("SELECT status FROM learnings WHERE id = 'lrn_p1'").get().status, 'archived');
+  assert.equal(curator.forget(db, { match: 'lrn_p1' }).status, 'not_found');
+  const rows = db.prepare("SELECT id, kind, outcome FROM candidates WHERE session_id = 'migration'").all();
+  assert.deepEqual(rows.map((r) => [r.kind, r.outcome]), [['global', 'pending'], ['global', 'pending']]);
+  assert.equal(migrate.retireProfile(db), null, 'nothing to do the second time');
 
-  // Consolidation replaces the bullets of one block only.
-  const next = profile.profileWithBlock(text, 'user', [{ id: 'lrn_x1', text: 'Short answers, with examples' }]);
-  assert.match(next, /## User\n\n- Short answers, with examples <!-- lrn_x1 -->\n\nA paragraph the user wrote\./);
-  assert.ok(next.includes('- keep this') && next.includes('- Windows 11'));
+  // The evaluation routes them to the global CLAUDE.md (created if missing) for the editor.
+  await ev.drainQueue(db);
+  const global = path.join(tmp, 'claude', 'CLAUDE.md');
+  assert.ok(fs.existsSync(global));
+  for (const r of rows) assert.equal(path.resolve(db.prepare('SELECT target FROM candidates WHERE id = ?').get(r.id).target || ''), global);
 });
 
 test('one memory directory per repository: worktrees and subfolders share it; settings can move it', () => {

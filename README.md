@@ -2,7 +2,7 @@
 
 Self-learning for Claude Code. Ouroboros reviews your sessions, turns what is worth keeping into memories and skills, and shows on a local dashboard what it learned, how much that is used, and what it costs — in the spirit of Nous Research's Hermes Agent.
 
-> **Status: v0.8 — complete loop.** Each session starts with a short learning protocol and your global profile (`~/.ouroboros/user.md`). Every 10 turns (and right after a turn that worked through repeated failures) Claude briefly reviews the recent turns and saves what is worth keeping; when the session ends, a small isolated model call reviews whatever was not reviewed yet. Everything goes through one curator — deduplicated, routed, budgeted and undoable — and a daily maintenance pass archives what nobody uses and consolidates what grew too big. The local dashboard shows whether corrections are going down, what it costs, and lets you confirm, undo, archive or approve. See [DESIGN.md](DESIGN.md).
+> **Status: v0.8 — complete loop.** Each session starts with a short learning protocol. Every 10 turns (and right after a turn that worked through repeated failures) Claude briefly reviews the recent turns and saves what is worth keeping; when the session ends, a small isolated model call reviews whatever was not reviewed yet. Everything goes through one curator — deduplicated, routed, budgeted and undoable — and a daily maintenance pass archives what nobody uses and consolidates what grew too big. The local dashboard shows whether corrections are going down, what it costs, and lets you confirm, undo, archive or approve. See [DESIGN.md](DESIGN.md).
 
 ## Install
 
@@ -32,8 +32,7 @@ Everything else is automatic: capture hooks record turns, tool calls, error → 
 
 | Learning | Destination |
 |---|---|
-| Who you are, preferences valid everywhere | `~/.ouroboros/user.md` → User |
-| Cross-project facts (OS, shell, tool auth) | `~/.ouroboros/user.md` → Environment & lessons |
+| Who you are, preferences and facts valid on every project (OS, shell, tool auth) | an addition to your global `~/.claude/CLAUDE.md`, under the section it belongs to, after your approval |
 | Project facts and conventions | the project's auto-memory directory + `MEMORY.md` |
 | Reusable procedures | `~/.claude/skills/learned-*`, or project skills routed by `~/.ouroboros/config.json` |
 
@@ -50,9 +49,9 @@ Everything else is automatic: capture hooks record turns, tool calls, error → 
 - **Knowledge check, in two independent steps:** a *screen* drops what your CLAUDE.md files, `.claude/rules`, skills (and their reference files) and memories already say, merges duplicates (even when aimed at different files), turns workarounds for fixable problems into **suggested fixes**, and sends each learning to the file that owns its topic. Then an *editor* reads that whole file, with every learning pending for it and what the project's code says about the names they mention, and writes one coherent change: it skips what is covered, rejects what the code contradicts, corrects outdated lines, and hands learnings that contradict a written rule to you, in a *Conflicts* section, to say whether it is a new rule or the current one stands. Code validates every edit before it is applied or queued: exact fragments, frontmatter and headings intact, no secret in what it adds, and only a pure insertion counts as an addition. Any edit that rewrites existing text, even one word, is a correction and waits for you, whether the background editor or Claude in your session wrote it.
 - **One change per file:** pending changes to a file are always composed together, so two learnings never make conflicting edits. The dashboard shows each change as a diff with the learnings behind it; approving re-applies it to the current file, and removing one learning recomposes the rest. One process evaluates at a time (sessions that end together queue their proposals for it), so parallel sessions never overwrite each other's changes.
 - **Merge:** when a review finds something already saved, the editor folds in only what is new.
-- **Promotion:** a working rule saved in one project that shows up in another becomes a global profile fact.
-- **Daily maintenance:** archives Ouroboros memories and skills unused for 60 days (unless confident), consolidates profile blocks past 80% of their budget, and trims memory indexes and learned skills over budget. You see what it did at the next session start.
-- **Archive, never delete:** archived items move to `~/.ouroboros/archive/`; every change is undoable (`/ouroboros:undo` or the dashboard). If you edited the file since, undo reverts only the lines that change wrote and keeps your edits. Ouroboros only touches the bullets it manages in `~/.ouroboros/user.md`; anything else you write there stays.
+- **Promotion:** a working rule saved in one project that shows up in another becomes a proposed addition to your global CLAUDE.md.
+- **Daily maintenance:** archives Ouroboros memories and skills unused for 60 days (unless confident), and trims memory indexes and learned skills over budget. You see what it did at the next session start.
+- **Archive, never delete:** archived items move to `~/.ouroboros/archive/`; every change is undoable (`/ouroboros:undo` or the dashboard). If you edited the file since, undo reverts only the lines that change wrote and keeps your edits.
 
 `~/.ouroboros/config.json` also takes `excludeProjects` (globs, e.g. `["**/client-*"]`): Ouroboros does nothing at all in those directories.
 

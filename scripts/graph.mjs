@@ -1,5 +1,5 @@
 // The knowledge graph: what Claude knows as nodes (skills and their reference files,
-// memories, the profile, CLAUDE.md and rule files, projects) and how they relate.
+// memories, CLAUDE.md and rule files, projects) and how they relate.
 // Derived on demand from the files and the usage events; nothing new is stored.
 //
 // Edge types, from the strongest evidence to the weakest:
@@ -107,7 +107,7 @@ function cosine(a, b) {
 /**
  * Build the graph.
  *
- * `items`: [{ file, kind: skill|reference|memory|profile|instructions|rules, name?, label?,
+ * `items`: [{ file, kind: skill|reference|memory|instructions|rules, name?, label?,
  *   description?, scope?, project_id?, project_name?, uses?, lastUsed?, learned? }]
  * `usage`: [{ session, id }] — node ids used in each session (skills used, memories read)
  * `plugins`: 'used' keeps a plugin skill only when it was used or a non-plugin file

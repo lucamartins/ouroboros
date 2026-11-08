@@ -114,10 +114,10 @@ const MIGRATIONS = [
   `
   CREATE TABLE learnings (
     id             TEXT PRIMARY KEY,          -- lrn_<time><rand>
-    kind           TEXT NOT NULL,             -- memory | skill | profile
+    kind           TEXT NOT NULL,             -- memory | skill | instructions | rules (profile: retired in v0.12)
     scope          TEXT NOT NULL,             -- global | project
     memory_type    TEXT,
-    block          TEXT,                      -- profile block: user | environment
+    block          TEXT,                      -- retired profile block: user | environment
     project        TEXT,
     name           TEXT NOT NULL,
     title          TEXT NOT NULL,
@@ -197,7 +197,7 @@ const MIGRATIONS = [
   CREATE TABLE changesets (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     file        TEXT NOT NULL,                     -- the one knowledge file it changes
-    kind        TEXT NOT NULL,                     -- memory | skill | profile | rules | instructions
+    kind        TEXT NOT NULL,                     -- memory | skill | rules | instructions
     cwd         TEXT,
     project     TEXT,
     base_hash   TEXT NOT NULL,                     -- the file's content it was composed against

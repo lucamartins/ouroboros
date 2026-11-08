@@ -3,7 +3,7 @@
 // conversation, where Claude and the user can discuss and edit an item before deciding).
 //
 // Entry keys: "cf:<id>" a conflict with a written rule, "cs:<id>" a change to an existing
-// file (changeset), "it:<id>" a new item (memory, skill, profile fact), "sg:<id>" a fix the
+// file (changeset), "it:<id>" a new item (memory or skill), "sg:<id>" a fix the
 // project could make once (suggested instead of learning a workaround).
 import fs from 'node:fs';
 import os from 'node:os';
@@ -87,7 +87,6 @@ const TYPE_LABEL = { conflict: 'Conflict', change: 'Change', item: 'New', sugges
 function where(e) {
   if (e.file) return e.file;
   if (e.type === 'item') {
-    if (e.kind === 'profile') return `profile (${e.block || 'user'})`;
     return `${e.kind}${e.memory_type ? ` · ${e.memory_type}` : ''}${e.cwd ? ` · ${path.basename(e.cwd)}` : ''}`;
   }
   return e.cwd ? path.basename(e.cwd) : '';
@@ -193,7 +192,6 @@ export function describeFile(file) {
   const home = os.homedir().replace(/\\/g, '/').toLowerCase();
   const lower = f.toLowerCase();
   const repoOf = (marker) => path.posix.basename(f.slice(0, lower.lastIndexOf(marker)));
-  if (lower === `${home}/.ouroboros/user.md`) return 'your global profile (loaded in every session)';
   const skill = /\/skills\/([^/]+)\/(.+)$/i.exec(f);
   if (skill) {
     const global = lower.startsWith(`${home}/.claude/skills/`);
@@ -370,21 +368,18 @@ export function showEntry(db, key, { project } = {}) {
   const item = p.item || {};
   const projectDir = item.project_dir || item.projectDir || c.cwd;
   const lands = item.op === 'patch' && item.target ? `${shortPath(item.target)} — ${describeFile(item.target)}`
-    : item.kind === 'profile' ? `~/.ouroboros/user.md, block "${item.block || 'user'}" — your global profile (loaded in every session)`
-      : item.kind === 'skill' ? `a new ${item.scope === 'global' ? 'global ' : ''}skill${item.name ? ` "${item.name}"` : ''}${item.scope === 'global' ? '' : ` of project ${path.basename(projectDir || '')}`}`
-        : `a new ${item.memory_type ? `${item.memory_type} ` : ''}memory of project ${path.basename(projectDir || '')} (${shortPath(memoryDirFor({ cwd: projectDir }))})`;
-  const content = item.kind === 'profile'
-    ? [`+ ${item.text || c.title}`]
-    : [
-      item.name ? `name: ${item.name}` : null,
-      `title: ${item.title || c.title}`,
-      item.description ? `description: ${item.description}` : null,
-      item.body ? `\n${item.body}` : null,
-      item.append !== undefined ? `adds under "${item.section || '(end)'}":\n${item.append}` : null,
-      item.old !== undefined ? `replaces:\n${item.old}\nwith:\n${item.new ?? ''}` : null,
-    ].filter((l) => l !== null);
+    : item.kind === 'skill' ? `a new ${item.scope === 'global' ? 'global ' : ''}skill${item.name ? ` "${item.name}"` : ''}${item.scope === 'global' ? '' : ` of project ${path.basename(projectDir || '')}`}`
+      : `a new ${item.memory_type ? `${item.memory_type} ` : ''}memory of project ${path.basename(projectDir || '')} (${shortPath(memoryDirFor({ cwd: projectDir }))})`;
+  const content = [
+    item.name ? `name: ${item.name}` : null,
+    `title: ${item.title || c.title}`,
+    item.description ? `description: ${item.description}` : null,
+    item.body ? `\n${item.body}` : null,
+    item.append !== undefined ? `adds under "${item.section || '(end)'}":\n${item.append}` : null,
+    item.old !== undefined ? `replaces:\n${item.old}\nwith:\n${item.new ?? ''}` : null,
+  ].filter((l) => l !== null);
   const text = [
-    `${pos}${key} · New ${item.kind === 'profile' ? 'profile fact' : item.kind || c.kind}${item.memory_type ? ` (${item.memory_type})` : ''}`,
+    `${pos}${key} · New ${item.kind || c.kind}${item.memory_type ? ` (${item.memory_type})` : ''}`,
     `Lands in: ${lands}`,
     `From: ${originOf(c)}`,
     ...evidence,

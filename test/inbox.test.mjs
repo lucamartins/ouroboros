@@ -211,7 +211,7 @@ test('describeFile names what a knowledge file is', () => {
   assert.equal(inbox.describeFile(path.join(home, '.claude', 'skills', 'nisus-local', 'SKILL.md')), 'The global skill "nisus-local"');
   assert.match(inbox.describeFile(path.join(home, 'src', 'api', '.claude', 'rules', 'testing.md')), /rule file of project api/);
   assert.match(inbox.describeFile(path.join(home, 'src', 'api', 'CLAUDE.md')), /instructions of api/);
-  assert.match(inbox.describeFile(path.join(home, '.ouroboros', 'user.md')), /global profile/);
+  assert.match(inbox.describeFile(path.join(home, '.claude', 'CLAUDE.md')), /global instructions/i);
   assert.equal(inbox.shortPath(path.join(home, 'a', 'b.md')), '~/a/b.md');
 });
 

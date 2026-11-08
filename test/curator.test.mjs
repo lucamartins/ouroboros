@@ -30,7 +30,7 @@ beforeEach(() => {
   fs.mkdirSync(process.env.OUROBOROS_HOME, { recursive: true });
   fs.writeFileSync(path.join(process.env.OUROBOROS_HOME, 'config.json'), JSON.stringify({
     routing: [{ match: '**/routed-*', skillsDir: path.join(tmp, 'skills-repo'), linkInto: path.join(tmp, 'claude', 'skills') }],
-    limits: { userBlockChars: 200 },
+    limits: {},
   }));
 });
 
@@ -38,27 +38,36 @@ const apply = (items, extra = {}) => curator.apply(db, { cwd, items, ...extra })
 const memoryDir = () => path.join(tmp, 'claude', 'projects', cwd.replace(/[^a-zA-Z0-9]/g, '-'), 'memory');
 const read = (f) => fs.readFileSync(f, 'utf8');
 
-test('profile facts land in user.md blocks and are deduplicated', async () => {
-  const [r] = apply([{ kind: 'profile', block: 'user', text: 'Prefers concise answers in Portuguese' }]);
-  assert.equal(r.status, 'created');
-  const text = read(path.join(process.env.OUROBOROS_HOME, 'user.md'));
-  assert.match(text, /## User\n\n- Prefers concise answers in Portuguese <!-- lrn_/);
-  const [dup] = apply([{ kind: 'profile', block: 'user', text: 'prefers concise answers in portuguese!' }]);
+test('a global fact is an addition to the global CLAUDE.md, deduplicated against what it says', async () => {
+  const file = path.join(tmp, 'claude', 'CLAUDE.md');
+  fs.rmSync(file, { force: true });
+  const [r] = apply([{ kind: 'global', text: 'Prefers concise answers in Portuguese' }]);
+  assert.equal(r.status, 'patched', r.reason);
+  assert.equal(r.path, file);
+  assert.equal(read(file), '# Global instructions\n\n- Prefers concise answers in Portuguese\n');
+  const [dup] = apply([{ kind: 'global', text: 'prefers concise answers in portuguese!' }]);
   assert.equal(dup.status, 'duplicate');
+  // The old kind name still works, and "section" places the fact under its heading.
+  fs.writeFileSync(file, '# Me\n\n## Language\n\n- Portuguese in chat\n\n## Git\n\n- Small commits\n');
+  const [s] = apply([{ kind: 'profile', block: 'user', section: 'Language', text: 'Files on disk are in English' }]);
+  assert.equal(s.status, 'patched', s.reason);
+  assert.match(read(file), /## Language\n\n- Portuguese in chat\n- Files on disk are in English\n\n## Git/);
+  // Claude Code loads the file itself: the session context no longer repeats it.
   const { sessionContext } = await import('../scripts/hook.mjs');
-  const ctx = sessionContext();
-  assert.match(ctx, /- Prefers concise answers in Portuguese/);
-  assert.doesNotMatch(ctx, /lrn_/);
+  assert.doesNotMatch(sessionContext(), /Files on disk are in English/);
 });
 
-test('a global memory becomes a profile fact; profile budget is enforced', () => {
+test('a global memory becomes a global fact; proposed by Claude or the reviewer it waits for approval', () => {
+  const file = path.join(tmp, 'claude', 'CLAUDE.md');
+  fs.writeFileSync(file, '# Me\n');
   const [r] = apply([{ kind: 'memory', scope: 'global', memory_type: 'reference', title: 'gh is authenticated as lucamartins' }]);
-  assert.equal(r.status, 'created');
-  assert.equal(r.kind, 'profile');
-  assert.match(read(r.path), /## Environment & lessons\n\n- gh is authenticated as lucamartins/);
-  const long = 'x'.repeat(150);
-  const [over] = apply([{ kind: 'profile', block: 'user', text: `Long fact ${long}` }]);
-  assert.equal(over.status, 'over_budget');
+  assert.equal(r.status, 'patched', r.reason);
+  assert.equal(r.kind, 'instructions');
+  assert.match(read(file), /- gh is authenticated as lucamartins/);
+  const [q] = curator.apply(db, { cwd, items: [{ kind: 'global', text: 'Uses Windows with Git Bash for hooks', confidence: 0.9 }] }, { actor: 'background', autonomy: 'auto' });
+  assert.equal(q.status, 'queued', q.reason);
+  assert.ok(q.changesetId);
+  assert.doesNotMatch(read(file), /Git Bash/);
 });
 
 test('project memories go to the native memory dir with an index line', () => {
@@ -158,7 +167,7 @@ test('patching a native skill is allowed and does not count as a learned skill',
   assert.match(inv, /native-one/);
 });
 
-test('patch targets outside memories, skills and the profile are refused', () => {
+test('patch targets outside memories, skills, rules and CLAUDE.md files are refused', () => {
   const [r] = apply([{ op: 'patch', target: path.join(cwd, 'package.json'), old: 'a', new: 'b' }]);
   assert.equal(r.status, 'rejected');
 });

@@ -1,5 +1,5 @@
 // What Claude already knows for a project, as searchable chunks:
-//   - knowledge: memories, the global profile, CLAUDE.md files, .claude/rules, skill bodies
+//   - knowledge: memories, CLAUDE.md files (the global one included), .claude/rules, skill bodies
 //   - sources of truth: CI workflows, package manifests and deploy/runtime config
 //   - past rejections: proposals the user rejected or undid
 // Used to check proposals before anything is queued or written, and to find the
@@ -11,7 +11,6 @@ import { classifyPath, claudeDir, gitRoot, home, memoryDirFor } from './paths.mj
 
 export { gitRoot };
 import { parseFrontmatter } from './inventory.mjs';
-import { profileFile } from './profile.mjs';
 
 const MAX_CHILD_REPOS = 40;
 const CHUNK_TARGET = 900;
@@ -78,7 +77,7 @@ export function projectRoots(cwd) {
   return roots.slice(0, MAX_CHILD_REPOS + 1);
 }
 
-/** Kind of a knowledge file: profile | memory | skill | rules | instructions | source. */
+/** Kind of a knowledge file: memory | skill | rules | instructions | source. */
 export function knowledgeKind(file) {
   const cls = classifyPath(file);
   if (cls) return cls;
@@ -109,13 +108,12 @@ function skillFileName(file, data) {
 }
 
 /** Kinds Ouroboros may add to or correct (rules and instructions only with approval). */
-export const PATCHABLE = new Set(['memory', 'skill', 'profile', 'rules', 'instructions']);
+export const PATCHABLE = new Set(['memory', 'skill', 'rules', 'instructions']);
 
 export function knowledgeFiles(cwd) {
   const files = [];
   const add = (file) => { if (isFile(file) && !files.includes(file)) files.push(file); };
   add(path.join(claudeDir(), 'CLAUDE.md'));
-  add(profileFile());
   // Claude Code loads CLAUDE.md files from the working directory and every directory above it.
   for (let d = cwd ? path.resolve(cwd) : null; d; ) {
     add(path.join(d, 'CLAUDE.md'));

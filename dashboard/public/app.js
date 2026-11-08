@@ -145,7 +145,7 @@ function fileLabel(file) {
   return { dir: parts.slice(-2).join('/') + (parts.length ? '/' : ''), name };
 }
 
-const KIND_NAME = { skill: 'skill', rules: 'rule file', instructions: 'CLAUDE.md', memory: 'memory', profile: 'profile' };
+const KIND_NAME = { skill: 'skill', rules: 'rule file', instructions: 'CLAUDE.md', memory: 'memory', profile: 'profile (retired)' };
 
 /** Notes start with "adds to <path>: …" or "✎ corrects <path>: …"; keep the reason. */
 function reasonOf(note) {
@@ -748,7 +748,7 @@ function changeCard(c) {
 }
 
 function itemCard(q) {
-  const kind = q.kind === 'profile' ? `profile · ${q.block || ''}` : q.memory_type ? `${q.kind} · ${q.memory_type}` : q.kind;
+  const kind = q.memory_type ? `${q.kind} · ${q.memory_type}` : q.kind;
   return h('article', { class: 'item', 'data-entry': q.key },
     itemTitle(q.title || q.target || '(untitled)'),
     h('div', { class: 'item-meta' },
@@ -833,7 +833,7 @@ async function renderInbox() {
   const legend = keyed(disclose('What each kind of entry means', h('dl', { class: 'legend' },
     h('dt', {}, 'Conflict'), h('dd', {}, 'Contradicts a rule already written, or another learning, and nothing in the project settles which is right. Nothing was written.'),
     h('dt', {}, 'Change to a file'), h('dd', {}, 'Every learning for one file gathered into one edit, shown as a diff. Approving applies it to the current file; Undo in Knowledge reverts it.'),
-    h('dt', {}, 'New item'), h('dd', {}, 'A new memory, skill or profile fact. No existing file owned its topic.'),
+    h('dt', {}, 'New item'), h('dd', {}, 'A new memory or skill. No existing file owned its topic.'),
     h('dt', {}, 'Suggested fix'), h('dd', {}, 'A workaround the project could remove with one change. It is not learned; fix it, or learn it anyway.'))), 'inbox:legend');
 
   const strip = data.projects.length > 1 ? h('nav', { class: 'summary-strip', 'aria-label': 'Projects in the inbox' }, data.projects.map((p) =>
@@ -866,7 +866,7 @@ async function renderOverview() {
   const [o, v, recentData] = await overviewData();
   state.overviewSig = JSON.stringify([o, v, recentData].map((x) => (failed(x) ? String(x) : x)));
   if (failed(o)) throw o;
-  const learnedTotal = (o.learned.memory || 0) + (o.learned.skill || 0) + (o.learned.profile || 0);
+  const learnedTotal = (o.learned.memory || 0) + (o.learned.skill || 0);
   const waiting = inboxTotal();
 
   const banner = waiting ? h('div', { class: 'banner' },
@@ -897,7 +897,7 @@ async function renderOverview() {
             h('span', { class: `dot ${tone}` }), `${delta > 0 ? '+' : ''}${delta.toFixed(1)}`, enough ? null : h('span', { class: 'delta-note' }, 'small sample')) : null),
         h('p', { class: 'sentence' }, text)),
       h('div', { class: 'stats' },
-        stat('Learned', fmt.int(learnedTotal), `${o.learned.profile || 0} profile · ${o.learned.memory || 0} memories · ${o.learned.skill || 0} skills${o.learned.patchedNative ? ` · ${o.learned.patchedNative} refined` : ''}`),
+        stat('Learned', fmt.int(learnedTotal), `${o.learned.memory || 0} memories · ${o.learned.skill || 0} skills${o.learned.patchedNative ? ` · ${o.learned.patchedNative} refined` : ''}`),
         stat('Sessions using a learning', v.sessions ? fmt.pct((v.hits / v.sessions) * 100) : '—', `${fmt.int(v.hits)} of ${fmt.plural(v.sessions, 'session')}`),
         stat('Misses', fmt.int(o.misses), `times you repeated something already saved, in the last ${o.days} days`),
         h('div', { class: 'stat' },
@@ -957,7 +957,7 @@ function changeKind(c) {
   const l = c.learning;
   const fixes = c.files.some((f) => (f.hunks || []).some((hk) => hk.before.length));
   if (c.op === 'consolidate') return 'Consolidation';
-  if (c.op === 'create') return l?.kind === 'profile' ? `Profile fact · ${l.block}` : l?.kind === 'skill' ? 'New skill' : `New memory${l?.memory_type ? ` · ${l.memory_type}` : ''}`;
+  if (c.op === 'create') return l?.kind === 'profile' ? 'Profile fact (retired)' : l?.kind === 'skill' ? 'New skill' : `New memory${l?.memory_type ? ` · ${l.memory_type}` : ''}`;
   return `${fixes ? 'Correction' : 'Addition'} to ${KIND_NAME[l?.kind] || 'a file'}`;
 }
 
@@ -1112,10 +1112,10 @@ async function inventoryList(kind, q, project) {
 
 // ---------- Knowledge › Graph ----------
 const GRAPH_KINDS = [
-  ['skill', 'Skills'], ['reference', 'Reference files'], ['memory', 'Memories'], ['profile', 'Profile'],
+  ['skill', 'Skills'], ['reference', 'Reference files'], ['memory', 'Memories'],
   ['instructions', 'CLAUDE.md'], ['rules', 'Rule files'], ['project', 'Projects'],
 ];
-const GRAPH_KIND_ONE = { skill: 'skill', reference: 'reference file', memory: 'memory', profile: 'profile', instructions: 'CLAUDE.md', rules: 'rule file', project: 'project' };
+const GRAPH_KIND_ONE = { skill: 'skill', reference: 'reference file', memory: 'memory', instructions: 'CLAUDE.md', rules: 'rule file', project: 'project' };
 const GRAPH_EDGES = [
   ['link', 'Links', 'An explicit [[link]] or markdown link between two files'],
   ['mention', 'Mentions', 'A file names a skill'],
@@ -1135,7 +1135,7 @@ const ZOOM_MAX = 4;
 /** Above this zoom every skill and memory shows its name, not only hubs and the focused ones. */
 const ZOOM_LABELS = 1.5;
 /** Kinds always drawn with their name (the rest on zoom); the layout keeps room for it. */
-const GRAPH_LABELLED = new Set(['project', 'skill', 'profile']);
+const GRAPH_LABELLED = new Set(['project', 'skill']);
 /** Rest length and stiffness of each kind of connection in the layout. */
 const GRAPH_LINK = {
   belongs: { dist: 80, k: 0.25 },
@@ -1150,7 +1150,7 @@ const listParam = (k) => new Set(param(k).split(',').filter(Boolean));
 
 function nodeRadius(n) {
   if (n.kind === 'project') return 13;
-  const base = { skill: 8, reference: 4.5, memory: 7, profile: 8.5, instructions: 7.5, rules: 5.5 }[n.kind] || 6;
+  const base = { skill: 8, reference: 4.5, memory: 7, instructions: 7.5, rules: 5.5 }[n.kind] || 6;
   return Math.min(base + Math.sqrt(n.uses || 0) * 1.1 + Math.min(n.degree || 0, 12) * 0.2, 19);
 }
 
@@ -1775,8 +1775,6 @@ async function renderSystem() {
       h('div', { class: 'panel pad' },
         h('h3', {}, 'Always in context'),
         budgetRow('Skill listing', hl.skillListing.tokens, LISTING_REF, 'tokens'),
-        budgetRow('Profile · User', hl.budgets.userBlock.used, hl.budgets.userBlock.limit, 'chars'),
-        budgetRow('Profile · Environment & lessons', hl.budgets.environmentBlock.used, hl.budgets.environmentBlock.limit, 'chars'),
         budgetRow('Learned skills', hl.budgets.learnedSkills.used, hl.budgets.learnedSkills.limit, 'skills'),
         h('p', { class: 'small faint panel-note' }, `Skill listing: ${hl.skillListing.skills} skills Claude can invoke (plugin skills not counted); ~2,000 tokens is 1% of a 200K context. Limits live in ~/.ouroboros/config.json; past 80%, Ouroboros consolidates.`)),
       h('div', { class: 'panel pad' },

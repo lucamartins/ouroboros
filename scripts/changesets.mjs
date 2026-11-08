@@ -155,7 +155,7 @@ export function changesetNeedsApproval(db, cs, actor, autonomy) {
   const claims = claimsOf(db, cs.id);
   const confidence = claims.length ? Math.min(...claims.map((c) => c.confidence ?? 0.6)) : 0.6;
   const kind = knowledgeKind(cs.file);
-  return needsApproval({ op: 'patch', target: cs.file, kind: kind === 'skill' ? 'skill' : kind === 'profile' ? 'profile' : 'memory', corrects: !!cs.corrects, confidence }, actor, autonomy);
+  return needsApproval({ op: 'patch', target: cs.file, kind: kind === 'skill' ? 'skill' : 'memory', corrects: !!cs.corrects, confidence }, actor, autonomy);
 }
 
 /**

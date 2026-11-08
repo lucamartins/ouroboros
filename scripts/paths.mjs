@@ -9,7 +9,27 @@ export function claudeDir() {
   return process.env.CLAUDE_CONFIG_DIR || path.join(home, '.claude');
 }
 
-/** User-level Ouroboros directory (user.md, config.json, archive). */
+/** The user's global instructions, loaded by Claude Code in every session. */
+export function globalInstructionsFile() {
+  return path.join(claudeDir(), 'CLAUDE.md');
+}
+
+/**
+ * The global CLAUDE.md, created with a title when the user has none (or an empty one):
+ * edits to a file are anchored on text it already holds.
+ */
+export function ensureGlobalInstructions() {
+  const file = globalInstructionsFile();
+  let text = null;
+  try { text = fs.readFileSync(file, 'utf8'); } catch { /* missing */ }
+  if (text === null || !text.trim()) {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '# Global instructions\n');
+  }
+  return file;
+}
+
+/** User-level Ouroboros directory (config.json, archive). */
 export function ouroborosDir() {
   return process.env.OUROBOROS_HOME || path.join(home, '.ouroboros');
 }
@@ -103,11 +123,10 @@ const MEMORY_RE = /\/projects\/[^/]+\/memory\/[^/]+\.md$/;
 const SKILL_RE = /\/skills\/[^/]+\/skill\.md$/i;
 const CLAUDE_MD_RE = /(^|\/)(claude|claude\.local)\.md$/i;
 
-/** Classify a file path touched by a tool: memory, user profile, skill, instructions or null. */
+/** Classify a file path touched by a tool: memory, skill, instructions or null. */
 export function classifyPath(filePath) {
   const p = normalize(filePath);
   if (!p) return null;
-  if (p.startsWith(normalize(ouroborosDir()) + '/') && p.endsWith('.md')) return 'profile';
   if (MEMORY_RE.test(p)) return 'memory';
   const custom = settingsValue(path.join(claudeDir(), 'settings.json'), 'autoMemoryDirectory');
   if (typeof custom === 'string' && custom.trim() && p.endsWith('.md') && p.startsWith(`${normalize(path.resolve(expandTilde(custom.trim())))}/`)) return 'memory';

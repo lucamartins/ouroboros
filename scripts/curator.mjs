@@ -12,12 +12,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { options } from './config.mjs';
-import { applyChangeset, applyEdits, claimsOf, queueEdit, rejectChangeset } from './changesets.mjs';
+import { applyChangeset, applyEdits, claimsOf, pendingChangeset, queueEdit, rejectChangeset } from './changesets.mjs';
 import { getMeta, logError, openDb, setMetaOnce } from './db.mjs';
 import { listMemories, listMemoriesIn, listSkills, parseFrontmatter } from './inventory.mjs';
 import { knowledgeKind, PATCHABLE } from './knowledge.mjs';
-import { claudeDir, classifyPath, gitRoot, memoryDirFor, normalize, ouroborosDir, projectKey } from './paths.mjs';
-import { BLOCKS, blockChars, parseProfile, profileFile, profileReplaceBullet, profileWithBlock, profileWithBullet, profileWithoutBullet } from './profile.mjs';
+import { claudeDir, classifyPath, ensureGlobalInstructions, gitRoot, memoryDirFor, normalize, ouroborosDir, projectKey } from './paths.mjs';
 import { ensureSettingsFile, expandHome, loadSettings, routeFor } from './settings.mjs';
 import { addedText, isInsertion, revertChange } from './textdiff.mjs';
 
@@ -50,7 +49,7 @@ export function similarity(a, b) {
   return inter / (A.size + B.size - inter);
 }
 
-const DUPLICATE_THRESHOLD = 0.6;
+export const DUPLICATE_THRESHOLD = 0.6;
 
 const SECRET_RE = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
@@ -240,21 +239,56 @@ function setDescription(text, description) {
 function normalizeItem(raw, payload) {
   const item = { ...raw };
   item.op = item.op === 'patch' ? 'patch' : 'create';
-  item.kind = ['memory', 'skill', 'profile'].includes(item.kind) ? item.kind : 'memory';
+  // "profile" is the kind used before global facts moved to the global CLAUDE.md.
+  item.kind = ['memory', 'skill', 'global'].includes(item.kind) ? item.kind : item.kind === 'profile' ? 'global' : 'memory';
   item.scope = item.scope === 'global' ? 'global' : 'project';
   item.confidence = Math.min(0.9, Math.max(0.3, Number(item.confidence) || 0.6));
   item.trigger = payload.trigger || 'manual';
   item.projectDir = item.project_dir || payload.cwd || process.cwd();
-  // A global fact lives in the profile; user/feedback facts go to the User block.
-  if (item.kind === 'memory' && item.scope === 'global') {
-    item.kind = 'profile';
-    item.block = item.block || (['user', 'feedback'].includes(item.memory_type) ? 'user' : 'environment');
-  }
-  if (item.kind === 'profile') {
-    item.scope = 'global';
-    item.block = item.block === 'user' ? 'user' : 'environment';
-  }
+  if (item.kind === 'memory' && item.scope === 'global') item.kind = 'global';
+  if (item.kind === 'global') return item.op === 'create' ? globalFact(item) : { ...item, kind: 'instructions', scope: 'global' };
   return item;
+}
+
+/**
+ * A fact valid on every project is an addition to the user's global CLAUDE.md, which
+ * Claude Code loads in every session: at the end of `section` when given, else at the
+ * end of the file. Like any change to a CLAUDE.md it waits for the user, unless the
+ * user asked for it.
+ */
+function globalFact(item) {
+  const text = String(item.text || item.append || item.body || item.description || item.title || '').replace(/\s+/g, ' ').trim();
+  const file = ensureGlobalInstructions();
+  return {
+    ...item, op: 'patch', kind: 'instructions', scope: 'global', target: file, section: item.section || '',
+    append: text && !/^[-*]\s/.test(text) ? `- ${text}` : text, title: item.title || text.slice(0, 120), globalFact: text,
+  };
+}
+
+/** The lines of a markdown file that state something (bullets and prose), for duplicate checks. */
+function statements(text) {
+  return String(text || '').split(/\r?\n/)
+    .map((l) => l.replace(/^\s*(?:[-*]|\d+\.)\s+/, '').trim())
+    .filter((l) => l.length > 15 && !/^(#|<!--|```|\|)/.test(l))
+    .map((l) => ({ text: l }));
+}
+
+/**
+ * The same way-of-working rule already saved in another project is really a global
+ * preference: it becomes a global fact instead of a copy project by project.
+ */
+function promoteToGlobal(item, payload) {
+  if (item.op !== 'create' || item.kind !== 'memory' || !['feedback', 'user'].includes(item.memory_type)) return item;
+  const title = String(item.title || '').trim();
+  const description = String(item.description || title).replace(/\s+/g, ' ').trim();
+  const dir = memoryDirFor({ memoryDir: payload.memory_dir, cwd: item.projectDir });
+  const probe = `${slug(item.name || title)} ${title} ${description}`;
+  const here = listMemoriesIn(dir).filter((m) => !m.index);
+  if (findSimilar(here.map((m) => ({ text: `${m.name} ${m.description}` })), probe)) return item;
+  const elsewhere = findSimilar(listMemories().filter((m) => !m.index && normalize(path.dirname(m.file)) !== normalize(dir))
+    .map((m) => ({ text: `${m.name} ${m.description}`, project: m.project })), probe);
+  if (!elsewhere) return item;
+  return { ...globalFact({ ...item, kind: 'global', text: description }), promoted: elsewhere.project };
 }
 
 function skillsInScope(item, settings) {
@@ -307,29 +341,6 @@ function learningForPath(db, file) {
   return db.prepare("SELECT * FROM learnings WHERE lower(path) = lower(?) AND status = 'active' ORDER BY updated_at DESC").get(file);
 }
 
-function createProfile(db, batch, item, settings) {
-  const text = String(item.text || item.body || item.title || '').replace(/\s+/g, ' ').trim();
-  if (!text) return { status: 'rejected', reason: 'empty profile fact' };
-  const file = profileFile();
-  const current = readOrNull(file) ?? '';
-  const blocks = parseProfile(current);
-  const dup = findSimilar([...blocks.user, ...blocks.environment].map((b) => ({ ...b, text: b.text })), text);
-  if (dup) return { status: 'duplicate', target: dup.id || dup.text, existing: dup.text, reason: 'a similar fact is already in the profile; patch it instead' };
-  const limit = item.block === 'user' ? settings.limits.userBlockChars : settings.limits.environmentBlockChars;
-  const used = blockChars(blocks[item.block]) + text.length + 3;
-  if (used > limit) {
-    return {
-      status: 'over_budget',
-      reason: `profile block "${BLOCKS[item.block]}" would use ${used}/${limit} chars; merge or shorten bullets (patch) or forget one, then retry`,
-      items: blocks[item.block],
-    };
-  }
-  const id = newId();
-  batch.write(file, profileWithBullet(current, item.block, { id, text }), { learningId: id, op: 'create' });
-  upsertLearning(db, { id, kind: 'profile', scope: 'global', block: item.block, name: slug(text, 40), title: text.slice(0, 120), path: file, confidence: item.confidence, trigger: item.trigger });
-  return { status: 'created', id, kind: 'profile', path: file, title: text, warning: budgetWarning(used, limit, settings, `profile block "${BLOCKS[item.block]}"`) };
-}
-
 function createMemory(db, batch, item, settings, payload) {
   const title = String(item.title || '').trim();
   const description = String(item.description || title).replace(/\s+/g, ' ').trim();
@@ -342,23 +353,10 @@ function createMemory(db, batch, item, settings, payload) {
   const indexFile = path.join(dir, 'MEMORY.md');
 
   const existing = listMemoriesIn(dir).filter((m) => !m.index);
-  const all = [...existing, ...listMemories().filter((m) => !m.index && normalize(path.dirname(m.file)) !== normalize(dir))];
   if (fs.existsSync(file)) return { status: 'duplicate', target: file, reason: `a memory named "${name}" already exists; patch it instead` };
   const probe = `${name} ${title} ${description}`;
   const dup = findSimilar(existing.map((m) => ({ text: `${m.name} ${m.description}`, file: m.file, name: m.name })), probe);
   if (dup) return { status: 'duplicate', target: dup.file, existing: dup.text, reason: 'a similar memory exists; patch it instead' };
-
-  // The same way-of-working rule in another project is really a global preference:
-  // promote it to the profile instead of copying it project by project.
-  if (['feedback', 'user'].includes(type)) {
-    const elsewhere = findSimilar(all.filter((m) => !existing.includes(m)).map((m) => ({ text: `${m.name} ${m.description}`, file: m.file, project: m.project })), probe);
-    if (elsewhere) {
-      const promoted = createProfile(db, batch, { ...item, kind: 'profile', block: 'user', text: description }, settings);
-      return promoted.status === 'created'
-        ? { ...promoted, note: `promoted to the profile: project ${elsewhere.project} already has a similar memory` }
-        : promoted;
-    }
-  }
 
   const indexText = readOrNull(indexFile);
   const entries = countIndexEntries(indexText) + 1;
@@ -409,7 +407,7 @@ function createSkill(db, batch, item, settings) {
   return { status: 'created', id, kind: 'skill', path: file, title, warning: budgetWarning(active + 1, settings.limits.learnedSkills, settings, 'learned skills') };
 }
 
-/** Resolve the file a patch targets: learning id, a memory/skill/profile path, or a name. */
+/** Resolve the file a patch targets: learning id, a knowledge file path, or a name. */
 function resolvePatchTarget(db, item, settings, payload) {
   const target = String(item.target || '').trim();
   if (!target) return null;
@@ -420,10 +418,9 @@ function resolvePatchTarget(db, item, settings, payload) {
   if (path.isAbsolute(expandHome(target))) {
     const file = path.resolve(expandHome(target));
     const kind = knowledgeKind(file);
-    if (!PATCHABLE.has(kind)) return { error: 'only memory, skill, profile, rule and CLAUDE.md files can be patched' };
+    if (!PATCHABLE.has(kind)) return { error: 'only memory, skill, rule and CLAUDE.md files can be patched' };
     return { file, kind };
   }
-  if (item.kind === 'profile') return { file: profileFile(), kind: 'profile' };
   if (item.kind === 'skill') {
     const s = skillsInScope(item, settings).find((x) => x.name === target || x.name === `learned-${target}`);
     return s ? { file: s.file, kind: 'skill' } : null;
@@ -466,7 +463,9 @@ export function appendToSection(text, section, addition) {
   }
   while (end > start + 1 && end > 0 && !lines[end - 1].trim()) end--;
   const block = bullet !== null && !/^\s*[-*]\s/.test(add) ? `${bullet}- ${add}` : add;
-  const insert = start < 0 && lines[lines.length - 1] !== '' ? ['', block] : [block];
+  // A blank line after a heading (and before text added at the end of a file without a final newline).
+  const prev = end > 0 ? lines[end - 1] : '';
+  const insert = /^#{1,6}\s/.test(prev) || (start < 0 && lines[lines.length - 1] !== '') ? ['', block] : [block];
   lines.splice(end, 0, ...insert);
   return lines.join(eol);
 }
@@ -478,21 +477,9 @@ function patchItem(db, batch, item, settings, payload) {
   const before = readOrNull(t.file);
   if (before === null) return { status: 'rejected', reason: `file not found: ${t.file}` };
 
-  if (t.kind === 'profile') {
-    const blocks = parseProfile(before);
-    const all = [...blocks.user.map((b) => ['user', b]), ...blocks.environment.map((b) => ['environment', b])];
-    const hit = all.find(([, b]) => (t.learning && b.id === t.learning.id) || b.id === item.target || (item.old && b.text.includes(item.old)));
-    if (!hit) return { status: 'rejected', reason: 'profile bullet not found (give its id or an exact "old" fragment)' };
-    const [blockKey, bullet] = hit;
-    const nextText = item.old && bullet.text.includes(item.old) ? bullet.text.replace(item.old, item.new ?? '') : String(item.new ?? item.text ?? '').trim();
-    if (!nextText) return { status: 'rejected', reason: 'patch would leave an empty bullet; use forget instead' };
-    const limit = blockKey === 'user' ? settings.limits.userBlockChars : settings.limits.environmentBlockChars;
-    const used = blockChars(blocks[blockKey]) - bullet.text.length + nextText.length;
-    if (used > limit) return { status: 'over_budget', reason: `profile block would use ${used}/${limit} chars` };
-    const id = bullet.id || newId();
-    batch.write(t.file, profileReplaceBullet(before, bullet, { id, text: nextText }), { learningId: id, op: 'patch' });
-    upsertLearning(db, { id, kind: 'profile', scope: 'global', block: blockKey, name: slug(nextText, 40), title: nextText.slice(0, 120), path: t.file, confidence: item.confidence, trigger: item.trigger });
-    return { status: 'patched', id, kind: 'profile', path: t.file, title: nextText };
+  if (item.globalFact) {
+    const dup = findSimilar(statements(before), item.globalFact);
+    if (dup) return { status: 'duplicate', target: t.file, existing: dup.text, reason: 'your global CLAUDE.md already says this; patch that line instead' };
   }
 
   let after = before;
@@ -523,7 +510,7 @@ function editOf(item) {
 
 /**
  * Whether a patch rewrites what its target says (rather than only adding to it): a
- * replaced profile bullet, a changed description, or an edit that is not a pure
+ * changed description, or an edit that is not a pure
  * insertion. Such a patch is a correction and waits for the user like any other.
  */
 function rewritesText(db, item, settings, payload) {
@@ -532,13 +519,6 @@ function rewritesText(db, item, settings, payload) {
   if (!t || t.error) return false;
   const before = readOrNull(t.file);
   if (before === null) return false;
-  if (t.kind === 'profile') {
-    const blocks = parseProfile(before);
-    const bullet = [...blocks.user, ...blocks.environment].find((b) => (t.learning && b.id === t.learning.id) || b.id === item.target || (item.old && b.text.includes(item.old)));
-    if (!bullet) return false;
-    const next = item.old && bullet.text.includes(item.old) ? bullet.text.replace(item.old, item.new ?? '') : String(item.new ?? item.text ?? '');
-    return !isInsertion(bullet.text, next);
-  }
   if (item.description) {
     const { data } = parseFrontmatter(before);
     if (data.description && !isInsertion(String(data.description), item.description)) return true;
@@ -595,7 +575,7 @@ export function needsApproval(item, actor, autonomy) {
  */
 export function writeText(db, { file, after, title, why = null, confidence = 0.6, trigger = 'session_end', actor = 'background', sessionId = null, expectBefore }) {
   const kind = knowledgeKind(file);
-  if (!PATCHABLE.has(kind)) return { status: 'rejected', reason: 'only memory, skill, profile, rule and CLAUDE.md files can be changed' };
+  if (!PATCHABLE.has(kind)) return { status: 'rejected', reason: 'only memory, skill, rule and CLAUDE.md files can be changed' };
   const batch = new Batch(db, { actor, sessionId, title, why });
   try {
     db.exec('BEGIN IMMEDIATE');
@@ -625,7 +605,6 @@ function runItem(db, item, settings, payload, actor, { dryRun = false } = {}) {
     db.exec('BEGIN IMMEDIATE');
     let result;
     if (item.op === 'patch') result = patchItem(db, batch, item, settings, payload);
-    else if (item.kind === 'profile') result = createProfile(db, batch, item, settings);
     else if (item.kind === 'skill') result = createSkill(db, batch, item, settings);
     else result = createMemory(db, batch, item, settings, payload);
     if (dryRun) {
@@ -693,7 +672,7 @@ export function apply(db, payload, { actor = 'manual', autonomy = 'auto' } = {})
   const items = Array.isArray(payload?.items) ? payload.items : [];
   const results = [];
   for (const raw of items) {
-    const item = normalizeItem(raw, payload || {});
+    const item = promoteToGlobal(normalizeItem(raw, payload || {}), payload || {});
     if (containsSecret(item.title, item.description, item.body, item.text, item.new)) {
       results.push({ status: 'rejected', title: item.title, reason: 'looks like it contains a secret (token, key or password); never store secrets' });
       continue;
@@ -708,7 +687,15 @@ export function apply(db, payload, { actor = 'manual', autonomy = 'auto' } = {})
         results.push({ title: item.title, ...pre });
         continue;
       }
-      if (item.op === 'patch' && !item.description && path.isAbsolute(String(item.target || '')) && item.kind !== 'profile') {
+      if (item.op === 'patch' && !item.description && path.isAbsolute(String(item.target || ''))) {
+        // The same global fact already waiting (another session proposed it): keep one.
+        const pending = item.globalFact ? pendingChangeset(db, item.target) : null;
+        const same = pending && findSimilar(claimsOf(db, pending.id).map((c) => ({ id: c.id, text: String(c.claim || c.summary || '').replace(/^[-*]s+/, '') })), item.globalFact);
+        if (same) {
+          db.prepare('UPDATE candidates SET confidence = MAX(COALESCE(confidence, 0), ?), session_id = ?, ts = ? WHERE id = ?').run(item.confidence, payload?.session_id || actor, Date.now(), same.id);
+          results.push({ status: 'queued', title: item.title, candidateId: same.id, changesetId: pending.id, replaced: true, reason: 'merged with a similar proposal already waiting for approval' });
+          continue;
+        }
         // A change to an existing file joins that file's pending changeset.
         const q = queueEdit(db, item, payload || {}, actor);
         results.push({
@@ -724,54 +711,10 @@ export function apply(db, payload, { actor = 'manual', autonomy = 'auto' } = {})
       });
       continue;
     }
-    results.push({ title: item.title, ...runItem(db, item, settings, payload || {}, actor) });
+    results.push({ title: item.title, ...runItem(db, item, settings, payload || {}, actor), ...(item.promoted ? { note: `saved as a global fact: project ${item.promoted} already has a similar memory` } : {}) });
   }
   if (results.some((r) => r.status === 'created' || r.status === 'patched')) setMetaOnce(db, 'learning_enabled_at', Date.now());
   return results;
-}
-
-// ---------- consolidation ----------
-
-/**
- * Replace a profile block with consolidated bullets. Each new bullet lists the ids it
- * merges; it keeps the first id, the other sources are marked archived (merged).
- * One ledger batch, so `undo` restores the previous block.
- */
-export function rewriteProfileBlock(db, block, bullets, { actor = 'background' } = {}) {
-  const file = profileFile();
-  const current = readOrNull(file) ?? '';
-  const before = parseProfile(current)[block];
-  const known = new Set(before.map((b) => b.id).filter(Boolean));
-  const next = [];
-  const kept = new Set();
-  for (const b of bullets) {
-    const text = String(b.text || '').replace(/\s+/g, ' ').trim();
-    if (!text || containsSecret(text)) continue;
-    const ids = (b.sources || []).filter((id) => known.has(id) && !kept.has(id));
-    const id = ids[0] || newId();
-    kept.add(id);
-    next.push({ id, text });
-  }
-  if (!next.length) return { status: 'rejected', reason: 'consolidation produced no bullets' };
-  const batch = new Batch(db, { actor, title: `Consolidated the profile "${BLOCKS[block]}" block`, why: 'The block was past its budget; similar facts were merged.' });
-  try {
-    db.exec('BEGIN IMMEDIATE');
-    batch.write(file, profileWithBlock(current, block, next), { learningId: next[0].id, op: 'consolidate' });
-    batch.commit();
-    const now = Date.now();
-    for (const b of next) {
-      upsertLearning(db, { id: b.id, kind: 'profile', scope: 'global', block, name: slug(b.text, 40), title: b.text.slice(0, 120), path: file, confidence: 0.6, trigger: 'consolidate' });
-      db.prepare('UPDATE learnings SET title = ?, updated_at = ? WHERE id = ?').run(b.text.slice(0, 120), now, b.id);
-    }
-    const merged = [...known].filter((id) => !kept.has(id));
-    for (const id of merged) db.prepare("UPDATE learnings SET status = 'archived', updated_at = ? WHERE id = ?").run(now, id);
-    db.exec('COMMIT');
-    return { status: 'consolidated', before: before.length, after: next.length, merged: merged.length };
-  } catch (err) {
-    try { db.exec('ROLLBACK'); } catch { /* ignore */ }
-    batch.rollback();
-    return { status: 'error', reason: String(err.message) };
-  }
 }
 
 // ---------- approval queue and confirmation ----------
@@ -854,13 +797,6 @@ export function undo(db, { id, last, batch } = {}) {
   const ops = new Set(writes.map((w) => w.op));
   const learningId = writes.find((w) => w.learning_id)?.learning_id;
   if (learningId) {
-    if (ops.has('consolidate')) {
-      // Bullets merged away come back with the previous block.
-      const restored = parseProfile(writes[0].before ?? '');
-      for (const b of [...restored.user, ...restored.environment]) {
-        if (b.id) db.prepare("UPDATE learnings SET status = 'active', updated_at = ? WHERE id = ?").run(now, b.id);
-      }
-    }
     const status = ops.has('create') ? 'reverted' : ops.has('archive') ? 'active' : null;
     if (status) db.prepare('UPDATE learnings SET status = ?, updated_at = ? WHERE id = ?').run(status, now, learningId);
   }
@@ -887,6 +823,9 @@ export function forget(db, { match }) {
   const l = found[0];
   // A file Ouroboros did not create (a skill, rule or CLAUDE.md it only added to) is the
   // user's: archiving would remove all of it. Its changes are undone one by one instead.
+  if (l.kind === 'profile') {
+    return { status: 'refused', id: l.id, title: l.title, reason: 'profile facts were retired (global facts now live in ~/.claude/CLAUDE.md); edit that file instead' };
+  }
   if (l.origin_session === 'native') {
     return { status: 'refused', id: l.id, title: l.title, reason: `Ouroboros did not create ${l.path}; it only changed it. Undo those changes instead (dashboard: Knowledge, Learned).` };
   }
@@ -894,14 +833,7 @@ export function forget(db, { match }) {
   const archiveDir = path.join(ouroborosDir(), 'archive');
   try {
     db.exec('BEGIN IMMEDIATE');
-    if (l.kind === 'profile') {
-      const before = readOrNull(l.path) ?? '';
-      const blocks = parseProfile(before);
-      const bullet = [...blocks.user, ...blocks.environment].find((b) => b.id === l.id);
-      if (!bullet) throw new Error('bullet not found in user.md');
-      batch.write(path.join(archiveDir, `${today()}-${l.id}.md`), `${bullet.text}\n`, { learningId: l.id, op: 'archive' });
-      batch.write(l.path, profileWithoutBullet(before, l.id), { learningId: l.id, op: 'archive' });
-    } else if (l.kind === 'memory') {
+    if (l.kind === 'memory') {
       const content = readOrNull(l.path);
       if (content === null) throw new Error(`file not found: ${l.path}`);
       batch.write(path.join(archiveDir, `${today()}-${path.basename(l.path)}`), content, { learningId: l.id, op: 'archive' });
@@ -935,13 +867,11 @@ export function forget(db, { match }) {
 export function inventoryText(db, { cwd, memoryDir }) {
   const settings = loadSettings();
   const out = [];
-  const profileText = readOrNull(profileFile());
-  const blocks = parseProfile(profileText ?? '');
-  for (const [k, title] of Object.entries(BLOCKS)) {
-    const limit = k === 'user' ? settings.limits.userBlockChars : settings.limits.environmentBlockChars;
-    out.push(`## Profile — ${title} (${blockChars(blocks[k])}/${limit} chars)`);
-    out.push(...(blocks[k].length ? blocks[k].map((b) => `- ${b.text}${b.id ? `  [${b.id}]` : ''}`) : ['(empty)']));
-  }
+  const globalFile = path.join(claudeDir(), 'CLAUDE.md');
+  const globalText = readOrNull(globalFile);
+  const headings = String(globalText || '').split(/\r?\n/).filter((l) => /^#{1,6}\s/.test(l));
+  out.push(`## Global instructions in ${globalFile} (a fact valid on every project is an addition here, with "section")`);
+  out.push(...(globalText === null ? ['(no file yet)'] : headings.length ? headings.map((h) => `- ${h}`) : ['(no sections)']));
   const dir = memoryDirFor({ memoryDir, cwd });
   const mems = listMemoriesIn(dir);
   const index = mems.find((m) => m.index);

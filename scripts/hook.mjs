@@ -7,7 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { options } from './config.mjs';
 import { classifyPath, dataDir, projectKey, skillNameFromPath } from './paths.mjs';
-import { profileForContext, readProfileText } from './profile.mjs';
+import { retireProfile } from './migrate.mjs';
 import { RUBRIC_SHORT } from './rubric.mjs';
 import { globMatch, loadSettings } from './settings.mjs';
 import { countLines, readTranscript, usageSince } from './transcript.mjs';
@@ -169,16 +169,13 @@ function finishInloopReview(db, input, s, now) {
   }
 }
 
-/** Context injected at session start: the protocol plus the global profile. */
+/** Context injected at session start: the learning protocol (global facts live in ~/.claude/CLAUDE.md, which Claude Code loads itself). */
 export function sessionContext(learnedSinceLastSession = '') {
-  const text = readProfileText();
-  const profile = text ? profileForContext(text) : '';
   const lang = options().learningLanguage;
   return [
     '<ouroboros>',
     PROTOCOL,
     lang === 'auto' ? '' : `Write learnings in ${lang === 'pt-BR' ? 'Brazilian Portuguese' : 'English'}.`,
-    profile ? `\nWhat you already know about the user and their environment (from ~/.ouroboros/user.md):\n${profile}` : '',
     learnedSinceLastSession ? `\nLearned by the end-of-session review since the last session (already saved):\n${learnedSinceLastSession}` : '',
     '</ouroboros>',
   ].filter(Boolean).join('\n');
@@ -259,6 +256,12 @@ const handlers = {
       )
       ORDER BY started_at DESC LIMIT 3
     `).all(input.session_id, stale, stale);
+    // v0.12: the old global profile becomes proposals for the global CLAUDE.md.
+    try {
+      if (retireProfile(db, now) && options().learning) spawnWorker(['--drain']);
+    } catch (err) {
+      dbApi.logError(db, 'migrate:profile', err);
+    }
     // Daily upkeep (archive unused learnings, consolidate full budgets).
     if (options().learning && now - (Number(dbApi.getMeta(db, 'maintenance_at')) || 0) > 20 * 60 * 60 * 1000) {
       dbApi.setMeta(db, 'maintenance_at', now);
