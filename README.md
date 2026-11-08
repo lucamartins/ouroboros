@@ -2,6 +2,8 @@
 
 Self-learning for Claude Code. Ouroboros reviews your sessions, turns what is worth keeping into memories and skills, and shows on a local dashboard what it learned, how much that is used, and what it costs — in the spirit of Nous Research's Hermes Agent.
 
+![Ouroboros dashboard: corrections per 100 turns before and after learning turned on](docs/screenshots/overview.png)
+
 ## How it works
 
 - **At session start**, Claude gets a short learning protocol: save preferences, corrections, conventions and working paths as you go, without being asked.
@@ -34,6 +36,13 @@ For a local checkout: `/plugin marketplace add /path/to/ouroboros`.
 | `/ouroboros:forget <match>` | Archives a learning so it stops loading |
 | `/ouroboros:dashboard` | Opens the local dashboard (`http://127.0.0.1:4747`): an inbox of what waits for you, what was learned (each item with what it changed, why and from which session; undo, archive, keep), a graph of how skills, memories and instruction files connect, value, activity, cost and health |
 | `/ouroboros:backfill [measure \| learn] [days] [limit]` | Reviews past sessions: `measure` builds the correction baseline right away, `learn` sends what they would have taught to the inbox (asks before spending) |
+
+<details>
+<summary>The inbox: what waits for your decision, as diffs</summary>
+
+![Ouroboros inbox with pending changes to a rule file and the global CLAUDE.md](docs/screenshots/inbox.png)
+
+</details>
 
 Everything else is automatic: capture hooks record turns, tool calls, error → fix recoveries, skill uses and memory reads/writes; a background reviewer runs when a session ends.
 
@@ -102,7 +111,7 @@ Run both evals before and after changing the rubric or a prompt.
 
 ## Contributing
 
-Issues and pull requests are welcome. Every file in the repository is in English, the runtime has no dependencies, and hooks must work on Windows, macOS and Linux (see [.claude/CLAUDE.md](.claude/CLAUDE.md)). Read [DESIGN.md](DESIGN.md) before changing behavior and update it when a decision changes; run the tests and `claude plugin validate --strict .` before opening a pull request.
+Changes are listed in [CHANGELOG.md](CHANGELOG.md); report vulnerabilities as described in [SECURITY.md](SECURITY.md). Issues and pull requests are welcome. Every file in the repository is in English, the runtime has no dependencies, and hooks must work on Windows, macOS and Linux (see [.claude/CLAUDE.md](.claude/CLAUDE.md)). Read [DESIGN.md](DESIGN.md) before changing behavior and update it when a decision changes; run the tests and `claude plugin validate --strict .` before opening a pull request.
 
 ## License
 
