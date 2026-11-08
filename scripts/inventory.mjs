@@ -111,6 +111,28 @@ export function listSkills(cwds = []) {
   return out;
 }
 
+function readJson(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
+}
+
+/**
+ * Where Claude Code loads a plugin from. A plugin from a `directory` marketplace (a local
+ * folder) is loaded from that folder, while `installed_plugins.json` keeps pointing at the
+ * copy made when it was installed, which is never updated. Other plugins load from their
+ * `installPath`.
+ */
+function pluginRoot(plugin, marketplace, install, marketplaces) {
+  const mk = marketplaces?.[marketplace];
+  if (mk?.source?.source === 'directory') {
+    const dir = mk.installLocation || mk.source.path;
+    const entry = readJson(path.join(dir, '.claude-plugin', 'marketplace.json'))?.plugins?.find((p) => p?.name === plugin);
+    const source = typeof entry?.source === 'string' ? entry.source : entry?.source?.path;
+    const root = source ? path.resolve(dir, source) : null;
+    if (root && safeStat(root)?.isDirectory()) return root;
+  }
+  return install.installPath;
+}
+
 /**
  * Skills of installed plugins (from `plugins/installed_plugins.json`), skipping plugins
  * the user settings disable. Claude invokes them as `<plugin>:<skill>`.
@@ -120,13 +142,14 @@ export function listPluginSkills() {
   try { installed = JSON.parse(fs.readFileSync(path.join(claudeDir(), 'plugins', 'installed_plugins.json'), 'utf8')).plugins || {}; } catch { return []; }
   let enabled = {};
   try { enabled = JSON.parse(fs.readFileSync(path.join(claudeDir(), 'settings.json'), 'utf8')).enabledPlugins || {}; } catch { /* none */ }
+  const marketplaces = readJson(path.join(claudeDir(), 'plugins', 'known_marketplaces.json'));
   const out = [];
   for (const [id, installs] of Object.entries(installed)) {
     if (enabled[id] === false) continue;
-    const plugin = id.split('@')[0];
+    const [plugin, marketplace] = id.split('@');
     const install = (Array.isArray(installs) ? installs : [installs]).find((x) => x?.installPath);
     if (!install) continue;
-    const dir = path.join(install.installPath, 'skills');
+    const dir = path.join(pluginRoot(plugin, marketplace, install, marketplaces), 'skills');
     for (const d of safeList(dir)) {
       const file = path.join(dir, d.name, 'SKILL.md');
       const text = safeRead(file);
