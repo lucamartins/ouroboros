@@ -118,7 +118,7 @@ test('a new item: edited fields replace the proposed ones before it is saved', (
   }, { actor: 'background', autonomy: 'queue' });
   assert.equal(q.status, 'queued', q.reason);
   const key = `it:${q.candidateId}`;
-  assert.match(inbox.showEntry(db, key).text, /Body:\nDo not seed\./);
+  assert.match(inbox.showEntry(db, key).text, /What it would save:[\s\S]*Do not seed\./);
   const r = inbox.editAndApprove(db, key, { item: { title: 'Agenda starts empty', description: 'Never insert sample agenda rows; the agenda starts empty' } });
   assert.equal(r.status, 'created', r.reason);
   const l = db.prepare('SELECT title, path FROM learnings WHERE id = ?').get(r.id);
@@ -129,7 +129,7 @@ test('a new item: edited fields replace the proposed ones before it is saved', (
 test('a conflict settled as a new rule with the correction composed in the conversation', () => {
   const id = conflict('Ask decisions one at a time', 'Ask owner decisions one at a time, waiting for each answer.');
   const key = `cf:${id}`;
-  assert.match(inbox.showEntry(db, key).text, /Decide: "keep"/);
+  assert.match(inbox.showEntry(db, key).text, /Conflict with a written rule[\s\S]*Decide: keep the current rule/);
   assert.equal(inbox.approve(db, key).status, 'invalid', 'a conflict is resolved, not approved');
   const edits = [{ old: '- Ask all owner decisions at once, then agree on waves.', new: '- Ask owner decisions one at a time, waiting for each answer.', corrects: true }];
   assert.match(inbox.previewEdit(db, key, { edits }).text, /rewrites existing text/);
@@ -170,4 +170,47 @@ test('a stale change is not approved blindly: it says to edit it against the cur
   const claim = inbox.showEntry(db, `cs:${q.changesetId}`).claims[0];
   const e = inbox.editAndApprove(db, `cs:${q.changesetId}`, { edits: [{ append: '- Clear the cache after upgrading.', section: 'Pitfalls', claims: [claim] }] });
   assert.equal(e.status, 'patched', e.reason);
+});
+
+test('the card says what the file is and quotes what the user said in that session', async () => {
+  const { buildDigest, citedTurns, quotesFor, userTurnsOfReview } = await import('../scripts/transcript.mjs');
+  const t0 = Date.parse('2026-11-01T10:00:00Z');
+  const turn = (i, text) => ({ type: 'user', timestamp: new Date(t0 + i * 60_000).toISOString(), message: { role: 'user', content: text } });
+  const entries = [turn(0, 'start the api'), turn(1, 'why is my agenda already filled? it should be empty'), turn(2, 'yes, production too'), turn(3, 'later question')];
+  assert.deepEqual(citedTurns('USER #2, #3 (agenda)'), [2, 3]);
+  assert.deepEqual(citedTurns('the session events'), []);
+  // At review time: the digest numbers user turns from the review cursor.
+  const digest = buildDigest(entries, { fromLine: 1 });
+  assert.deepEqual(quotesFor('USER #1, #2', digest.userTurns).map((q) => q.text), ['why is my agenda already filled? it should be empty', 'yes, production too']);
+  // Later, for an entry stored before quotes existed: the review covered the last 2 turns up to its time.
+  const later = userTurnsOfReview(entries, { reviewedAt: t0 + 2.5 * 60_000, turnsReviewed: 2 });
+  assert.deepEqual(quotesFor('USER #1', later).map((q) => q.text), ['why is my agenda already filled? it should be empty']);
+  assert.equal(userTurnsOfReview(entries, { reviewedAt: t0 + 10 * 60_000, turnsReviewed: 0, fromStart: true })[0].text, 'start the api');
+
+  // A stored entry with no quotes yet finds them in its session's transcript (and keeps them).
+  const transcript = path.join(tmp, 'sess-2.jsonl');
+  fs.writeFileSync(transcript, entries.map((e) => JSON.stringify(e)).join('\n'));
+  db.prepare("INSERT INTO sessions (id, project, cwd, started_at, transcript_path) VALUES ('sess-2', ?, ?, ?, ?)").run(hook.projectKeyOf(cwd), cwd, t0, transcript);
+  const review = Number(db.prepare("INSERT INTO reviews (session_id, mode, trigger, status, turns_reviewed, ts) VALUES ('sess-2', 'background', 'session_end', 'ok', 2, ?)").run(t0 + 2.5 * 60_000).lastInsertRowid);
+  const id = Number(db.prepare(`INSERT INTO candidates (review_id, session_id, project, kind, title, claim, evidence, confidence, outcome, target, cwd, note, ts)
+    VALUES (?, 'sess-2', ?, 'memory', 'Agenda starts empty', 'The agenda starts empty.', 'USER #1, #2', 0.7, 'conflict', ?, ?, ?, ?)`)
+    .run(review, hook.projectKeyOf(cwd), rules, cwd, `conflict: ${rules}: it contradicts the rules`, t0).lastInsertRowid);
+  const card = inbox.showEntry(db, `cf:${id}`).text;
+  assert.match(card, /You said \(turn 1\): "why is my agenda already filled\? it should be empty"/);
+  assert.match(card, /You said \(turn 2\): "yes, production too"/);
+  assert.doesNotMatch(card, /USER #/);
+  assert.match(card, /Why it was held: it contradicts the rules/, 'the file path before the reason is not shown (drive letters included)');
+  assert.match(card, /^\[\d+\/\d+\] cf:/, 'the card starts with its position in the inbox');
+  assert.ok(db.prepare('SELECT quotes FROM candidates WHERE id = ?').get(id).quotes, 'the quotes are kept');
+  inbox.resolveConflict(db, `cf:${id}`, 'keep');
+});
+
+test('describeFile names what a knowledge file is', () => {
+  const home = os.homedir();
+  assert.equal(inbox.describeFile(path.join(home, '.claude', 'skills', 'nisus', 'reference', 'windows-gotchas.md')), 'A reference file of the global skill "nisus"');
+  assert.equal(inbox.describeFile(path.join(home, '.claude', 'skills', 'nisus-local', 'SKILL.md')), 'The global skill "nisus-local"');
+  assert.match(inbox.describeFile(path.join(home, 'src', 'api', '.claude', 'rules', 'testing.md')), /rule file of project api/);
+  assert.match(inbox.describeFile(path.join(home, 'src', 'api', 'CLAUDE.md')), /instructions of api/);
+  assert.match(inbox.describeFile(path.join(home, '.ouroboros', 'user.md')), /global profile/);
+  assert.equal(inbox.shortPath(path.join(home, 'a', 'b.md')), '~/a/b.md');
 });

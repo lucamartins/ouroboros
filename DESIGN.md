@@ -2,7 +2,7 @@
 
 > A Claude Code plugin that learns from your sessions on its own: it saves memories and creates/refines skills without being asked, in the spirit of Nous Research's Hermes Agent, and shows on a local dashboard what it learned, how much that is being used and what it costs.
 
-Status: v0.9.0 — every phase implemented, plus the learning evaluation (§7.0), the v0.8 mechanism review (§7.3) and the inbox reviewed in the conversation (§9.3); next: real-world use, then a fresh install test on another machine. Owner decisions in [§12](#12-decisions).
+Status: v0.9.1 — every phase implemented, plus the learning evaluation (§7.0), the v0.8 mechanism review (§7.3) and the inbox reviewed in the conversation (§9.3); next: real-world use, then a fresh install test on another machine. Owner decisions in [§12](#12-decisions).
 
 ---
 
@@ -370,7 +370,8 @@ reviews   (id, session_id, mode, trigger, model, turns_reviewed, corrections, le
            input_tokens, output_tokens, cache_tokens, cost_usd, ts)
           -- mode: inloop | background | measure | manual
 candidates (id, review_id, session_id, kind, title, summary, evidence, confidence, outcome, payload,
-            note, claim, target, changeset_id, triaged_at, decided_at, ...)
+            note, claim, target, changeset_id, triaged_at, decided_at, quotes, ...)
+          -- quotes: the user's own words in the turns the evidence cites ("USER #12"), JSON [{ n, text }]
           -- outcome: queued | created | patched | duplicate | dropped | merged | suggested
           --          | dismissed | rejected_by_user | over_budget | error
 changesets (id, file, kind, base_hash, edits, corrects, status, note, cost_usd, created_at, decided_at, learning_id, batch)
@@ -413,6 +414,11 @@ Editing is what the dashboard cannot do. Claude writes the user's version and `p
 - a new item (`it:`): edited fields override the proposed ones, or a whole new item re-routes it (e.g. a patch to the owning skill instead of a memory);
 - a conflict (`cf:`) settled as "new rule": Claude composes the correction of the contradicted text in the conversation and it is written at once; without edits the claim goes back to the queue for the editor, as in the dashboard;
 - a suggested fix (`sg:`): Claude can make the fix as normal work, then `done` (outcome `fixed`), or `dismiss`.
+
+**Legible decisions (v0.9.1).** The first real use showed that the facts existed but did not reach the user: Claude Code collapses command output, the question dialog covers the conversation, and "USER #12" means nothing to the person deciding. So:
+- `show` prints a card: position (`[3/13]`), the file as `~/…` and what it is in words (a reference file of the global skill "nisus", a rule file of project X, your global profile), where it came from (session date, project, which review), why it waited (backfill, correction, rule file, autonomy setting), the reviewer's reasoning without the path prefix, and the diff;
+- the evidence is shown as **the user's own words**: the review stores the cited turns' text when it runs (`candidates.quotes`, from the digest it just read); for entries stored before, the turns are found again in the session transcript by the review's time and the number of turns it covered, and cached;
+- the skill makes Claude restate the card in the user's language (the user does not see command output) and ask with AskUserQuestion: the position as header, a question that names the file and the change, and a `preview` on each option showing what it would do (the diff to be written, the proposed edit, "nothing is written").
 
 Every decision goes through the curator, so it lands in the ledger and is undoable. SessionStart tells the user when entries wait for them (with the notices, otherwise at most once a day): "N waiting for your decision: /ouroboros:inbox (or the dashboard)".
 

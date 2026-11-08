@@ -227,6 +227,10 @@ const MIGRATIONS = [
   ALTER TABLE writes ADD COLUMN why TEXT;             -- where it came from (evidence, the learnings of a change)
   ALTER TABLE learnings ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;  -- kept by the user: never archived automatically
   `,
+  // 9 — v0.9.1: the user's own words behind a learning (the turns its evidence cites)
+  `
+  ALTER TABLE candidates ADD COLUMN quotes TEXT;      -- JSON [{ n, text }]; resolved from the transcript
+  `,
 ];
 
 export function openDb(explicitDir) {

@@ -56,6 +56,7 @@ function describeToolUse(c) {
  */
 export function buildDigest(entries, { fromLine = 0, maxChars = 80_000, maxParts = 8 } = {}) {
   const lines = [];
+  const userTurns = [];
   let humanTurns = 0;
 
   for (let i = fromLine; i < entries.length; i++) {
@@ -64,6 +65,7 @@ export function buildDigest(entries, { fromLine = 0, maxChars = 80_000, maxParts
 
     if (isHumanPrompt(e)) {
       humanTurns++;
+      userTurns.push({ n: humanTurns, text: clip(textOf(e.message.content), QUOTE_CHARS), ts: e.timestamp || null });
       lines.push({ kind: 'user', text: `[USER #${humanTurns}] ${clip(textOf(e.message.content), 2000)}` });
       continue;
     }
@@ -111,7 +113,37 @@ export function buildDigest(entries, { fromLine = 0, maxChars = 80_000, maxParts
     parts.splice(1, omitted);
   }
   const chunks = parts.map((p) => render(p));
-  return { text: chunks[0], chunks, omitted, humanTurns, nextLine: entries.length };
+  return { text: chunks[0], chunks, omitted, humanTurns, userTurns, nextLine: entries.length };
+}
+
+const QUOTE_CHARS = 500;
+const MAX_QUOTES = 4;
+
+/** The user turns an evidence string cites ("USER #3", "USER #12, #13"), in order. */
+export function citedTurns(evidence) {
+  const s = String(evidence || '');
+  if (!/USER\s*#/i.test(s)) return [];
+  return [...new Set([...s.matchAll(/#(\d+)/g)].map((m) => Number(m[1])))];
+}
+
+/**
+ * What the user actually said in the turns an evidence string cites, so whoever decides
+ * on a learning reads the user's own words instead of "USER #12".
+ */
+export function quotesFor(evidence, userTurns) {
+  const byN = new Map((userTurns || []).map((t) => [t.n, t]));
+  return citedTurns(evidence).map((n) => byN.get(n)).filter(Boolean).slice(0, MAX_QUOTES).map((t) => ({ n: t.n, text: t.text }));
+}
+
+/**
+ * The user turns of a transcript as a review numbered them, for a review that ran
+ * before quotes were stored: it covered the last `turnsReviewed` human turns up to its
+ * time (`fromStart`: a backfill that read the session from the start).
+ */
+export function userTurnsOfReview(entries, { reviewedAt, turnsReviewed, fromStart = false }) {
+  const human = entries.filter((e) => isHumanPrompt(e) && (!reviewedAt || !e.timestamp || Date.parse(e.timestamp) <= reviewedAt));
+  const offset = fromStart ? 0 : Math.max(0, human.length - (turnsReviewed || 0));
+  return human.slice(offset).map((e, i) => ({ n: i + 1, text: clip(textOf(e.message.content), QUOTE_CHARS) }));
 }
 
 /** Number of lines in a transcript (the cursor unit), or null if unreadable. */

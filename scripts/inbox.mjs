@@ -6,12 +6,16 @@
 // file (changeset), "it:<id>" a new item (memory, skill, profile fact), "sg:<id>" a fix the
 // project could make once (suggested instead of learning a workaround).
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDb } from './db.mjs';
 import { applyChangeset, applyEdits, claimsOf, getChangeset, hashText, rejectChangeset } from './changesets.mjs';
 import { containsSecret, decideQueued, writeText } from './curator.mjs';
-import { projectKey } from './paths.mjs';
+import { options } from './config.mjs';
+import { knowledgeKind } from './knowledge.mjs';
+import { dataDir, memoryDirFor, projectKey } from './paths.mjs';
+import { citedTurns, quotesFor, readTranscript, userTurnsOfReview } from './transcript.mjs';
 import { lineDiff } from './textdiff.mjs';
 
 const CONTEXT_LINES = 2;
@@ -123,98 +127,223 @@ export function unifiedDiff(before, after, { context = CONTEXT_LINES } = {}) {
   return out.join('\n');
 }
 
-function claimLines(c) {
-  return [
-    `- [${c.id}] ${c.title}`,
-    c.claim || c.summary ? `    claim: ${oneLine(c.claim || c.summary, 600)}` : null,
-    c.evidence ? `    evidence: ${oneLine(c.evidence, 300)}` : null,
-    c.note ? `    note: ${oneLine(c.note, 400)}` : null,
-  ].filter(Boolean);
+/** A path as the user reads it: the home directory as `~`, forward slashes. */
+export function shortPath(file) {
+  if (!file) return '';
+  const home = os.homedir();
+  const f = String(file);
+  const rel = f.toLowerCase().startsWith(home.toLowerCase()) ? `~${f.slice(home.length)}` : f;
+  return rel.replace(/\\/g, '/');
 }
 
-/** Everything needed to judge one entry: what, where, why, and the exact text change. */
-export function showEntry(db, key) {
+/** What a knowledge file is, in words: whose skill, which project's rules, and so on. */
+export function describeFile(file) {
+  if (!file) return '';
+  const f = String(file).replace(/\\/g, '/');
+  const home = os.homedir().replace(/\\/g, '/').toLowerCase();
+  const lower = f.toLowerCase();
+  const repoOf = (marker) => path.posix.basename(f.slice(0, lower.lastIndexOf(marker)));
+  if (lower === `${home}/.ouroboros/user.md`) return 'your global profile (loaded in every session)';
+  const skill = /\/skills\/([^/]+)\/(.+)$/i.exec(f);
+  if (skill) {
+    const global = lower.startsWith(`${home}/.claude/skills/`);
+    const owner = global ? `the global skill "${skill[1]}"` : `the skill "${skill[1]}" of project ${repoOf('/.claude/skills/')}`;
+    return /^skill\.md$/i.test(skill[2]) ? owner.replace(/^the /, 'The ') : `A reference file of ${owner}`;
+  }
+  if (/\/\.claude\/rules\/[^/]+\.md$/i.test(f)) return `A rule file of project ${repoOf('/.claude/rules/')} (loaded in its sessions)`;
+  if (/\/memory\/[^/]+\.md$/i.test(f)) return /\/memory\/memory\.md$/i.test(f) ? 'The index of a project\'s memories' : 'A project memory';
+  if (/(^|\/)claude(\.local)?\.md$/i.test(f)) {
+    if (lower === `${home}/.claude/claude.md`) return 'Your global instructions (CLAUDE.md, loaded in every session)';
+    const dir = path.posix.dirname(f);
+    return `The instructions of ${path.posix.basename(dir === `${home}/.claude` ? dir : dir.replace(/\/\.claude$/i, ''))} (${path.posix.basename(f)})`;
+  }
+  return 'A knowledge file';
+}
+
+const ORIGIN = { background: 'end-of-session review', session_end: 'end-of-session review', inloop: 'during the session', periodic: 'periodic review in the session', manual: 'you asked', backfill: 'review of a past session' };
+
+function dateOf(ts) {
+  if (!ts) return null;
+  const d = new Date(ts);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/** Where a learning came from: when, in which project, and how it was proposed. */
+function originOf(c) {
+  const p = payloadOf(c);
+  const how = ORIGIN[p.actor] || ORIGIN[p.trigger] || ORIGIN[c.session_id] || null;
+  const when = dateOf(c.session_started_at || c.ts);
+  const where = c.cwd || c.session_cwd;
+  return [when ? `session of ${when}` : 'a session', where ? `in ${path.basename(where)}` : null, how ? `(${how})` : null].filter(Boolean).join(' ');
+}
+
+/**
+ * The user's own words behind a learning. Stored when the review ran; for older entries,
+ * found again in the session transcript (and stored) when it is still there.
+ */
+export function quotesOf(db, c) {
+  if (c.quotes) { try { return JSON.parse(c.quotes); } catch { return []; } }
+  if (!citedTurns(c.evidence).length) return [];
+  let quotes = [];
+  const review = c.review_id ? db.prepare('SELECT ts, turns_reviewed, trigger FROM reviews WHERE id = ?').get(c.review_id) : null;
+  const session = db.prepare('SELECT transcript_path FROM sessions WHERE id = ?').get(c.session_id);
+  if (!review || !session?.transcript_path || !fs.existsSync(session.transcript_path)) return [];
+  try {
+    const entries = readTranscript(session.transcript_path);
+    quotes = quotesFor(c.evidence, userTurnsOfReview(entries, { reviewedAt: review.ts, turnsReviewed: review.turns_reviewed, fromStart: review.trigger === 'backfill-learn' }));
+  } catch { return []; }
+  db.prepare('UPDATE candidates SET quotes = ? WHERE id = ?').run(JSON.stringify(quotes), c.id);
+  return quotes;
+}
+
+function quoteLines(quotes, indent = '') {
+  return quotes.map((q) => `${indent}You said (turn ${q.n}): "${oneLine(q.text, 400)}"`);
+}
+
+/** The autonomy setting: plugin options reach hooks, not commands; hooks leave a snapshot. */
+function currentAutonomy() {
+  try { return JSON.parse(fs.readFileSync(path.join(dataDir(), 'options.json'), 'utf8')).autonomy || options().autonomy; } catch { return options().autonomy; }
+}
+
+function fromBackfill(db, c) {
+  return !!c.review_id && db.prepare('SELECT trigger FROM reviews WHERE id = ?').get(c.review_id)?.trigger === 'backfill-learn';
+}
+
+/** Why an entry waited for the user instead of being written. */
+function waitedBecause({ corrects, file, kind, confidence, autonomy, backfill }) {
+  if (backfill) return 'it was learned from a past session (backfill), and those always wait for you';
+  if (corrects) return 'it rewrites existing text, and corrections always wait for you';
+  if (file && ['rules', 'instructions'].includes(knowledgeKind(file))) return 'changes to rule files and CLAUDE.md always wait for you';
+  if (autonomy === 'queue') return 'your autonomy setting is "queue": every learning waits for you';
+  if (autonomy === 'hybrid') return kind === 'skill' ? 'your autonomy setting is "hybrid": skills wait for you' : `your autonomy setting is "hybrid": tentative items (confidence ${confidence ?? '?'} < 0.7) wait for you`;
+  return `your autonomy setting (${autonomy || 'auto'})`;
+}
+
+function editorNote(note) {
+  // "adds to C:\x\SKILL.md: reason" -> "reason" (a drive letter's colon is not the separator)
+  return note ? oneLine(String(note)
+    .replace(/^(adds to|corrects|conflict|suggest(?:ed)?|fix in the project)\b(?:[^:]|:(?!\s))*:\s+/i, '')
+    .replace(/^(?:[A-Za-z]:)?[\\/].*?\.md:\s+/, ''), 500) : null;
+}
+
+/** Position of an entry in the inbox ("3/20"), with the same filter as the list. */
+function positionOf(db, key, project) {
+  const entries = inboxEntries(db, { project });
+  const i = entries.findIndex((e) => e.key === key);
+  return i < 0 ? '' : `[${i + 1}/${entries.length}] `;
+}
+
+/**
+ * Everything needed to judge one entry, as a card: what it is, the file it changes and
+ * what that file is, where it came from (with the user's own words), why it waited for
+ * the user, and the exact diff against the file as it is now.
+ */
+export function showEntry(db, key, { project } = {}) {
   const k = parseKey(key);
   if (!k) return { status: 'not_found', reason: `unknown key ${key}` };
+  const pos = positionOf(db, k.type === 'it' && !/^it:/.test(String(key)) ? `it:${k.id}` : String(key), project);
   if (k.type === 'cs') {
     const cs = getChangeset(db, k.id);
     if (!cs || !['pending', 'stale'].includes(cs.status)) return { status: 'not_found', reason: 'no pending change with that id' };
     const current = readOrNull(cs.file);
     const edits = JSON.parse(cs.edits);
     const res = current === null ? null : applyEdits(current, edits);
-    const claims = claimsOf(db, cs.id);
+    const claims = db.prepare(`
+      SELECT c.*, s.started_at session_started_at, s.cwd session_cwd FROM candidates c LEFT JOIN sessions s ON s.id = c.session_id
+      WHERE c.changeset_id = ? AND c.outcome = 'queued' ORDER BY COALESCE(s.started_at, c.ts), c.id`).all(cs.id);
+    const autonomy = payloadOf(claims[0]).autonomy || currentAutonomy();
+    const backfill = claims.some((c) => fromBackfill(db, c));
+    const confidence = claims.length ? Math.min(...claims.map((c) => c.confidence ?? 0.6)) : null;
     const text = [
-      `Change ${key} to ${cs.file}${cs.status === 'stale' ? ' (STALE: the file changed since it was composed)' : ''}`,
-      cs.corrects ? 'It rewrites existing text (a correction), not only adds.' : 'It only adds text.',
-      cs.note ? `Note: ${oneLine(cs.note, 400)}` : null,
+      `${pos}${key} · Change to a file · ${cs.corrects ? 'rewrites existing text' : 'adds text'}${cs.status === 'stale' ? ' · STALE (the file changed since)' : ''}`,
+      `File: ${shortPath(cs.file)}`,
+      `What it is: ${describeFile(cs.file)}`,
+      `Waited because: ${waitedBecause({ corrects: cs.corrects, file: cs.file, kind: cs.kind, confidence, autonomy, backfill })}`,
+      cs.note && cs.status === 'stale' ? `Note: ${oneLine(cs.note, 300)}` : null,
       '',
-      `Learnings it implements (${claims.length}):`,
-      ...claims.flatMap(claimLines),
-      '',
-      'Edits:',
-      ...edits.map((e, i) => `${i + 1}. ${e.append !== undefined ? `append under "${e.section || '(end)'}"` : 'replace'}${e.claims?.length ? ` for [${e.claims.join(', ')}]` : ''}${e.why ? ` — ${oneLine(e.why, 200)}` : ''}`),
+      `What it teaches (${claims.length} learning${claims.length > 1 ? 's' : ''}):`,
+      ...claims.flatMap((c, i) => {
+        const quotes = quotesOf(db, c);
+        return [
+          `${i + 1}. ${c.title}  [${c.id}]`,
+          c.claim || c.summary ? `   ${oneLine(c.claim || c.summary, 600)}` : null,
+          `   From: ${originOf(c)}`,
+          ...quoteLines(quotes, '   '),
+          !quotes.length && c.evidence ? `   Evidence: ${oneLine(c.evidence, 300)}` : null,
+          editorNote(c.note) ? `   Reviewer: ${editorNote(c.note)}` : null,
+        ];
+      }).filter((l) => l !== null),
       '',
       current === null ? 'The file no longer exists.'
         : res.rejected.length ? `These edits no longer apply to the current file: ${res.rejected.map((r) => r.reason).join('; ')}`
-          : `Diff against the current file:\n${unifiedDiff(current, res.after)}`,
+          : `Diff against the file as it is now:\n${unifiedDiff(current, res.after)}`,
     ].filter((l) => l !== null);
     return { status: 'ok', key, type: 'change', file: cs.file, stale: cs.status === 'stale', edits, claims: claims.map((c) => c.id), text: text.join('\n') };
   }
   const c = db.prepare('SELECT c.*, s.started_at session_started_at, s.cwd session_cwd FROM candidates c LEFT JOIN sessions s ON s.id = c.session_id WHERE c.id = ?').get(k.id);
   const expected = { cf: 'conflict', it: 'queued', sg: 'suggested' }[k.type];
-  if (!c || c.outcome !== expected || (k.type === 'it' && c.changeset_id)) return { status: 'not_found', reason: `no ${TYPE_LABEL[{ cf: 'conflict', it: 'item', sg: 'suggestion' }[k.type]].toLowerCase()} waiting with that id` };
-  const when = c.session_started_at ? new Date(c.session_started_at).toISOString().slice(0, 16).replace('T', ' ') : null;
-  const origin = `From ${c.session_id === 'manual' || c.session_id === 'inloop' ? `a ${c.session_id} save` : `session ${c.session_id}`}${when ? ` (${when})` : ''}${c.cwd ? ` in ${c.cwd}` : ''}.`;
+  if (!c || c.outcome !== expected || (k.type === 'it' && c.changeset_id)) return { status: 'not_found', reason: `no ${{ cf: 'conflict', it: 'item', sg: 'suggested fix' }[k.type]} waiting with that id` };
+  const quotes = quotesOf(db, c);
+  const evidence = [...quoteLines(quotes), !quotes.length && c.evidence ? `Evidence: ${oneLine(c.evidence, 400)}` : null];
   if (k.type === 'cf') {
     const current = c.target ? readOrNull(c.target) : null;
     const text = [
-      `Conflict ${key}: ${c.title}`,
-      origin,
-      `It contradicts what is written in: ${c.target || '(unknown file)'}${c.target && current === null ? ' (file no longer exists)' : ''}`,
+      `${pos}${key} · Conflict with a written rule`,
+      `File: ${shortPath(c.target) || '(unknown)'}${c.target && current === null ? ' (no longer exists)' : ''}`,
+      c.target ? `What it is: ${describeFile(c.target)}` : null,
+      `From: ${originOf(c)}`,
+      ...evidence,
       '',
-      `New claim: ${c.claim || c.summary || ''}`,
-      c.summary && c.claim && c.summary !== c.claim ? `As proposed:\n${c.summary}` : null,
-      c.evidence ? `Evidence: ${oneLine(c.evidence, 400)}` : null,
-      c.note ? `Why it was held: ${c.note.replace(/^conflict:\s*/, '')}` : null,
+      `New claim: ${oneLine(c.claim || c.summary, 800)}`,
+      `Why it was held: ${editorNote(c.note) || 'it contradicts what the file says'}`,
       '',
-      'Decide: "keep" (the written rule stands; the claim is rejected) or "new" (it is a new rule: the file is corrected to say it).',
+      'Decide: keep the current rule (the claim is rejected), or it is a new rule (the file is corrected to say it).',
     ].filter((l) => l !== null);
     return { status: 'ok', key, type: 'conflict', file: c.target || null, text: text.join('\n') };
   }
   if (k.type === 'sg') {
     const text = [
-      `Suggested fix ${key}: ${c.title}`,
-      origin,
+      `${pos}${key} · Suggested fix in the project`,
+      `Project: ${c.cwd ? shortPath(c.cwd) : '(unknown)'}`,
+      `From: ${originOf(c)}`,
+      ...evidence,
       '',
-      c.summary ? `What was learned: ${c.summary}` : null,
-      c.note ? `Why a fix instead: ${c.note.replace(/^suggest(ed)?:\s*/, '')}` : null,
-      c.evidence ? `Evidence: ${oneLine(c.evidence, 400)}` : null,
+      c.summary ? `What happened: ${oneLine(c.summary, 600)}` : null,
+      `Why a fix instead of a learning: ${editorNote(c.note) || 'it would only document a workaround'}`,
       '',
-      'Make the fix in the project (then "done"), or "dismiss" it.',
+      'Make the fix in the project (then mark it done), or dismiss it.',
     ].filter((l) => l !== null);
     return { status: 'ok', key, type: 'suggestion', text: text.join('\n') };
   }
-  const item = payloadOf(c).item || {};
-  const fields = item.kind === 'profile'
-    ? [`Profile fact (${item.block || 'user'}): ${item.text || c.title}`]
+  const p = payloadOf(c);
+  const item = p.item || {};
+  const projectDir = item.project_dir || item.projectDir || c.cwd;
+  const lands = item.op === 'patch' && item.target ? `${shortPath(item.target)} — ${describeFile(item.target)}`
+    : item.kind === 'profile' ? `~/.ouroboros/user.md, block "${item.block || 'user'}" — your global profile (loaded in every session)`
+      : item.kind === 'skill' ? `a new ${item.scope === 'global' ? 'global ' : ''}skill${item.name ? ` "${item.name}"` : ''}${item.scope === 'global' ? '' : ` of project ${path.basename(projectDir || '')}`}`
+        : `a new ${item.memory_type ? `${item.memory_type} ` : ''}memory of project ${path.basename(projectDir || '')} (${shortPath(memoryDirFor({ cwd: projectDir }))})`;
+  const content = item.kind === 'profile'
+    ? [`+ ${item.text || c.title}`]
     : [
-      `Kind: ${item.kind}${item.memory_type ? ` · ${item.memory_type}` : ''} · ${item.scope || 'project'}${item.op === 'patch' ? ` · patch of ${item.target}` : ''}`,
-      item.name ? `Name: ${item.name}` : null,
-      `Title: ${item.title || c.title}`,
-      item.description ? `Description: ${item.description}` : null,
-      item.project_dir || c.cwd ? `Project: ${item.project_dir || c.cwd}` : null,
-      item.body ? `Body:\n${item.body}` : null,
-      item.append !== undefined ? `Adds under "${item.section || '(end)'}":\n${item.append}` : null,
-      item.old !== undefined ? `Replaces:\n${item.old}\nwith:\n${item.new ?? ''}` : null,
-    ];
+      item.name ? `name: ${item.name}` : null,
+      `title: ${item.title || c.title}`,
+      item.description ? `description: ${item.description}` : null,
+      item.body ? `\n${item.body}` : null,
+      item.append !== undefined ? `adds under "${item.section || '(end)'}":\n${item.append}` : null,
+      item.old !== undefined ? `replaces:\n${item.old}\nwith:\n${item.new ?? ''}` : null,
+    ].filter((l) => l !== null);
   const text = [
-    `New ${item.kind || c.kind} ${key}: ${c.title}`,
-    origin,
-    `Confidence ${c.confidence ?? item.confidence ?? '?'}${c.triaged_at ? '' : ' · not evaluated yet (no duplicate check against existing knowledge has run)'}.`,
-    c.evidence || item.evidence ? `Evidence: ${oneLine(c.evidence || item.evidence, 400)}` : null,
+    `${pos}${key} · New ${item.kind === 'profile' ? 'profile fact' : item.kind || c.kind}${item.memory_type ? ` (${item.memory_type})` : ''}`,
+    `Lands in: ${lands}`,
+    `From: ${originOf(c)}`,
+    ...evidence,
+    `Waited because: ${waitedBecause({ corrects: item.corrects, file: item.op === 'patch' ? item.target : null, kind: item.kind, confidence: c.confidence ?? item.confidence, autonomy: p.autonomy || currentAutonomy(), backfill: fromBackfill(db, c) })}`,
+    c.triaged_at ? null : 'Not checked against existing knowledge yet: look for duplicates before approving.',
     c.note ? `Note: ${oneLine(c.note, 400)}` : null,
     '',
-    ...fields,
+    'What it would save:',
+    ...content,
   ].filter((l) => l !== null);
   return { status: 'ok', key, type: 'item', item, text: text.join('\n') };
 }
@@ -411,7 +540,7 @@ async function main() {
       return;
     }
     if (cmd === 'show') {
-      r = showEntry(db, key);
+      r = showEntry(db, key, { project: args.project && args.project !== true ? args.project : undefined });
       console.log(r.status === 'ok' ? r.text : `⚠ ${r.reason}`);
       return;
     }

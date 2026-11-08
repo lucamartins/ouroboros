@@ -15,7 +15,7 @@ import { isExcluded } from './hook.mjs';
 import { logError, monthSpend, openDb } from './db.mjs';
 import { inventoryForPrompt } from './inventory.mjs';
 import { claudeDir, dataDir, projectKey } from './paths.mjs';
-import { buildDigest, isHumanPrompt, readTranscript } from './transcript.mjs';
+import { buildDigest, isHumanPrompt, quotesFor, readTranscript } from './transcript.mjs';
 
 const MIN_HUMAN_TURNS = 2;
 const PER_CALL_BUDGET_USD = 0.5;
@@ -270,17 +270,18 @@ function finish(db, sessionId, state, cursor) {
  * consumer; if another process is evaluating, it picks these up before it stops. The
  * notice for the session is written when they are evaluated.
  */
-async function applyLearnings(db, session, reviewId, items, opts, { notify = true } = {}) {
+async function applyLearnings(db, session, reviewId, items, opts, { notify = true, userTurns = [] } = {}) {
   const ts = Date.now();
   const insert = db.prepare(`
-    INSERT INTO candidates (review_id, session_id, project, kind, scope, memory_type, title, summary, evidence, confidence, repeats, outcome, payload, cwd, ts)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`);
+    INSERT INTO candidates (review_id, session_id, project, kind, scope, memory_type, title, summary, evidence, confidence, repeats, outcome, payload, cwd, quotes, ts)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`);
   for (const raw of items) {
     const item = { op: 'create', ...raw, scope: raw.kind === 'profile' ? 'global' : raw.scope || 'project' };
     insert.run(reviewId, session.id, session.project, item.kind, item.scope, item.memory_type ?? null,
       String(item.title || item.text || '').slice(0, 200), String(item.text || item.body || item.description || '').slice(0, 1500),
       String(item.evidence || '').slice(0, 800), item.confidence ?? null, item.repeats || null,
-      JSON.stringify({ item, cwd: session.cwd, trigger: 'session_end', actor: 'background', autonomy: opts.autonomy, notify }), session.cwd, ts);
+      JSON.stringify({ item, cwd: session.cwd, trigger: 'session_end', actor: 'background', autonomy: opts.autonomy, notify }), session.cwd,
+      JSON.stringify(quotesFor(item.evidence, userTurns)), ts);
   }
   if (!items.length) return null;
   const { drainQueue } = await import('./evaluate.mjs');
@@ -385,7 +386,7 @@ export async function reviewSession(db, sessionId, trigger, overrides = {}) {
         .run(reviewId, sessionId, String(c.quote).slice(0, 500), c.kind, ts);
     }
     if (mode === 'background') {
-      await applyLearnings(db, session, reviewId, out.items, opts, { notify: !learnBackfill });
+      await applyLearnings(db, session, reviewId, out.items, opts, { notify: !learnBackfill, userTurns: digest.userTurns });
       finish(db, sessionId, 'done', digest.nextLine);
       return 'ok';
     }
