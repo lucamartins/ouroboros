@@ -4,13 +4,16 @@
 // Pages, one question each:
 //   Inbox      what waits for your decision (grouped by project, then by target file)
 //   Overview   is learning working? (corrections before/after, use, misses, cost)
-//   Knowledge  what Claude knows (learned items, skills, memories, instruction files)
+//   Knowledge  what Claude knows (learned items, skills, memories, instruction files,
+//              and a graph of how they connect)
 //   Activity   what happened (sessions, reviews, proposals, dropped, corrections)
 //   System     health and cost (capture, reviewer, quality, budgets, problems)
 //
 // Page state lives in the URL hash: `#<tab>[/<segment or anchor>][?filters]`, e.g.
 // `#knowledge/learned?q=nisus&project=…` or `#activity/proposals?kind=skill&days=90`.
 // Lists are paged by the server ("Showing 50 of 1,240" and "Load more").
+
+import { forceLayout } from './force.js';
 
 const view = document.getElementById('view');
 const tooltip = document.getElementById('tooltip');
@@ -999,7 +1002,7 @@ function learnedRow(c) {
       c.canArchive ? actionButton('Archive', 'forget', l.id, { small: true, variant: 'quiet', iconName: 'archive', confirmText: 'Archive it?', title: 'Stop loading it; restorable with undo' }) : null));
 }
 
-const KNOWLEDGE_SEGS = ['learned', 'skills', 'memories', 'instructions'];
+const KNOWLEDGE_SEGS = ['learned', 'skills', 'memories', 'instructions', 'graph'];
 
 /** Columns of each inventory list; `sort` names the server-side sort key. */
 const INVENTORY_COLUMNS = {
@@ -1036,11 +1039,11 @@ async function renderKnowledge() {
   const undoneToggle = seg === 'learned' && n.undone ? h('label', { class: 'check small muted' },
     h('input', { type: 'checkbox', checked: param('undone') === '1', 'data-fk': 'undone', onchange: (e) => { setNav({ set: { undone: e.target.checked ? '1' : '' }, push: false }); fillKnowledge(results, seg); } }),
     h('span', { class: 'undone-label' }, `Show undone (${fmt.int(n.undone)})`)) : null;
-  const search = searchBox(param('q'), seg === 'learned' ? 'Filter by title, reason or file' : 'Filter by name, text or path',
-    (q) => { setNav({ set: { q }, push: false }); fillKnowledge(results, seg); }, 'search:knowledge');
+  const search = searchBox(param('q'), seg === 'learned' ? 'Filter by title, reason or file' : seg === 'graph' ? 'Find an item' : 'Filter by name, text or path',
+    (q) => { setNav({ set: { q }, push: false }); if (seg === 'graph') state.graph?.search(q); else fillKnowledge(results, seg); }, 'search:knowledge');
 
   const toolbar = h('div', { class: 'toolbar' },
-    segmented([['learned', 'Learned', n.learned], ['skills', 'Skills', n.skills], ['memories', 'Memories', n.memories], ['instructions', 'Instruction files', n.instructions]],
+    segmented([['learned', 'Learned', n.learned], ['skills', 'Skills', n.skills], ['memories', 'Memories', n.memories], ['instructions', 'Instruction files', n.instructions], ['graph', 'Graph']],
       seg, (next) => go({ sub: next, keep: false, set: { project } }), 'Knowledge lists'),
     h('div', { class: 'filters' }, projectFilter(), search, undoneToggle));
   await fillKnowledge(results, seg);
@@ -1058,7 +1061,9 @@ async function fillKnowledge(results, seg) {
   const project = param('project');
   let content;
   try {
-    content = seg === 'learned' ? await learnedList(q, project) : await inventoryList(seg, q, project);
+    state.graph?.stop();
+    state.graph = null;
+    content = seg === 'learned' ? await learnedList(q, project) : seg === 'graph' ? await graphList(project) : await inventoryList(seg, q, project);
   } catch (err) {
     content = sectionError(err, 'this list');
   }
@@ -1104,6 +1109,415 @@ async function inventoryList(kind, q, project) {
       t.el, foot);
   }));
 }
+
+// ---------- Knowledge › Graph ----------
+const GRAPH_KINDS = [
+  ['skill', 'Skills'], ['reference', 'Reference files'], ['memory', 'Memories'], ['profile', 'Profile'],
+  ['instructions', 'CLAUDE.md'], ['rules', 'Rule files'], ['project', 'Projects'],
+];
+const GRAPH_KIND_ONE = { skill: 'skill', reference: 'reference file', memory: 'memory', profile: 'profile', instructions: 'CLAUDE.md', rules: 'rule file', project: 'project' };
+const GRAPH_EDGES = [
+  ['link', 'Links', 'An explicit [[link]] or markdown link between two files'],
+  ['mention', 'Mentions', 'A file names a skill'],
+  ['contains', 'Contains', 'A skill and its reference files'],
+  ['used', 'Used together', 'Used in the same sessions, at least twice'],
+  ['similar', 'Similar', 'Close wording: a hint, not a relation'],
+  ['belongs', 'Project', 'The project an item belongs to'],
+];
+/** How an edge reads from the selected item's side: [outgoing, incoming]. */
+const EDGE_READS = {
+  link: ['Links to', 'Linked from'], mention: ['Names', 'Named by'], contains: ['Contains', 'Part of'],
+  used: ['Used together with', 'Used together with'], similar: ['Similar wording', 'Similar wording'], belongs: ['Project', 'In this project'],
+};
+const GRAPH_HEIGHT = { wide: 640, narrow: 440 };
+const ZOOM_MIN = 0.2;
+const ZOOM_MAX = 4;
+/** Above this zoom every skill and memory shows its name, not only hubs and the focused ones. */
+const ZOOM_LABELS = 1.5;
+/** Layout work per animation frame, and before the first paint. */
+const FRAME_BUDGET_MS = 6;
+const WARMUP_MS = 60;
+
+const listParam = (k) => new Set(param(k).split(',').filter(Boolean));
+
+function nodeRadius(n) {
+  if (n.kind === 'project') return 11;
+  const base = { skill: 6.5, reference: 3.5, memory: 5.5, profile: 7, instructions: 6, rules: 4.5 }[n.kind] || 5;
+  return Math.min(base + Math.sqrt(n.uses || 0) * 0.9 + Math.min(n.degree || 0, 12) * 0.15, 15);
+}
+
+/** Where an item lives in the Knowledge lists, to see it there. */
+function knowledgeLink(n) {
+  const seg = { skill: 'skills', memory: 'memories', instructions: 'instructions' }[n.kind];
+  if (!seg) return null;
+  return hashOf('knowledge', seg, new URLSearchParams({ q: n.kind === 'instructions' ? n.path : n.name }));
+}
+
+async function graphList(project) {
+  const plugins = param('plugins') === 'all' ? 'all' : '';
+  const data = await api('graph', { project, plugins });
+  if (!data.stats.items) {
+    return h('div', { class: 'panel' }, h('div', { class: 'empty' }, h('p', {}, project ? 'Nothing Claude knows belongs to this project yet.' : 'Nothing to draw yet: no skill, memory or instruction file was found.')));
+  }
+  return graphView(data);
+}
+
+/**
+ * The graph page: filters, the drawing and a side panel with the selected item (or a
+ * summary). Everything the drawing shows is also reachable from the panel's lists, so the
+ * page works with a keyboard and a screen reader.
+ */
+function graphView(data) {
+  const hideKinds = listParam('hide');
+  const hideEdges = listParam('off');
+  const wrap = h('div', { class: 'graph-page' });
+
+  const kindChips = h('div', { class: 'chips', role: 'group', 'aria-label': 'Kinds of items' }, GRAPH_KINDS
+    .filter(([k]) => data.nodes.some((n) => n.kind === k))
+    .map(([k, label]) => h('button', {
+      type: 'button', class: 'chip', 'aria-pressed': String(!hideKinds.has(k)), 'data-fk': `kind:${k}`,
+      onclick: () => { toggleIn('hide', k); paint(); },
+    }, h('span', { class: `swatch k-${k}` }), label, h('span', { class: 'n' }, fmt.int(data.nodes.filter((n) => n.kind === k).length)))));
+  const edgeChips = h('div', { class: 'chips', role: 'group', 'aria-label': 'Kinds of connections' }, GRAPH_EDGES
+    .filter(([t]) => data.stats.edges[t])
+    .map(([t, label, tip]) => h('button', {
+      type: 'button', class: 'chip', title: tip, 'aria-pressed': String(!hideEdges.has(t)), 'data-fk': `edge:${t}`,
+      onclick: () => { toggleIn('off', t); paint(); },
+    }, s('svg', { class: 'edge-sample', viewBox: '0 0 18 6', 'aria-hidden': 'true' }, s('line', { x1: 1, y1: 3, x2: 17, y2: 3, class: `e-${t}` })), label, h('span', { class: 'n' }, fmt.int(data.stats.edges[t])))));
+  const pluginsToggle = h('label', { class: 'check small muted', title: 'Plugin skills nothing here uses or names are left out by default' },
+    h('input', { type: 'checkbox', checked: param('plugins') === 'all', 'data-fk': 'plugins', onchange: (e) => { setNav({ set: { plugins: e.target.checked ? 'all' : '' }, push: false }); fillKnowledge(document.querySelector('.results'), 'graph'); } }),
+    'All plugin skills');
+
+  function toggleIn(key, value) {
+    const set = listParam(key);
+    if (set.has(value)) set.delete(value); else set.add(value);
+    setNav({ set: { [key]: [...set].join(',') }, push: false });
+  }
+
+  const holder = h('div', { class: 'graph-holder' });
+  const side = h('aside', { class: 'panel graph-side', 'aria-live': 'polite' });
+  wrap.append(h('div', { class: 'graph-filters' }, kindChips, edgeChips, pluginsToggle), h('div', { class: 'graph-body' }, holder, side));
+
+  let drawing = null;
+  function paint() {
+    const hk = listParam('hide');
+    const he = listParam('off');
+    for (const b of kindChips.children) b.setAttribute('aria-pressed', String(!hk.has(b.dataset.fk.slice(5))));
+    for (const b of edgeChips.children) b.setAttribute('aria-pressed', String(!he.has(b.dataset.fk.slice(5))));
+    drawing?.stop();
+    const nodes = data.nodes.filter((n) => !hk.has(n.kind));
+    const ids = new Set(nodes.map((n) => n.id));
+    const edges = data.edges.filter((e) => !he.has(e.type) && ids.has(e.source) && ids.has(e.target));
+    drawing = drawGraph({ nodes, edges, all: data, holder, side });
+    state.graph = drawing;
+  }
+  paint();
+  return wrap;
+}
+
+function drawGraph({ nodes, edges, all, holder, side }) {
+  const saved = (state.graphPos ||= new Map());
+  const sim = nodes.map((n) => {
+    const p = saved.get(n.id);
+    return { ...n, x: p?.x, y: p?.y, r: nodeRadius(n), charge: n.kind === 'project' ? -420 : -(55 + Math.min(n.degree || 0, 12) * 12) };
+  });
+  const byId = new Map(sim.map((n) => [n.id, n]));
+  const allById = new Map(all.nodes.map((n) => [n.id, n]));
+  const neighbors = new Map(sim.map((n) => [n.id, new Set()]));
+  for (const e of edges) { neighbors.get(e.source)?.add(e.target); neighbors.get(e.target)?.add(e.source); }
+  const layout = forceLayout(sim, edges);
+  if (sim.every((n) => saved.has(n.id))) layout.reheat(0.05);
+
+  const view = { k: 1, x: 0, y: 0 };
+  const svg = s('svg', { class: 'graph', role: 'img', 'aria-label': `Knowledge graph: ${fmt.plural(sim.filter((n) => n.kind !== 'project').length, 'item')} and ${fmt.plural(edges.length, 'connection')}. Use the panel to browse them.` });
+  const viewport = s('g', {});
+  const edgeLayer = s('g', { class: 'edges' });
+  const nodeLayer = s('g', { class: 'nodes' });
+  viewport.append(edgeLayer, nodeLayer);
+  svg.append(viewport);
+
+  const lineEls = edges.map((e) => {
+    const el = s('line', { class: `e-${e.type}` });
+    edgeLayer.append(el);
+    return { e, el, a: byId.get(e.source), b: byId.get(e.target) };
+  });
+  const nodeEls = new Map();
+  for (const n of sim) {
+    const g = s('g', { class: `node k-${n.kind}${n.learned ? ' learned' : ''}${n.degree || n.kind === 'project' ? '' : ' lonely'}`, 'data-id': n.id });
+    g.append(s('circle', { r: n.r }), s('text', { y: n.r + 2 }, n.kind === 'project' ? n.label : shortLabel(n)));
+    nodeLayer.append(g);
+    nodeEls.set(n.id, g);
+  }
+
+  const controls = h('div', { class: 'graph-controls' },
+    h('button', { type: 'button', class: 'btn icon small', 'aria-label': 'Zoom in', title: 'Zoom in', onclick: () => zoomBy(1.4) }, '+'),
+    h('button', { type: 'button', class: 'btn icon small', 'aria-label': 'Zoom out', title: 'Zoom out', onclick: () => zoomBy(1 / 1.4) }, '−'),
+    h('button', { type: 'button', class: 'btn small', title: 'Fit everything in view', onclick: () => fit(true) }, 'Fit'));
+  const hint = h('p', { class: 'graph-hint' }, 'Drag to move · scroll to zoom · click an item');
+  holder.replaceChildren(svg, controls, hint);
+
+  let size = { w: holder.clientWidth || 800, h: holder.clientHeight || GRAPH_HEIGHT.wide };
+  const setBox = () => svg.setAttribute('viewBox', `${-size.w / 2} ${-size.h / 2} ${size.w} ${size.h}`);
+  setBox();
+  let observed = false;
+  const ro = new ResizeObserver(() => {
+    if (!svg.isConnected) { ro.disconnect(); return; }
+    size = { w: holder.clientWidth || size.w, h: holder.clientHeight || size.h };
+    setBox();
+    // The drawing is built before it is on the page: fit it once its real size is known.
+    if (!observed) { observed = true; if (!userMoved) fit(); }
+  });
+  ro.observe(holder);
+
+  function applyView() {
+    viewport.setAttribute('transform', `translate(${view.x} ${view.y}) scale(${view.k})`);
+    // Labels keep a readable size on screen whatever the zoom.
+    svg.style.setProperty('--zoom', String(view.k));
+    svg.classList.toggle('zoomed', view.k >= ZOOM_LABELS);
+  }
+  function paintPositions() {
+    for (const l of lineEls) {
+      l.el.setAttribute('x1', l.a.x.toFixed(1)); l.el.setAttribute('y1', l.a.y.toFixed(1));
+      l.el.setAttribute('x2', l.b.x.toFixed(1)); l.el.setAttribute('y2', l.b.y.toFixed(1));
+    }
+    for (const n of sim) nodeEls.get(n.id).setAttribute('transform', `translate(${n.x.toFixed(1)} ${n.y.toFixed(1)})`);
+  }
+  function fit(animate = false) {
+    if (!sim.length) return;
+    const xs = sim.map((n) => n.x);
+    const ys = sim.map((n) => n.y);
+    const [x0, x1, y0, y1] = [Math.min(...xs) - 30, Math.max(...xs) + 30, Math.min(...ys) - 30, Math.max(...ys) + 40];
+    const k = Math.min(Math.max(Math.min(size.w / (x1 - x0), size.h / (y1 - y0)), ZOOM_MIN), 1.6);
+    Object.assign(view, { k, x: -((x0 + x1) / 2) * k, y: -((y0 + y1) / 2) * k });
+    svg.classList.toggle('animate', animate && !reducedMotion());
+    applyView();
+  }
+  /** Client point → drawing coordinates (the viewBox is centered and 1:1 with pixels). */
+  function toGraph(clientX, clientY) {
+    const r = svg.getBoundingClientRect();
+    const sx = clientX - r.left - r.width / 2;
+    const sy = clientY - r.top - r.height / 2;
+    return { x: (sx - view.x) / view.k, y: (sy - view.y) / view.k, sx, sy };
+  }
+  function zoomAt(factor, sx = 0, sy = 0) {
+    const k = Math.min(Math.max(view.k * factor, ZOOM_MIN), ZOOM_MAX);
+    view.x = sx - ((sx - view.x) * k) / view.k;
+    view.y = sy - ((sy - view.y) * k) / view.k;
+    view.k = k;
+    svg.classList.remove('animate');
+    applyView();
+  }
+  const zoomBy = (f) => { userMoved = true; zoomAt(f); };
+  function centerOn(n) {
+    view.x = -n.x * view.k;
+    view.y = -n.y * view.k;
+    svg.classList.toggle('animate', !reducedMotion());
+    applyView();
+  }
+
+  // Simulation loop: animated, or computed at once when the user prefers less motion.
+  let running = true;
+  /** Once the user pans, zooms or drags, the view is theirs: no automatic fitting. */
+  let userMoved = false;
+  let fitted = sim.every((n) => saved.has(n.id));
+  const save = () => { for (const n of sim) saved.set(n.id, { x: n.x, y: n.y }); };
+  let seen = false;
+  let waited = 0;
+  function frame() {
+    if (svg.isConnected) seen = true;
+    // Stop once the drawing left the page (or never reached it).
+    if (!running || (seen && !svg.isConnected) || (!seen && ++waited > 120)) { running = false; ro.disconnect(); return; }
+    const until = performance.now() + FRAME_BUDGET_MS;
+    while (!layout.done() && performance.now() < until) layout.tick();
+    paintPositions();
+    if (!fitted && layout.alpha() < 0.08) { fitted = true; if (!userMoved) fit(true); }
+    if (layout.done()) { save(); return; }
+    requestAnimationFrame(frame);
+  }
+  const kick = () => { if (!svg.isConnected) return; const was = !layout.done(); layout.reheat(0.25); if (!was) requestAnimationFrame(frame); };
+  if (reducedMotion()) {
+    for (let i = 0; i < 500 && !layout.done(); i++) layout.tick();
+    paintPositions();
+    fit();
+    save();
+  } else {
+    // Most of the settling happens before the first paint; the rest is animated.
+    const until = performance.now() + WARMUP_MS;
+    while (!fitted && layout.alpha() > 0.3 && performance.now() < until) layout.tick();
+    paintPositions();
+    fit();
+    requestAnimationFrame(frame);
+  }
+
+  // Pointer: drag a node to move it, drag the background to pan, click to select.
+  let drag = null;
+  svg.addEventListener('pointerdown', (ev) => {
+    const g = ev.target.closest('.node');
+    const p = toGraph(ev.clientX, ev.clientY);
+    drag = { node: g ? byId.get(g.dataset.id) : null, start: { x: ev.clientX, y: ev.clientY }, view: { ...view }, moved: false };
+    svg.setPointerCapture(ev.pointerId);
+    if (drag.node) { drag.node.fx = p.x; drag.node.fy = p.y; }
+    hideTip();
+  });
+  svg.addEventListener('pointermove', (ev) => {
+    if (!drag) return;
+    const dx = ev.clientX - drag.start.x;
+    const dy = ev.clientY - drag.start.y;
+    if (Math.abs(dx) + Math.abs(dy) > 3) { drag.moved = true; userMoved = true; }
+    if (!drag.moved) return;
+    if (drag.node) {
+      const p = toGraph(ev.clientX, ev.clientY);
+      drag.node.fx = p.x; drag.node.fy = p.y;
+      kick();
+    } else {
+      view.x = drag.view.x + dx;
+      view.y = drag.view.y + dy;
+      svg.classList.remove('animate');
+      applyView();
+    }
+  });
+  const endDrag = (ev) => {
+    if (!drag) return;
+    const d = drag;
+    drag = null;
+    if (d.node) { d.node.fx = null; d.node.fy = null; }
+    if (!d.moved && ev.type === 'pointerup') select(d.node ? d.node.id : null);
+    else if (d.node) save();
+  };
+  svg.addEventListener('pointerup', endDrag);
+  svg.addEventListener('pointercancel', endDrag);
+  svg.addEventListener('wheel', (ev) => {
+    ev.preventDefault();
+    const p = toGraph(ev.clientX, ev.clientY);
+    userMoved = true;
+    zoomAt(Math.exp(-ev.deltaY * 0.0015), p.sx, p.sy);
+  }, { passive: false });
+  svg.addEventListener('pointerover', (ev) => {
+    const g = ev.target.closest?.('.node');
+    if (!g || drag) return;
+    const n = byId.get(g.dataset.id);
+    hover(n.id);
+    showTip(g, h('b', {}, n.label), h('div', { class: 'faint' }, [GRAPH_KIND_ONE[n.kind], n.project_name].filter(Boolean).join(' · ')));
+  });
+  svg.addEventListener('pointerout', (ev) => {
+    if (ev.target.closest?.('.node')) { hover(null); hideTip(); }
+  });
+
+  function hover(id) {
+    svg.classList.toggle('hovering', !!id);
+    for (const g of nodeLayer.querySelectorAll('.hot')) g.classList.remove('hot');
+    for (const l of lineEls) l.el.classList.remove('hot');
+    if (!id) return;
+    nodeEls.get(id)?.classList.add('hot');
+    for (const m of neighbors.get(id) || []) nodeEls.get(m)?.classList.add('hot');
+    for (const l of lineEls) if (l.e.source === id || l.e.target === id) l.el.classList.add('hot');
+  }
+
+  let selected = null;
+  let matches = new Set();
+  function select(id, { center = false } = {}) {
+    selected = id && byId.has(id) ? id : null;
+    setNav({ set: { sel: selected || '' }, push: false });
+    svg.classList.toggle('focusing', !!selected);
+    for (const g of nodeEls.values()) g.classList.remove('on', 'sel');
+    for (const l of lineEls) l.el.classList.toggle('on', !!selected && (l.e.source === selected || l.e.target === selected));
+    if (selected) {
+      nodeEls.get(selected).classList.add('on', 'sel');
+      for (const m of neighbors.get(selected)) nodeEls.get(m)?.classList.add('on');
+      if (center) centerOn(byId.get(selected));
+    }
+    side.replaceChildren(...(selected ? detailPanel(byId.get(selected)) : summaryPanel()).filter(Boolean));
+  }
+
+  function search(q) {
+    const text = String(q || '').toLowerCase();
+    matches = new Set(text ? sim.filter((n) => [n.label, n.name, n.description, n.path, n.project_name].some((x) => String(x || '').toLowerCase().includes(text))).map((n) => n.id) : []);
+    svg.classList.toggle('searching', !!text);
+    for (const [id, g] of nodeEls) g.classList.toggle('match', matches.has(id));
+    return matches;
+  }
+
+  function itemButton(n, extra) {
+    return h('button', { type: 'button', class: 'graph-item', 'data-fk': `item:${n.id}`, onclick: () => select(n.id, { center: true }) },
+      h('span', { class: `swatch k-${n.kind}` }), h('span', { class: 'graph-item-label' }, n.label), extra ? h('span', { class: 'faint' }, extra) : null);
+  }
+
+  function detailPanel(n) {
+    const full = allById.get(n.id) || n;
+    const groups = new Map();
+    for (const e of all.edges) {
+      if (e.source !== n.id && e.target !== n.id) continue;
+      const other = allById.get(e.source === n.id ? e.target : e.source);
+      if (!other) continue;
+      const outgoing = e.type === 'contains' || e.type === 'belongs' ? e.source === n.id : (e.from ? e.from === n.id : e.source === n.id);
+      const label = EDGE_READS[e.type][outgoing ? 0 : 1];
+      if (!groups.has(label)) groups.set(label, []);
+      groups.get(label).push({ other, e });
+    }
+    const usage = n.kind === 'project' ? null
+      : n.uses ? `${n.kind === 'skill' ? 'Used' : 'Read'} ${fmt.plural(n.uses, 'time')}${n.lastUsed ? `, last ${fmt.when(n.lastUsed)}` : ''}`
+        : n.kind === 'skill' || n.kind === 'memory' ? `Not ${n.kind === 'skill' ? 'used' : 'read'} since Ouroboros started measuring` : null;
+    const link = knowledgeLink(n);
+    return [
+      h('div', { class: 'graph-side-head' },
+        h('h2', {}, n.label),
+        h('button', { type: 'button', class: 'btn icon quiet small', 'aria-label': 'Close details', title: 'Close', 'data-fk': 'graph-close', onclick: () => select(null) }, icon('x'))),
+      h('div', { class: 'graph-tags' }, pill(GRAPH_KIND_ONE[n.kind]), n.memoryType ? pill(n.memoryType) : null, n.learned ? pill('changed by Ouroboros', 'accent') : null,
+        n.kind !== 'project' ? h('span', { class: 'faint' }, n.project_name || 'everywhere') : null),
+      n.path ? h('p', { class: 'mono graph-path' }, n.path) : null,
+      full.description ? clampText(full.description) : null,
+      usage ? h('p', { class: 'muted small-text' }, usage) : null,
+      full.dangling?.length ? h('div', { class: 'graph-warn' }, icon('alert'), h('div', {}, h('b', {}, 'Broken links: '), full.dangling.map((d) => `[[${d}]]`).join(', '), '. Nothing with that name exists.')) : null,
+      groups.size ? h('div', { class: 'graph-conns' }, [...groups].map(([label, list]) => h('section', {},
+        h('h3', {}, label, h('span', { class: 'n' }, fmt.int(list.length))),
+        h('ul', { class: 'graph-list' }, list.sort((a, b) => a.other.label.localeCompare(b.other.label)).slice(0, 60).map(({ other, e }) => h('li', {},
+          byId.has(other.id) ? itemButton(other, e.type === 'used' ? `${e.sessions} sessions` : e.type === 'similar' ? `${Math.round(e.score * 100)}%` : null)
+            : h('span', { class: 'graph-item hidden-item' }, h('span', { class: `swatch k-${other.kind}` }), other.label, h('span', { class: 'faint' }, 'hidden by a filter'))))))))
+        : h('p', { class: 'faint' }, 'No connections: nothing links to it, names it or was used with it.'),
+      link ? h('p', {}, h('a', { href: link }, 'Show in the Knowledge list')) : null,
+    ];
+  }
+
+  function summaryPanel() {
+    const st = all.stats;
+    const lonely = all.nodes.filter((n) => n.kind !== 'project' && !n.degree);
+    const dangling = all.nodes.filter((n) => n.dangling?.length);
+    const byKind = GRAPH_KINDS.filter(([k]) => k !== 'project').map(([k, label]) => [k, label, sim.filter((n) => n.kind === k).sort((a, b) => (b.degree || 0) - (a.degree || 0) || a.label.localeCompare(b.label))]).filter(([, , l]) => l.length);
+    return [
+      h('h2', {}, 'What connects to what'),
+      h('p', { class: 'muted' }, `${fmt.plural(st.items, 'item')} and ${fmt.plural(Object.entries(st.edges).filter(([t]) => t !== 'belongs').reduce((s, [, v]) => s + v, 0), 'connection')}. Bigger circles are used more; a ring marks what Ouroboros wrote or changed.`),
+      lonely.length ? disclose(`Unconnected (${fmt.int(lonely.length)})`,
+        h('p', { class: 'faint small-text' }, 'Nothing links to these, names them or used them with something else. Candidates to link, merge or retire.'),
+        h('ul', { class: 'graph-list' }, lonely.map((n) => h('li', {}, byId.has(n.id) ? itemButton(n) : h('span', { class: 'graph-item hidden-item' }, n.label))))) : null,
+      dangling.length ? disclose(`Broken links (${fmt.int(st.dangling)})`,
+        h('ul', { class: 'graph-list' }, dangling.map((n) => h('li', {}, byId.has(n.id) ? itemButton(n, n.dangling.map((d) => `[[${d}]]`).join(', ')) : n.label)))) : null,
+      disclose('Browse every item', ...byKind.map(([k, label, list]) => h('section', { class: 'graph-browse' },
+        h('h3', {}, label, h('span', { class: 'n' }, fmt.int(list.length))),
+        h('ul', { class: 'graph-list' }, list.map((n) => h('li', {}, itemButton(n, n.degree ? fmt.plural(n.degree, 'link') : null))))))),
+    ];
+  }
+
+  const initial = param('sel');
+  if (initial && byId.has(initial)) select(initial); else side.replaceChildren(...summaryPanel().filter(Boolean));
+  if (param('q')) search(param('q'));
+
+  return {
+    stop() { running = false; ro.disconnect(); },
+    search(q) {
+      // A search replaces the selection: one highlight at a time.
+      if (selected && q) select(null);
+      const found = search(q);
+      if (found.size === 1) select([...found][0], { center: true });
+    },
+  };
+}
+
+function shortLabel(n) {
+  const text = n.kind === 'reference' ? n.label.split('/').pop() : n.kind === 'instructions' ? n.label.split('/').slice(-2).join('/') : n.label;
+  return text.length > 28 ? `${text.slice(0, 27)}…` : text;
+}
+
+const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 // ---------- Activity ----------
 const OUTCOME = {

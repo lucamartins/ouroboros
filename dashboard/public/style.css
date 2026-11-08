@@ -495,3 +495,113 @@ th.num .sort { flex-direction: row-reverse; }
 }
 .claims > li { grid-template-columns: 22px minmax(0, 1fr) auto; }
 .claims .claim-text, .evidence, .item-body, .item-reason, .row-main { overflow-wrap: anywhere; }
+
+/* ---------- knowledge graph (Knowledge › Graph) ----------
+   One color per kind of item, readable on both themes; edges differ by stroke, not hue,
+   except "used together" (the accent). */
+:root {
+  --k-skill: #2a78d6; --k-reference: #86b1e6; --k-memory: #13896b; --k-profile: #8250c8;
+  --k-instructions: #bf7413; --k-rules: #b84a66; --k-project: #77756d;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --k-skill: #4b93ea; --k-reference: #5b82b3; --k-memory: #3dbd98; --k-profile: #a681e6;
+    --k-instructions: #e3a243; --k-rules: #e07a95; --k-project: #8f8e86;
+  }
+}
+:root[data-theme="dark"] {
+  --k-skill: #4b93ea; --k-reference: #5b82b3; --k-memory: #3dbd98; --k-profile: #a681e6;
+  --k-instructions: #e3a243; --k-rules: #e07a95; --k-project: #8f8e86;
+}
+.k-skill { --k: var(--k-skill); }
+.k-reference { --k: var(--k-reference); }
+.k-memory { --k: var(--k-memory); }
+.k-profile { --k: var(--k-profile); }
+.k-instructions { --k: var(--k-instructions); }
+.k-rules { --k: var(--k-rules); }
+.k-project { --k: var(--k-project); }
+
+.graph-filters { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s4); align-items: center; margin-bottom: var(--s3); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--surface); color: var(--text-2); font: inherit; font-size: 12.5px; cursor: pointer;
+}
+.chip:hover { border-color: var(--border-strong); color: var(--text); }
+.chip[aria-pressed="false"] { background: transparent; color: var(--text-3); }
+.chip .n { color: var(--text-3); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.swatch { width: 9px; height: 9px; border-radius: 50%; flex: none; background: var(--k, var(--text-3)); }
+.chip[aria-pressed="false"] .swatch { background: transparent; box-shadow: inset 0 0 0 1.5px var(--k, var(--text-3)); }
+.edge-sample { width: 18px; height: 6px; overflow: visible; flex: none; }
+.chip[aria-pressed="false"] .edge-sample { opacity: .4; }
+
+line[class^="e-"] { stroke: var(--text-3); stroke-opacity: .45; stroke-width: 1; fill: none; }
+.e-link { stroke: var(--text-2); stroke-opacity: .6; stroke-width: 1.2; }
+.e-mention { stroke-opacity: .55; }
+.e-contains { stroke: var(--k-reference); stroke-opacity: .75; }
+.e-used { stroke: var(--accent); stroke-opacity: .85; stroke-width: 1.8; stroke-dasharray: 0.5 3.5; stroke-linecap: round; }
+.e-similar { stroke-dasharray: 4 3; stroke-opacity: .4; }
+.e-belongs { stroke: var(--border-strong); stroke-opacity: .7; stroke-width: .8; }
+
+.graph-body { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: var(--s4); align-items: start; }
+.graph-holder {
+  position: relative; height: min(72vh, 680px); min-height: 420px; overflow: hidden;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow);
+}
+.graph { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; user-select: none; -webkit-user-select: none; }
+.graph:active { cursor: grabbing; }
+.graph.animate > g { transition: transform .35s ease; }
+.graph .node { cursor: pointer; transition: opacity .15s; }
+.graph .node circle { fill: var(--k); stroke: var(--surface); stroke-width: 1.5; }
+.graph .node.learned circle { stroke: var(--text); stroke-width: 2; }
+.graph .node.k-project circle { fill: var(--surface-2); stroke: var(--k-project); stroke-width: 2; }
+.graph .node text {
+  display: none; font-size: calc(10.5px / var(--zoom, 1)); fill: var(--text-2); text-anchor: middle; dominant-baseline: hanging; pointer-events: none;
+  paint-order: stroke; stroke: var(--surface); stroke-width: calc(3px / var(--zoom, 1)); stroke-linejoin: round;
+}
+.graph .node.k-project text { display: block; font-size: calc(11.5px / var(--zoom, 1)); font-weight: 600; fill: var(--text); }
+/* Skills and the profile are few and named for what they do: always labelled. The rest on zoom. */
+.graph .node:is(.k-skill, .k-profile) text,
+.graph.zoomed .node:is(.k-memory, .k-instructions, .k-rules) text,
+.graph .node:is(.hot, .on, .match) text { display: block; }
+.graph line { transition: stroke-opacity .15s; }
+.graph.hovering .node:not(.hot), .graph.focusing:not(.hovering) .node:not(.on), .graph.searching:not(.hovering):not(.focusing) .node:not(.match) { opacity: .2; }
+.graph.hovering line:not(.hot), .graph.focusing:not(.hovering) line:not(.on), .graph.searching:not(.hovering):not(.focusing) line { stroke-opacity: .07; }
+.graph line.hot, .graph line.on { stroke-opacity: .95; }
+.graph .node.match circle { stroke: var(--warning); stroke-width: 2.5; }
+.graph .node.sel circle { stroke: var(--accent); stroke-width: 3; }
+.graph-controls { position: absolute; top: var(--s3); right: var(--s3); display: flex; gap: 4px; }
+.graph-controls .btn.icon { width: 28px; font-size: 16px; line-height: 1; }
+.graph-hint { position: absolute; left: var(--s3); bottom: var(--s2); margin: 0; font-size: 12px; color: var(--text-3); pointer-events: none; }
+
+.graph-side { padding: var(--s4); max-height: min(72vh, 680px); overflow: auto; }
+.graph-side h2 { font-size: 15px; margin: 0 0 var(--s2); overflow-wrap: anywhere; }
+.graph-side > p { margin: 0 0 var(--s2); }
+.graph-side-head { display: flex; justify-content: space-between; gap: var(--s2); align-items: flex-start; }
+.graph-side-head h2 { margin-top: 4px; }
+.graph-tags { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: var(--s2); font-size: 12.5px; }
+.graph-path { overflow-wrap: anywhere; color: var(--text-3); }
+.graph-conns section, .graph-browse { margin-top: var(--s3); }
+.graph-side h3 { display: flex; gap: 6px; align-items: baseline; margin: 0 0 4px; font-size: 12px; font-weight: 600; letter-spacing: .03em; text-transform: uppercase; color: var(--text-3); }
+.graph-side h3 .n { font-weight: 400; }
+.graph-list { list-style: none; margin: 0; padding: 0; }
+.graph-item {
+  display: flex; align-items: center; gap: 8px; width: 100%; padding: 4px 6px; border: 0; border-radius: var(--radius-sm);
+  background: none; color: var(--text); font: inherit; font-size: 13px; text-align: left; cursor: pointer;
+}
+.graph-item:hover { background: var(--surface-2); }
+.graph-item-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.graph-item .faint { flex: none; font-size: 11.5px; }
+.graph-item.hidden-item { cursor: default; color: var(--text-3); }
+.graph-item.hidden-item:hover { background: none; }
+.graph-warn { display: flex; gap: 8px; margin: var(--s2) 0; padding: var(--s2) var(--s3); border-radius: var(--radius-sm); background: color-mix(in srgb, var(--warning) 14%, var(--surface)); font-size: 13px; }
+.graph-warn .i { flex: none; margin-top: 2px; }
+.small-text { font-size: 12.5px; }
+@media (max-width: 960px) {
+  .graph-body { grid-template-columns: 1fr; }
+  .graph-holder { height: 440px; min-height: 0; }
+  .graph-side { max-height: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .graph.animate > g, .graph .node, .graph line { transition: none; }
+}

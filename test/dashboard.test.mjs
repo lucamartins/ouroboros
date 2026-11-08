@@ -167,3 +167,16 @@ test('a skill file is named by its skill in titles', async () => {
   assert.equal(fileDisplayName('/home/x/.claude/skills/nisus/reference/business-rules.md'), 'nisus/reference/business-rules.md');
   assert.equal(fileDisplayName('/repo/.claude/rules/testing.md'), 'testing.md');
 });
+
+test('the graph route draws skills and memories, leaves idle plugin skills out, and never sends raw file paths', () => {
+  const skillsDir = path.join(tmp, 'claude', 'skills');
+  fs.writeFileSync(path.join(skillsDir, 'deploy', 'SKILL.md'), '---\nname: deploy\ndescription: Deploy the app\n---\nRun the `kit:lint` skill first.\n');
+  const g = api('graph', {});
+  const names = g.nodes.map((n) => n.name);
+  assert.ok(names.includes('deploy'));
+  assert.ok(names.includes('kit:lint'), 'a plugin skill a personal skill names is kept');
+  assert.ok(g.nodes.every((n) => !('file' in n) && !('text' in n)));
+  assert.ok(g.edges.some((e) => e.type === 'mention'));
+  assert.equal(typeof g.stats.items, 'number');
+  fs.writeFileSync(path.join(skillsDir, 'deploy', 'SKILL.md'), '---\nname: deploy\ndescription: Deploy the app\n---\n');
+});

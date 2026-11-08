@@ -23,7 +23,7 @@ For a local checkout: `/plugin marketplace add /path/to/ouroboros`.
 | `/ouroboros:inbox [this project | key]` | Goes through what waits for your decision in the conversation, one entry at a time: Claude shows the diff, checks it and recommends; you approve, reject, skip, or discuss and edit it before it is saved |
 | `/ouroboros:undo [id]` | Reverts the last (or a given) learning write |
 | `/ouroboros:forget <match>` | Archives a learning so it stops loading |
-| `/ouroboros:dashboard` | Opens the local dashboard (`http://127.0.0.1:4747`): an inbox of what waits for you, what was learned (each item with what it changed, why and from which session; undo, archive, keep), value, activity, cost and health |
+| `/ouroboros:dashboard` | Opens the local dashboard (`http://127.0.0.1:4747`): an inbox of what waits for you, what was learned (each item with what it changed, why and from which session; undo, archive, keep), a graph of how skills, memories and instruction files connect, value, activity, cost and health |
 | `/ouroboros:backfill [days] [limit]` | Reviews past sessions to build the baseline right away (asks before spending) |
 
 Everything else is automatic: capture hooks record turns, tool calls, error → fix recoveries, skill uses and memory reads/writes; a background reviewer runs when a session ends.

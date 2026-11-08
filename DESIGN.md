@@ -2,7 +2,7 @@
 
 > A Claude Code plugin that learns from your sessions on its own: it saves memories and creates/refines skills without being asked, in the spirit of Nous Research's Hermes Agent, and shows on a local dashboard what it learned, how much that is being used and what it costs.
 
-Status: v0.10.0 — every phase implemented, plus the learning evaluation (§7.0), the v0.8 mechanism review (§7.3), the inbox reviewed in the conversation (§9.3) and a dashboard that scales (§9.1: server-side paging and filters, the inbox grouped by project and file, page state in the URL, one project filter); next: real-world use, then a fresh install test on another machine. Owner decisions in [§12](#12-decisions).
+Status: v0.11.0 — every phase implemented, plus the learning evaluation (§7.0), the v0.8 mechanism review (§7.3), the inbox reviewed in the conversation (§9.3), a dashboard that scales (§9.1: server-side paging and filters, the inbox grouped by project and file, page state in the URL, one project filter) and a knowledge graph (§9.4, read-only); next: real-world use, then a fresh install test on another machine. Owner decisions in [§12](#12-decisions).
 
 ---
 
@@ -108,6 +108,7 @@ ouroboros/
 │   ├── review-worker.mjs      # reflection B (claude -p) + curator call
 │   ├── curator.mjs            # dedupe, routing, limits, writing, ledger
 │   ├── inbox.mjs              # what waits for the user and the decisions on it (dashboard + inbox skill)
+│   ├── graph.mjs              # knowledge graph derived from the files and usage (dashboard)
 │   └── paths.mjs              # resolves native memory, skills, config
 ├── skills/
 │   ├── learn/SKILL.md         # review script (periodic review and manual: /ouroboros:learn)
@@ -118,7 +119,7 @@ ouroboros/
 ├── agents/curator.md          # cheap-model subagent for consolidation when a budget overflows
 ├── dashboard/
 │   ├── server.mjs             # native http, 127.0.0.1, JSON API
-│   └── public/                # build-free HTML/CSS/JS; hand-rolled SVG charts
+│   └── public/                # build-free HTML/CSS/JS; hand-rolled SVG charts; force.js (graph layout)
 └── DESIGN.md
 ```
 
@@ -397,7 +398,7 @@ One page per question, in a sticky top bar; the Inbox carries a count of what wa
 |---|---|---|
 | **Inbox** | What needs my decision? | Entries grouped by project, then by target file (new items without one by kind; suggested fixes together), in `inbox.mjs`'s order: conflicts (a learning vs a written rule: "it is a new rule" / "keep the current rule"), changes to files (one diff per file with the learnings behind it; approve, reject, remove one learning), new items, suggested fixes. A group shows its first 20 entries with "Load more"; bulk approve/reject per group and for the whole filter; "check against knowledge" |
 | **Overview** | Is learning working? | Corrections per 100 turns before vs after learning with the delta, learned count, sessions using a learning, misses, month cost vs budget; trend charts with the "learning on" marker; recently learned |
-| **Knowledge** | What does Claude know? | **Learned**: one row per thing learned (each ledger batch), not per file: what it says (the title the writer gave, or the first sentence it added), why (the evidence, or the learnings of an approved change), where, from which session and how, what it saved or changed (a diff that opens on click), how often the file was used; actions Undo (only that change, later edits stay), Archive (only what Ouroboros created), Keep; undone rows behind a toggle next to the filter. Then every skill (personal, project and plugin skills in collapsible groups), memory (grouped by project) and instruction file, sortable by name, uses, last use or date |
+| **Knowledge** | What does Claude know? | **Learned**: one row per thing learned (each ledger batch), not per file: what it says (the title the writer gave, or the first sentence it added), why (the evidence, or the learnings of an approved change), where, from which session and how, what it saved or changed (a diff that opens on click), how often the file was used; actions Undo (only that change, later edits stay), Archive (only what Ouroboros created), Keep; undone rows behind a toggle next to the filter. Then every skill (personal, project and plugin skills in collapsible groups), memory (grouped by project) and instruction file, sortable by name, uses, last use or date; and **Graph** (§9.4) |
 | **Activity** | What happened? | Sessions, reviews (with cost), proposals and their outcome (filter by kind, outcome, period), what the knowledge check dropped (restorable), corrections; sortable by date; on a narrow screen each row is a labelled card |
 | **System** | Is it healthy, how good is it, what does it cost? | Capture and reviewer status, month cost; learning quality (outcome counts, approval and undo rates, why proposals were dropped, warnings); cost per review; context budgets; failed reviews and errors |
 
@@ -429,6 +430,24 @@ Editing is what the dashboard cannot do. Claude writes the user's version and `p
 **Readable diffs (v0.9.2).** Most changes add a sentence to a long Markdown line, and a line diff showed that paragraph twice, removed and added, with the change buried at its end; Claude then shortened the lines by hand with `(...)`, so the reader could not tell elided text from file text, and list items read as `- - item`. Now a line changed inside prints once as `~ …context{+added words+}[-removed words-]context…` (a word diff, cut to 40 characters of unchanged text around each change), nearby hunks print as one block (a context line is never the old version of a line the next hunk changes), and the skill makes Claude copy the printed diff verbatim, never hand-write or elide one, keep one kind of information per card field, and keep each option to this entry's decision (a related fix elsewhere is its own question afterwards).
 
 Every decision goes through the curator, so it lands in the ledger and is undoable. SessionStart tells the user when entries wait for them (with the notices, otherwise at most once a day): "N waiting for your decision: /ouroboros:inbox (or the dashboard)".
+
+### 9.4 Knowledge graph (Knowledge › Graph, v0.11)
+
+What Claude knows, drawn as a graph: which skills point to which, which memories link to each other, what belongs to which project, what is used together, and what stands alone. Hermes Agent shows a memory graph; Claude Code's own auto memory already writes `[[name]]` links between memories, which nothing displayed before.
+
+**Derived, never stored.** `scripts/graph.mjs` builds it on request from the same files the knowledge check reads (`knowledgeFiles` of every known project, minus sources of truth), every memory directory and the plugin skills, plus the usage events. No new table, no new file, nothing written. The `graph` API route caches it like the inventory (5 s).
+
+| Nodes | Edges (strongest evidence first) |
+|---|---|
+| skills, their reference files, memories, the profile, CLAUDE.md files, rule files; one hub per project | **link** (`[[name]]` resolved in the memory's own folder first, or a relative markdown link to another node); **mention** (a file names a skill: a hyphenated or `plugin:` name as a whole token, a plain-word name only as code, a `/command` or next to "skill", since `deploy` or `run` as words mean something else); **contains** (a skill and its reference files); **used** (used or read in the same sessions, at least twice); **similar** (TF-IDF cosine ≥ 0.3, top 2 per item, only between items not otherwise related: a hint, drawn dashed); **belongs** (item → project) |
+
+A `[[link]]` that resolves to nothing is reported as a **broken link** on its file. Items with no link, mention, containment or shared use are **unconnected** (candidates to link, merge or retire). Plugin skills appear only when used or named by a non-plugin file, unless the user asks for all of them. The Project filter keeps that project's items, what they relate to one edge away (so a global skill a project memory names stays) and its hub.
+
+**Drawing, without dependencies.** `dashboard/public/force.js` is a small force layout after d3-force's model (springs per edge type, O(n²) repulsion, centering, collision, velocity decay as `alpha` cools); enough for the few hundred items a machine has, and it keeps the zero-dependency rule (§2.8) and the strict CSP. Most settling happens before the first paint (a 60 ms warm-up), the rest is animated with a per-frame budget, or computed at once under `prefers-reduced-motion`; positions are kept while the page is open. Drag moves an item, drag on the background pans, the wheel and buttons zoom, Fit frames everything until the user takes over the view. Color is the kind of item, size grows with use, a ring marks files Ouroboros wrote or changed; skills and project hubs are always labelled, other items on zoom, hover or selection. Hovering or selecting dims everything except the item and its neighbors.
+
+The side panel is the accessible path through the same data: with nothing selected it summarizes, lists the unconnected items and broken links, and browses every item by kind; a selected item shows its path, description, use, broken links and its connections grouped by how they read from its side ("Links to", "Named by", "Contains", "Used together with"…), each a button to move there, plus a link to it in the Knowledge lists. Filters for kinds and edge types, the search (highlights matches; one match selects it) and the selection live in the URL (`#knowledge/graph?hide=reference&off=similar&sel=…`).
+
+Phase 1 is read-only on purpose. Later, the same graph could drive behavior: write `[[links]]` when Ouroboros creates a memory, turn broken links into suggested fixes and unconnected unused items into decay candidates, and link sources of truth to their owners so a change in a source re-checks the owners (the known gap in §7.0). Those wait until the correction-rate metric shows the loop's value (§7.3).
 
 ### 9.2 Metrics (definitions)
 
@@ -488,6 +507,7 @@ Every decision goes through the curator, so it lands in the ledger and is undoab
 | Reviewing the inbox | Two equal ways over one module (`inbox.mjs`): the dashboard, and `/ouroboros:inbox` in the conversation, one entry at a time, where the user can discuss and edit before approving |
 | Dashboard at scale | Server-side paging and filters on every list, the inbox grouped by project then by file, bulk decisions by filter on the server, page state in the URL (v0.10) |
 | Evaluation model | Haiku by default (`judge_model`): on the synthetic suite Sonnet scored the same at about 15 times the cost; revisit when the suite tells them apart |
+| Knowledge graph | Derived on request from the files and usage, never stored; drawn with an in-house force layout to keep zero dependencies; D3 (vendored into `dashboard/public/`) is the fallback if the layout or interactions prove too weak or too costly to maintain. Read-only until the loop's value is measured (§9.4) |
 
 ## 13. Phases
 
@@ -499,4 +519,5 @@ Every decision goes through the curator, so it lands in the ledger and is undoab
 | **4. Lifecycle and distribution** | Confidence/decay, automatic consolidation, merge on rediscovery, promotion, autonomy queue, dashboard actions (keep/undo/archive/approve/reject, token-protected), `excludeProjects`, CI (tests on Ubuntu + Windows, macOS on demand; `validate --strict`), README | Someone else installs it from scratch on Windows and macOS |
 | **v0.7 Evaluation** | Screen → ground → edit → validate; changesets per file with diffs in the dashboard; suggested fixes; skill reference files as owners; `eval.mjs` (synthetic + replay) | The same 60 real proposals give fewer, coherent changes, and the synthetic score holds |
 | **v0.9 Inbox in the conversation** | `/ouroboros:inbox`: list, show, preview, approve, reject, edit, resolve, done/dismiss; the dashboard uses the same module; SessionStart says when entries wait | Each kind of entry can be decided and edited in the conversation, with a regression test |
+| **v0.11 Knowledge graph** | Knowledge › Graph (§9.4): nodes and edges derived from the files and usage, broken links and unconnected items, filters and selection in the URL, an accessible side panel; read-only | The graph of this machine's knowledge is legible at a glance and every relation it draws can be traced to a file or an event |
 | **v0.8 Mechanism review** | §7.3: insertion-only additions, one validator for both write paths, single-consumer evaluation queue, surgical profile writes, added-text secret check, line-level undo, one memory-dir resolver, ancestor CLAUDE.md files, long sessions in parts, budget guard on every call, notices per project, merges that must land; harder eval cases | 15/15 on the synthetic suite; every finding has a regression test |

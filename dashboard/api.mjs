@@ -15,6 +15,8 @@ import { listInstructionFiles, listMemories, listPluginSkills, listSkills, userP
 import { claudeDir, classifyPath, dataDir, home, normalize, ouroborosDir, projectKey, repoRoot } from '../scripts/paths.mjs';
 import { inboxCounts, sessionContext } from '../scripts/hook.mjs';
 import { inboxEntries } from '../scripts/inbox.mjs';
+import { buildGraph, focusGraph } from '../scripts/graph.mjs';
+import { knowledgeFiles, knowledgeKind } from '../scripts/knowledge.mjs';
 import { lineDiff } from '../scripts/textdiff.mjs';
 
 const DAY = 86_400_000;
@@ -388,6 +390,62 @@ export function createApi(db) {
       const y = key(b);
       return (x < y ? -1 : x > y ? 1 : 0) * dir || String(a.name).localeCompare(String(b.name));
     });
+  }
+
+  // ---------- graph ----------
+  let graphCache = null;
+
+  /**
+   * Every knowledge file of the known projects (no sources of truth), every memory and the
+   * plugin skills, with the inventory's project and usage, as one graph (scripts/graph.mjs).
+   */
+  function graphData(plugins) {
+    if (graphCache && graphCache.plugins === plugins && Date.now() - graphCache.at < INVENTORY_TTL_MS) return graphCache.data;
+    const idx = projects();
+    const inv = inventoryData();
+    const meta = new Map();
+    for (const s of inv.skills) meta.set(normalize(s.file), { name: s.name, scope: s.scope, project_id: s.project_id, project_name: s.project_name, uses: s.uses, lastUsed: s.lastUsed, description: s.description });
+    for (const m of inv.memories) meta.set(normalize(m.file), { name: m.name, scope: 'project', project_id: m.project_id, project_name: m.project_name, uses: m.reads, lastUsed: m.lastRead, memoryType: m.type });
+    for (const f of inv.instructions) meta.set(normalize(f.file), { label: f.path, scope: f.scope, project_id: f.project_id, project_name: f.project_name });
+
+    const files = new Map();
+    const roots = [...new Set(knownCwds(db).map((c) => repoRoot(c) || c))];
+    for (const root of roots) for (const f of knowledgeFiles(root)) files.set(normalize(f), f);
+    for (const m of inv.memories) files.set(normalize(m.file), m.file);
+    for (const s of inv.skills) if (s.scope === 'plugin') files.set(normalize(s.file), s.file);
+
+    const learned = new Set(db.prepare('SELECT DISTINCT file FROM writes WHERE reverted_at IS NULL').all().map((r) => normalize(r.file)));
+    const items = [];
+    for (const [id, file] of files) {
+      let kind = knowledgeKind(file);
+      if (kind === 'source') continue;
+      if (kind === 'skill' && !/^skill\.md$/i.test(path.basename(file))) kind = 'reference';
+      const m = meta.get(id) || {};
+      const project_id = 'project_id' in m ? m.project_id : idx.fileProject(file);
+      // A repository first seen here (a child repo's rule file) has no display name yet: its folder.
+      const project_name = 'project_name' in m ? m.project_name
+        : project_id ? idx.byId.get(project_id)?.name || path.basename(repoRoot(path.dirname(file)) || '') || project_id : null;
+      const label = m.label || (kind === 'profile' ? 'Profile (user.md)' : kind === 'instructions' ? tilde(file) : kind === 'rules' ? `rules/${path.basename(file)}` : undefined);
+      items.push({ ...m, file, kind, label, project_id, project_name, learned: learned.has(id) });
+    }
+
+    // Usage per session: skills by name (with or without the plugin prefix), memories by file.
+    const skillIds = new Map();
+    for (const it of items) if (it.kind === 'skill' && it.name) skillIds.set(String(it.name).toLowerCase(), normalize(it.file));
+    for (const it of items) if (it.kind === 'skill' && it.name && !skillIds.has(String(it.name).split(':').pop().toLowerCase())) skillIds.set(String(it.name).split(':').pop().toLowerCase(), normalize(it.file));
+    const usage = [];
+    for (const e of db.prepare("SELECT DISTINCT session_id, kind, target FROM events WHERE kind IN ('skill_used','memory_read') AND target IS NOT NULL").all()) {
+      const t = String(e.target);
+      const id = e.kind === 'memory_read' ? normalize(t) : skillIds.get(t.toLowerCase()) || skillIds.get(t.split(':').pop().toLowerCase());
+      if (id) usage.push({ session: e.session_id, id });
+    }
+    const data = buildGraph(items, { usage, plugins });
+    for (const n of data.nodes) {
+      if (n.file) n.path = tilde(n.file);
+      delete n.file;
+    }
+    graphCache = { at: Date.now(), plugins, data };
+    return data;
   }
 
   // ---------- inbox ----------
@@ -798,6 +856,15 @@ export function createApi(db) {
         kind, total: rows.length, profile: userProfile(),
         groups: list.map(({ list: l, ...g }) => ({ ...g, total: l.length, rows: l.slice(0, per) })),
       };
+    },
+
+    /**
+     * The knowledge graph: { nodes, edges, stats }. `project` keeps that project's items and
+     * what they relate to; `plugins=all` adds plugin skills nothing here uses or names.
+     */
+    graph(params) {
+      const plugins = params.get('plugins') === 'all' ? 'all' : 'used';
+      return focusGraph(graphData(plugins), params.get('project') || null);
     },
 
     /** How many learned entries, skills, memories and instruction files (for the Knowledge tabs). */
