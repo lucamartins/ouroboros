@@ -40,7 +40,7 @@ Claude Code session
  │    UserPromptExpansion   typed /skill (does not go through PostToolUse)
  │
  ├─ REFLECTION A — periodic in-loop review (Stop, synchronous)
- │    every N user turns, or after a long autonomous turn  →  {"decision":"block", reason}
+ │    every N user turns, or after a turn that recovered from failures  →  {"decision":"block", reason}
  │    Claude reviews the segment since the last review with the `learn` skill
  │    and writes (Write/Edit); ends with a structured result line
  │
@@ -76,7 +76,7 @@ metadata:
   id: lrn_01J...          # ledger key
   confidence: 0.6        # 0.3 tentative … 0.9 near-certain
   created: 2026-11-07
-  trigger: periodic       # periodic | long_turn | session_end | manual
+  trigger: periodic       # periodic | recovery | session_end | manual
 ```
 
 ### 3.2 `user.md`
@@ -132,7 +132,7 @@ No `bin/` folder (it blocks installation through claude.ai/Cowork). Every file i
 | `inloop_review` | boolean | `true` | Toggles reflection A |
 | `background_review` | boolean | `true` | Toggles reflection B |
 | `review_every_turns` | number | `10` | User turns between in-loop reviews |
-| `long_turn_tool_calls` | number | `15` | Tool calls in one turn that trigger an early review |
+| `early_review_failures` | number | `2` | Failures on the same command or file, before it worked, that trigger an early in-session review (at most one every 5 turns) |
 | `judge_model` | string | `haiku` | Model of the learning evaluation (screen and editor, §7.0); follows `reviewer_model` when unset |
 | `monthly_budget_usd` | number | `5` | Cap on every model call Ouroboros makes (reviewer, evaluation, consolidation), checked before each call; when reached, the work waits until next month |
 | `language` | string | `auto` | Language of learnings and notices written to the user's files (`auto` = the conversation's language) |
@@ -193,7 +193,9 @@ The `Stop` hook returns `{"hookSpecificOutput":{"hookEventName":"Stop","addition
 - `stop_hook_active` is false (prevents loops), **and**
 - `inloop_review` is on, **and** either
   - `review_every_turns` user turns have passed since the last review, or
-  - the turn that just ended used ≥ `long_turn_tool_calls` tool calls.
+  - the turn that just ended found a working path after failures: a `recovery` event (the same command or file failed at least `early_review_failures` times, then worked, here or in a subagent), and no review was requested in the last 5 user turns.
+
+  Until v0.8.0 the early trigger was a *long turn* (≥ 15 tool calls). Measured on 49 real sessions (308 turns), 32% of turns are that long, and only about a third of those worked through repeated failures: during feature work the early review fired every other turn, re-reading the whole context each time, mostly with nothing new to learn. A long turn alone is not a learning signal; a recovery is (the strongest procedural one, best captured while the context is fresh). Long turns are still recorded as a metric. Note: capture hooks are asynchronous, so a recovery on the very last tool call of a turn may land after the Stop hook and wait for the next review.
 
 The `reason` tells Claude to run the `learn` skill over **the segment since the last review only** (it names the turn range and, when present, the recorded `recovery` events, including those from subagents), to be brief, and to finish with the result line:
 
@@ -441,7 +443,7 @@ Visual system: warm neutrals with one blue accent (primary actions, selection, d
 |---|---|
 | Name | `ouroboros` |
 | Autonomy | Fully automatic (like Hermes); `hybrid`/`queue` available as options |
-| Reflection | Periodic in-loop review every N turns (+ early on long turns) and an end-of-session background review of the unreviewed tail |
+| Reflection | Periodic in-loop review every N turns (+ early after a turn that recovered from repeated failures, at most every 5 turns) and an end-of-session background review of the unreviewed tail |
 | Prompt classification | None — no regex or per-prompt classifier; corrections are counted by the reviews |
 | `user.md` | Two blocks in one file: `User` (≤ 1,500 chars) and `Environment & lessons` (≤ 2,000 chars) |
 | Subagents | Full transcripts not reviewed; only `recovery` snippets captured inside subagents; workflow agents excluded |

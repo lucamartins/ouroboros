@@ -1,7 +1,7 @@
 {
   "name": "ouroboros",
   "displayName": "Ouroboros",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "Self-learning for Claude Code: reviews your sessions, turns what is worth keeping into memories and skills, and shows usage, value and cost on a local dashboard.",
   "author": {
     "name": "Luca Martins",
@@ -34,7 +34,7 @@
     "inloop_review": {
       "type": "boolean",
       "title": "Periodic in-session review",
-      "description": "Every N turns (and after long autonomous turns) Claude briefly reviews the recent turns and saves what is worth keeping.",
+      "description": "Every N turns (and right after a turn that worked through repeated failures) Claude briefly reviews the recent turns and saves what is worth keeping.",
       "default": true
     },
     "review_every_turns": {
@@ -44,11 +44,11 @@
       "default": 10,
       "min": 1
     },
-    "long_turn_tool_calls": {
+    "early_review_failures": {
       "type": "number",
-      "title": "Long turn threshold",
-      "description": "Tool calls in a single turn that trigger an early review.",
-      "default": 15,
+      "title": "Failures before an early review",
+      "description": "A turn where the same command or file failed this many times before working triggers an in-session review right away (at most one every 5 turns), while the working path is fresh. Other turns wait for the periodic or end-of-session review.",
+      "default": 2,
       "min": 1
     },
     "background_review": {

@@ -22,7 +22,6 @@ before(() => {
     CLAUDE_CONFIG_DIR: path.join(tmp, 'claude'),
     OUROBOROS_HOME: path.join(tmp, 'ouroboros'),
     OUROBOROS_CLAUDE_CMD: JSON.stringify([process.execPath, path.join(fixtures, 'fake-claude.mjs')]),
-    CLAUDE_PLUGIN_OPTION_LONG_TURN_TOOL_CALLS: '3',
   };
   delete env.OUROBOROS_REVIEWER;
 });
@@ -85,7 +84,8 @@ test('capture: turns, skills, memory writes, recovery and long turns', () => {
   assert.deepEqual(kinds.filter((k) => k.kind === 'skill_used').map((k) => k.target), ['deploy', 'review']);
   const write = kinds.find((k) => k.kind === 'memory_write');
   assert.equal(write.agent_id, 'sub-1');
-  assert.ok(kinds.some((k) => k.kind === 'long_turn'));
+  // The turn worked through two failures: an early review was requested at once.
+  assert.equal(kinds.find((k) => k.kind === 'review_requested')?.target, 'recovery');
   assert.equal(d.prepare('SELECT COUNT(*) n FROM fail_streaks').get().n, 0);
   assert.equal(d.prepare('SELECT COUNT(*) n FROM errors').get().n, 0);
   d.close();
@@ -182,6 +182,41 @@ test('periodic in-loop review: request, result line, cursor and skips', () => {
   hook('UserPromptSubmit', sid, every2);
   hook('UserPromptSubmit', sid, every2);
   assert.equal(hook('Stop', { ...sid, stop_hook_active: false }, { ...every2, CLAUDE_PLUGIN_OPTION_LEARNING: 'false' }), '');
+});
+
+test('early review: after a turn that worked through repeated failures, not after a merely long one', () => {
+  const sid = { session_id: 's9' };
+  const requested = (out) => (out ? JSON.parse(out).hookSpecificOutput.additionalContext : '');
+  const finish = () => hook('Stop', { ...sid, stop_hook_active: true, last_assistant_message: '[ouroboros] reviewed=1 corrections=0 learned=0 patched=0' });
+  const turn = ({ calls = 0, failures = 0 } = {}) => {
+    hook('UserPromptSubmit', sid);
+    for (let i = 0; i < calls; i++) hook('PostToolUse', { ...sid, tool_name: 'Read', tool_input: { file_path: `/f${i}` }, tool_response: {} });
+    for (let i = 0; i < failures; i++) hook('PostToolUseFailure', { ...sid, tool_name: 'Bash', tool_input: { command: 'npm test' }, error: 'Exit code 1' });
+    if (failures) hook('PostToolUse', { ...sid, tool_name: 'Bash', tool_input: { command: 'npm test' }, tool_response: {} });
+    return requested(hook('Stop', { ...sid, stop_hook_active: false }));
+  };
+  // A long turn (20 tool calls) with nothing failing: no review.
+  assert.equal(turn({ calls: 20 }), '');
+  // One failure, then success: below the default threshold of 2.
+  assert.equal(turn({ failures: 1 }), '');
+  // Two failures on the same command, then success: review right away, naming the signal.
+  const req = turn({ failures: 2 });
+  assert.match(req, /after working through failures/);
+  assert.match(req, /`Bash:npm test` failed 2× before working/);
+  finish();
+  // Another recovery two turns later: too soon (at most one early review every 5 turns).
+  turn();
+  assert.equal(turn({ failures: 3 }), '');
+  turn();
+  turn();
+  // Five turns after the last request: allowed again.
+  assert.match(turn({ failures: 2 }), /after working through failures/);
+  finish();
+  const d = db();
+  const reviews = d.prepare("SELECT trigger FROM reviews WHERE session_id = 's9' AND mode = 'inloop'").all();
+  assert.deepEqual(reviews.map((r) => r.trigger), ['recovery', 'recovery']);
+  assert.ok(d.prepare("SELECT 1 FROM events WHERE session_id = 's9' AND kind = 'long_turn'").get(), 'long turns are still recorded');
+  d.close();
 });
 
 test('learning can be turned off; reads of learned items count as uses', () => {

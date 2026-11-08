@@ -56,7 +56,7 @@ const MIGRATIONS = [
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id         TEXT NOT NULL,
     mode               TEXT NOT NULL,        -- measure | inloop | background | manual
-    trigger            TEXT,                 -- session_end | backfill | periodic | long_turn | manual
+    trigger            TEXT,                 -- session_end | backfill | periodic | recovery (long_turn before v0.8.1) | manual
     model              TEXT,
     status             TEXT NOT NULL,        -- ok | skipped | failed
     detail             TEXT,

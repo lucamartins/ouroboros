@@ -2,7 +2,7 @@
 
 Self-learning for Claude Code. Ouroboros reviews your sessions, turns what is worth keeping into memories and skills, and shows on a local dashboard what it learned, how much that is used, and what it costs — in the spirit of Nous Research's Hermes Agent.
 
-> **Status: v0.4 — complete loop.** Each session starts with a short learning protocol and your global profile (`~/.ouroboros/user.md`). Every 10 turns (and after long autonomous turns) Claude briefly reviews the recent turns and saves what is worth keeping; when the session ends, a small isolated model call reviews whatever was not reviewed yet. Everything goes through one curator — deduplicated, routed, budgeted and undoable — and a daily maintenance pass archives what nobody uses and consolidates what grew too big. The local dashboard shows whether corrections are going down, what it costs, and lets you confirm, undo, archive or approve. See [DESIGN.md](DESIGN.md).
+> **Status: v0.8 — complete loop.** Each session starts with a short learning protocol and your global profile (`~/.ouroboros/user.md`). Every 10 turns (and right after a turn that worked through repeated failures) Claude briefly reviews the recent turns and saves what is worth keeping; when the session ends, a small isolated model call reviews whatever was not reviewed yet. Everything goes through one curator — deduplicated, routed, budgeted and undoable — and a daily maintenance pass archives what nobody uses and consolidates what grew too big. The local dashboard shows whether corrections are going down, what it costs, and lets you confirm, undo, archive or approve. See [DESIGN.md](DESIGN.md).
 
 ## Install
 
@@ -70,7 +70,7 @@ Set when enabling the plugin, or later in `/config`:
 | `reviewer_model` | `haiku` | Model for background reviews |
 | `judge_model` | `haiku` | Model of the knowledge check (screen and editor); `sonnet` costs about 15 times more and scored the same on the evaluation suite |
 | `monthly_budget_usd` | `5` | Every Ouroboros model call (reviews, knowledge check, consolidation) stops for the month once this is spent |
-| `long_turn_tool_calls` | `15` | Tool calls in one turn that trigger an early review |
+| `early_review_failures` | `2` | A turn where the same command or file failed this many times before working triggers an in-session review right away (at most one every 5 turns) |
 
 ## Cost and privacy
 

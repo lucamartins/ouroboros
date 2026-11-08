@@ -13,6 +13,10 @@ import { globMatch, loadSettings } from './settings.mjs';
 import { countLines, readTranscript, usageSince } from './transcript.mjs';
 
 const MIN_NODE = [22, 13];
+/** Tool calls that make a turn "long" (recorded as a metric only). */
+export const LONG_TURN_TOOL_CALLS = 15;
+/** Early (recovery) reviews are at least this many user turns apart from any review. */
+export const EARLY_REVIEW_MIN_TURNS = 5;
 const here = path.dirname(fileURLToPath(import.meta.url));
 // db.mjs needs node:sqlite, so it is loaded only after the Node version check.
 let dbApi;
@@ -99,7 +103,7 @@ export const RESULT_RE = /\[ouroboros\]\s*reviewed=(\d+)\s+corrections=(\d+)\s+l
 
 /** Instructions sent through the Stop hook to ask for a periodic review. */
 export function reviewRequest({ from, to, trigger, recoveries = [] }) {
-  const why = trigger === 'long_turn' ? 'after a long autonomous turn' : 'periodic';
+  const why = trigger === 'recovery' ? 'after working through failures' : 'periodic';
   const signals = recoveries.map((r) => {
     let p = {};
     try { p = JSON.parse(r.payload || '{}'); } catch { /* ignore */ }
@@ -113,6 +117,29 @@ export function reviewRequest({ from, to, trigger, recoveries = [] }) {
     'End your message with exactly this line (numbers filled in; learned/patched count only what you saved for this review), even when nothing was saved:',
     '[ouroboros] reviewed=<user turns reviewed> corrections=<n> learned=<items created> patched=<items updated>',
   ].filter(Boolean).join('\n');
+}
+
+/**
+ * Whether the turn that just ended found a working path after failures: a recovery
+ * (same command or file failed, then worked) with at least `minFailures` failures,
+ * here or inside a subagent. A long turn alone is not a signal: a third of real turns
+ * use 15+ tool calls, and most have nothing new to learn.
+ */
+export function recoveredThisTurn(db, sessionId, minFailures) {
+  const turnStart = db.prepare("SELECT MAX(ts) t FROM events WHERE session_id = ? AND kind = 'turn'").get(sessionId).t || 0;
+  return db.prepare("SELECT payload FROM events WHERE session_id = ? AND kind = 'recovery' AND ts >= ?").all(sessionId, turnStart)
+    .some((r) => {
+      try { return (JSON.parse(r.payload || '{}').failures || 0) >= minFailures; } catch { return false; }
+    });
+}
+
+/** At most one early review every EARLY_REVIEW_MIN_TURNS user turns (after any review request). */
+function earlyAllowed(db, sessionId, turns) {
+  const last = db.prepare("SELECT payload FROM events WHERE session_id = ? AND kind = 'review_requested' ORDER BY id DESC LIMIT 1").get(sessionId);
+  if (!last) return true;
+  let at = 0;
+  try { at = JSON.parse(last.payload || '{}').turns?.[1] || 0; } catch { /* ignore */ }
+  return turns - at >= EARLY_REVIEW_MIN_TURNS;
 }
 
 /** Record the outcome of a requested in-loop review and move the cursor. */
@@ -285,7 +312,7 @@ const handlers = {
     ensureSession(db, input, now);
     const opts = options();
     const s = db.prepare('SELECT * FROM sessions WHERE id = ?').get(input.session_id);
-    if (s.turn_tool_calls >= opts.longTurnToolCalls && !input.stop_hook_active) {
+    if (s.turn_tool_calls >= LONG_TURN_TOOL_CALLS && !input.stop_hook_active) {
       addEvent(db, input, now, 'long_turn', null, { tool_calls: s.turn_tool_calls });
     }
 
@@ -299,7 +326,7 @@ const handlers = {
     if (!opts.learning || !opts.inloopReview || input.stop_hook_active || input.agent_id) return;
     const turnsSince = s.turns - s.turns_at_last_review;
     const trigger = turnsSince >= opts.reviewEveryTurns ? 'periodic'
-      : s.turn_tool_calls >= opts.longTurnToolCalls && turnsSince >= 2 ? 'long_turn'
+      : recoveredThisTurn(db, input.session_id, opts.earlyReviewFailures) && earlyAllowed(db, input.session_id, s.turns) ? 'recovery'
         : null;
     if (!trigger) return;
 
