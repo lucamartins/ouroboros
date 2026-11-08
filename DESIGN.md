@@ -2,7 +2,7 @@
 
 > A Claude Code plugin that learns from your sessions on its own: it saves memories and creates/refines skills without being asked, in the spirit of Nous Research's Hermes Agent, and shows on a local dashboard what it learned, how much that is being used and what it costs.
 
-Status: v0.11.0 — every phase implemented, plus the learning evaluation (§7.0), the v0.8 mechanism review (§7.3), the inbox reviewed in the conversation (§9.3), a dashboard that scales (§9.1: server-side paging and filters, the inbox grouped by project and file, page state in the URL, one project filter) and a knowledge graph (§9.4, read-only); next: real-world use, then a fresh install test on another machine. Owner decisions in [§12](#12-decisions).
+Status: v0.12.0 — every phase implemented, plus the learning evaluation (§7.0), the v0.8 mechanism review (§7.3), the inbox reviewed in the conversation (§9.3), a dashboard that scales (§9.1: server-side paging and filters, the inbox grouped by project and file, page state in the URL, one project filter) and a knowledge graph (§9.4, read-only, drawn with a vendored D3 subset since v0.12); next: real-world use, then a fresh install test on another machine. Owner decisions in [§12](#12-decisions).
 
 ---
 
@@ -25,7 +25,7 @@ Hermes solves this with (a) explicit save triggers in its prompt, (b) a periodic
 5. **Hard limits** (like Hermes): fixed context budget; consolidate at 80%.
 6. **Measure before learning**: phase 1 only measures, so there is a baseline to prove value against.
 7. **Learn only from trusted sources**: user turns and verified outcomes — never from tool-provided text (web pages, command output), to avoid poisoning via prompt injection.
-8. **Zero dependencies**: Node ≥ 22.13 (built-in `node:sqlite`), no `npm install`. Same behavior on Windows, macOS and Linux.
+8. **Zero dependencies**: Node ≥ 22.13 (built-in `node:sqlite`), no `npm install`, no build step. Same behavior on Windows, macOS and Linux. The one third-party file is a D3 subset vendored as a static browser module for the graph (§9.4); it is committed, served by our own server and never fetched at runtime.
 
 ## 3. Architecture
 
@@ -119,7 +119,7 @@ ouroboros/
 ├── agents/curator.md          # cheap-model subagent for consolidation when a budget overflows
 ├── dashboard/
 │   ├── server.mjs             # native http, 127.0.0.1, JSON API
-│   └── public/                # build-free HTML/CSS/JS; hand-rolled SVG charts; force.js (graph layout)
+│   └── public/                # build-free HTML/CSS/JS; hand-rolled SVG charts; d3.min.js (vendored D3 subset, graph)
 └── DESIGN.md
 ```
 
@@ -443,7 +443,9 @@ What Claude knows, drawn as a graph: which skills point to which, which memories
 
 A `[[link]]` that resolves to nothing is reported as a **broken link** on its file. Items with no link, mention, containment or shared use are **unconnected** (candidates to link, merge or retire). Plugin skills appear only when used or named by a non-plugin file, unless the user asks for all of them. The Project filter keeps that project's items, what they relate to one edge away (so a global skill a project memory names stays) and its hub.
 
-**Drawing, without dependencies.** `dashboard/public/force.js` is a small force layout after d3-force's model (springs per edge type, O(n²) repulsion, centering, collision, velocity decay as `alpha` cools); enough for the few hundred items a machine has, and it keeps the zero-dependency rule (§2.8) and the strict CSP. Most settling happens before the first paint (a 60 ms warm-up), the rest is animated with a per-frame budget, or computed at once under `prefers-reduced-motion`; positions are kept while the page is open. Drag moves an item, drag on the background pans, the wheel and buttons zoom, Fit frames everything until the user takes over the view. Color is the kind of item, size grows with use, a ring marks files Ouroboros wrote or changed; skills and project hubs are always labelled, other items on zoom, hover or selection. Hovering or selecting dims everything except the item and its neighbors.
+**Drawing (v0.12: D3).** v0.11 drew the graph with an in-house force layout; it worked but read as flat and static, and the camera and drag code was the costliest part to keep right. v0.12 vendors a D3 subset as `dashboard/public/d3.min.js` (d3-force, d3-zoom, d3-drag, d3-selection, d3-transition and d3-ease with their own dependencies, about 70 KB, ISC license in its header), imported by `app.js` as an ES module. It is served from our origin, so the strict CSP (`script-src 'self'`) and offline use are unchanged, and it lives at the top of `public/` so the server's code fingerprint sees it. To rebuild it: in a scratch folder, `npm i d3-force@3 d3-zoom@3 d3-drag@3 d3-selection@3 d3-transition@3 d3-ease@3 esbuild`, an entry file that re-exports the functions `app.js` imports, then `esbuild entry.js --bundle --format=esm --minify --legal-comments=none`, and prepend the header with the versions and the license.
+
+The drawing is SVG styled by CSS (theme variables, classes for state), so everything except layout, camera and drag stays ours. The layout unfolds on screen from a tight spiral while the camera follows it until the user takes over; items pop in, and items Ouroboros wrote or changed breathe (a pulsing halo). Dragging an item keeps the layout warm, so its neighbors follow. d3-zoom owns pan, wheel and pinch; selecting an item (in the drawing or the panel) glides the view to it and its neighbors, and Fit glides back to everything. A dot grid moves with the view. Relations are drawn as slight curves (structure — project, contains — stays straight), links and mentions take the color of the item they start from, and the connections of the hovered or selected item flow from source to target. Projects, skills and the profile are always labelled and the layout keeps room for their names; other items on zoom, hover or selection. Hovering or selecting dims everything except the item and its neighbors. Under `prefers-reduced-motion` the layout is computed at once and no transition or animation runs. Positions are kept while the page is open.
 
 The side panel is the accessible path through the same data: with nothing selected it summarizes, lists the unconnected items and broken links, and browses every item by kind; a selected item shows its path, description, use, broken links and its connections grouped by how they read from its side ("Links to", "Named by", "Contains", "Used together with"…), each a button to move there, plus a link to it in the Knowledge lists. Filters for kinds and edge types, the search (highlights matches; one match selects it) and the selection live in the URL (`#knowledge/graph?hide=reference&off=similar&sel=…`).
 
@@ -507,7 +509,7 @@ Phase 1 is read-only on purpose. Later, the same graph could drive behavior: wri
 | Reviewing the inbox | Two equal ways over one module (`inbox.mjs`): the dashboard, and `/ouroboros:inbox` in the conversation, one entry at a time, where the user can discuss and edit before approving |
 | Dashboard at scale | Server-side paging and filters on every list, the inbox grouped by project then by file, bulk decisions by filter on the server, page state in the URL (v0.10) |
 | Evaluation model | Haiku by default (`judge_model`): on the synthetic suite Sonnet scored the same at about 15 times the cost; revisit when the suite tells them apart |
-| Knowledge graph | Derived on request from the files and usage, never stored; drawn with an in-house force layout to keep zero dependencies; D3 (vendored into `dashboard/public/`) is the fallback if the layout or interactions prove too weak or too costly to maintain. Read-only until the loop's value is measured (§9.4) |
+| Knowledge graph | Derived on request from the files and usage, never stored; drawn with a D3 subset vendored into `dashboard/public/` (v0.12; the in-house layout of v0.11 looked flat and static, and its camera and drag code was costly to keep right). Vendored, not fetched: the CSP and offline use hold, and there is still no `npm install`. Read-only until the loop's value is measured (§9.4) |
 
 ## 13. Phases
 
@@ -520,4 +522,5 @@ Phase 1 is read-only on purpose. Later, the same graph could drive behavior: wri
 | **v0.7 Evaluation** | Screen → ground → edit → validate; changesets per file with diffs in the dashboard; suggested fixes; skill reference files as owners; `eval.mjs` (synthetic + replay) | The same 60 real proposals give fewer, coherent changes, and the synthetic score holds |
 | **v0.9 Inbox in the conversation** | `/ouroboros:inbox`: list, show, preview, approve, reject, edit, resolve, done/dismiss; the dashboard uses the same module; SessionStart says when entries wait | Each kind of entry can be decided and edited in the conversation, with a regression test |
 | **v0.11 Knowledge graph** | Knowledge › Graph (§9.4): nodes and edges derived from the files and usage, broken links and unconnected items, filters and selection in the URL, an accessible side panel; read-only | The graph of this machine's knowledge is legible at a glance and every relation it draws can be traced to a file or an event |
+| **v0.12 Graph drawing** | Knowledge › Graph drawn with a vendored D3 subset: the layout unfolds on screen, drag pulls neighbors along, animated camera on select and Fit, curved colored edges with flow on focus, halos and a pulse on what Ouroboros changed; reduced motion respected | The graph feels alive while staying legible, with the same CSP, offline use and no install step |
 | **v0.8 Mechanism review** | §7.3: insertion-only additions, one validator for both write paths, single-consumer evaluation queue, surgical profile writes, added-text secret check, line-level undo, one memory-dir resolver, ancestor CLAUDE.md files, long sessions in parts, budget guard on every call, notices per project, merges that must land; harder eval cases | 15/15 on the synthetic suite; every finding has a regression test |
