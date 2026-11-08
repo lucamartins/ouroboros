@@ -194,12 +194,26 @@ export function spawnWorker(args, env = process.env) {
   child.unref();
 }
 
+/**
+ * What waits for the user, by kind, with the same rule as `inboxEntries` (inbox.mjs):
+ * conflicts, pending or stale changes to files, queued items not part of a change, and
+ * suggested fixes. With `project` (a project key), that project's entries and the global
+ * ones; without it, everything. The dashboard badge and the SessionStart hint use this.
+ */
+export function inboxCounts(db, project = null) {
+  const mine = project ? '(project IS NULL OR project = ?) AND' : '';
+  const args = project ? [project] : [];
+  const n = (sql) => db.prepare(sql).get(...args).n;
+  const conflicts = n(`SELECT COUNT(*) n FROM candidates WHERE ${mine} outcome = 'conflict'`);
+  const changes = n(`SELECT COUNT(*) n FROM changesets WHERE ${mine} status IN ('pending', 'stale')`);
+  const items = n(`SELECT COUNT(*) n FROM candidates WHERE ${mine} outcome = 'queued' AND changeset_id IS NULL`);
+  const fixes = n(`SELECT COUNT(*) n FROM candidates WHERE ${mine} outcome = 'suggested'`);
+  return { conflicts, changes, items, fixes, total: conflicts + changes + items + fixes };
+}
+
 /** How many inbox entries wait for the user in a project (global entries included). */
 export function inboxCount(db, project) {
-  const mine = '(project IS NULL OR project = ?)';
-  return db.prepare(`SELECT
-      (SELECT COUNT(*) FROM candidates WHERE ${mine} AND (outcome IN ('conflict', 'suggested') OR (outcome = 'queued' AND changeset_id IS NULL)))
-    + (SELECT COUNT(*) FROM changesets WHERE ${mine} AND status IN ('pending', 'stale')) n`).get(project, project).n;
+  return inboxCounts(db, project).total;
 }
 
 const handlers = {

@@ -2,7 +2,7 @@
 
 > A Claude Code plugin that learns from your sessions on its own: it saves memories and creates/refines skills without being asked, in the spirit of Nous Research's Hermes Agent, and shows on a local dashboard what it learned, how much that is being used and what it costs.
 
-Status: v0.9.1 — every phase implemented, plus the learning evaluation (§7.0), the v0.8 mechanism review (§7.3) and the inbox reviewed in the conversation (§9.3); next: real-world use, then a fresh install test on another machine. Owner decisions in [§12](#12-decisions).
+Status: v0.10.0 — every phase implemented, plus the learning evaluation (§7.0), the v0.8 mechanism review (§7.3), the inbox reviewed in the conversation (§9.3) and a dashboard that scales (§9.1: server-side paging and filters, the inbox grouped by project and file, page state in the URL, one project filter); next: real-world use, then a fresh install test on another machine. Owner decisions in [§12](#12-decisions).
 
 ---
 
@@ -395,15 +395,21 @@ One page per question, in a sticky top bar; the Inbox carries a count of what wa
 
 | Page | Question | Content |
 |---|---|---|
-| **Inbox** | What needs my decision? | Conflicts (a learning vs a written rule: "it is a new rule" / "keep the current rule"), changes to files (one diff per file with the learnings behind it; approve, reject, remove one learning), new items, suggested fixes; bulk approve/reject; "check against knowledge" |
+| **Inbox** | What needs my decision? | Entries grouped by project, then by target file (new items without one by kind; suggested fixes together), in `inbox.mjs`'s order: conflicts (a learning vs a written rule: "it is a new rule" / "keep the current rule"), changes to files (one diff per file with the learnings behind it; approve, reject, remove one learning), new items, suggested fixes. A group shows its first 20 entries with "Load more"; bulk approve/reject per group and for the whole filter; "check against knowledge" |
 | **Overview** | Is learning working? | Corrections per 100 turns before vs after learning with the delta, learned count, sessions using a learning, misses, month cost vs budget; trend charts with the "learning on" marker; recently learned |
-| **Knowledge** | What does Claude know? | **Learned**: one row per thing learned (each ledger batch), not per file: what it says (the title the writer gave, or the first sentence it added), why (the evidence, or the learnings of an approved change), where, from which session and how, what it saved or changed (a diff that opens on click), how often the file was used; actions Undo (only that change, later edits stay), Archive (only what Ouroboros created), Keep. Then every skill, memory and instruction file, with a filter |
-| **Activity** | What happened? | Sessions, reviews (with cost), proposals and their outcome, what the knowledge check dropped (restorable), corrections |
+| **Knowledge** | What does Claude know? | **Learned**: one row per thing learned (each ledger batch), not per file: what it says (the title the writer gave, or the first sentence it added), why (the evidence, or the learnings of an approved change), where, from which session and how, what it saved or changed (a diff that opens on click), how often the file was used; actions Undo (only that change, later edits stay), Archive (only what Ouroboros created), Keep; undone rows behind a toggle next to the filter. Then every skill (personal, project and plugin skills in collapsible groups), memory (grouped by project) and instruction file, sortable by name, uses, last use or date |
+| **Activity** | What happened? | Sessions, reviews (with cost), proposals and their outcome (filter by kind, outcome, period), what the knowledge check dropped (restorable), corrections; sortable by date; on a narrow screen each row is a labelled card |
 | **System** | Is it healthy, how good is it, what does it cost? | Capture and reviewer status, month cost; learning quality (outcome counts, approval and undo rates, why proposals were dropped, warnings); cost per review; context budgets; failed reviews and errors |
 
-The Inbox page and the `inbox` skill (§9.3) share `scripts/inbox.mjs`: the same entries, the same decisions.
+The Inbox page and the `inbox` skill (§9.3) share `scripts/inbox.mjs`: the same entries, the same decisions. Every count of what waits (the Inbox badge, System, the SessionStart hint) uses one rule, `inboxCounts` in `hook.mjs`, the same as `inboxEntries`.
 
-Visual system: warm neutrals with one blue accent (primary actions, selection, data), system sans, light and dark from the same tokens; lists and tables over card grids, cards only for decisions; one stroke icon set drawn in `app.js`; status always pairs a color with a word.
+**Lists at scale (v0.10).** Nothing is cut silently. Every list route returns `{ rows, total }` and takes `limit` (50 by default), `offset`, `q` (a substring of the row's text, matched in SQL), `project` and, where they apply, `kind`, `outcome`, `days`, `sort` and `dir`; the page shows "Showing 50 of 1,240" with "Load more", and counts come from `total`. Grouped lists (the inbox, the inventory) return each group's total and first rows, and `group` pages through one group. Knowledge › Learned builds diffs only for the page it returns. Bulk decisions take a filter (`{ project }` or `{ group }`) and the count the user confirmed; the server resolves the filter to entries and decides nothing when the count no longer matches.
+
+**Projects.** A project is a repository's main checkout (so its worktrees and subfolders count as one) or, outside git, the session's folder; it is named after that folder, `~` for the home folder, and names that collide show the path. A learning belongs to the repository its file lives in, else to its session's project. The `projects` route lists them, and one Project filter is shared by Inbox, Knowledge and Activity.
+
+**Page state in the URL.** `#<page>[/<list or anchor>][?filters]`, e.g. `#knowledge/learned?q=nisus&project=…` or `#activity/proposals?kind=skill&outcome=dropped&days=90`: refresh, back and shared links restore the page. Inbox anchors (`#inbox/p-<project>`) scroll within the page. Typing in a filter is debounced and updates only the list (the field stays mounted; stale responses are dropped). After an action focus goes to the control that was used, or to the next entry; re-renders keep the scroll position and open sections, and the Overview refreshes every minute only when its data changed. A request that fails empties only its own section.
+
+Visual system: warm neutrals with one blue accent (primary actions, selection, data; filled surfaces under white text use a deeper `--accent-fill` for 4.5:1 in both themes), system sans, light and dark from the same tokens; lists and tables over card grids, cards only for decisions; one stroke icon set drawn in `app.js`; status always pairs a color with a word.
 
 ### 9.3 The inbox in the conversation (`/ouroboros:inbox`)
 
@@ -428,8 +434,8 @@ Every decision goes through the curator, so it lands in the ledger and is undoab
 
 | Metric | Definition |
 |---|---|
-| Correction rate | Σ `reviews.corrections` ÷ Σ `reviews.turns_reviewed`, 7-day moving average. **Primary value indicator**: should drop vs the phase 1 baseline |
-| Misses | Proposals with `duplicates_learning` — the user had to repeat something already learned (memory failed: not loaded, poor description, or ignored) |
+| Correction rate | Σ `reviews.corrections` ÷ Σ `reviews.turns_reviewed`, 7-day moving average. **Primary value indicator**: should drop vs the phase 1 baseline. The Overview shows each side's sample (n = turns) and keeps the before/after delta neutral below 200 reviewed turns after learning turned on (`MIN_SAMPLE_TURNS`) |
+| Misses | Proposals with `duplicates_learning`, counted in the selected period — the user had to repeat something already learned (memory failed: not loaded, poor description, or ignored) |
 | Utilization rate | Active learnings with ≥ 1 use in the last 30 days ÷ active |
 | Hits | Sessions with ≥ 1 `skill_used`/`memory_read` of a learned item |
 | Review cost | Σ `reviews.cost_usd` (background) + Σ in-loop review tokens (on a subscription this is quota-equivalent, not an extra charge) |
@@ -480,6 +486,7 @@ Every decision goes through the curator, so it lands in the ledger and is undoab
 | Changes to existing files | One changeset per file, composed with every pending learning; the model writes exact-fragment edits, code validates and applies them; re-applied to the current file on approval |
 | Additions vs corrections | Decided by code, not by the model's label: only a pure insertion is an addition; any rewrite is a correction and waits for the user, on both write paths |
 | Reviewing the inbox | Two equal ways over one module (`inbox.mjs`): the dashboard, and `/ouroboros:inbox` in the conversation, one entry at a time, where the user can discuss and edit before approving |
+| Dashboard at scale | Server-side paging and filters on every list, the inbox grouped by project then by file, bulk decisions by filter on the server, page state in the URL (v0.10) |
 | Evaluation model | Haiku by default (`judge_model`): on the synthetic suite Sonnet scored the same at about 15 times the cost; revisit when the suite tells them apart |
 
 ## 13. Phases

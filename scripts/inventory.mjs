@@ -111,6 +111,38 @@ export function listSkills(cwds = []) {
   return out;
 }
 
+/**
+ * Skills of installed plugins (from `plugins/installed_plugins.json`), skipping plugins
+ * the user settings disable. Claude invokes them as `<plugin>:<skill>`.
+ */
+export function listPluginSkills() {
+  let installed = {};
+  try { installed = JSON.parse(fs.readFileSync(path.join(claudeDir(), 'plugins', 'installed_plugins.json'), 'utf8')).plugins || {}; } catch { return []; }
+  let enabled = {};
+  try { enabled = JSON.parse(fs.readFileSync(path.join(claudeDir(), 'settings.json'), 'utf8')).enabledPlugins || {}; } catch { /* none */ }
+  const out = [];
+  for (const [id, installs] of Object.entries(installed)) {
+    if (enabled[id] === false) continue;
+    const plugin = id.split('@')[0];
+    const install = (Array.isArray(installs) ? installs : [installs]).find((x) => x?.installPath);
+    if (!install) continue;
+    const dir = path.join(install.installPath, 'skills');
+    for (const d of safeList(dir)) {
+      const file = path.join(dir, d.name, 'SKILL.md');
+      const text = safeRead(file);
+      if (text === null) continue;
+      const { data } = parseFrontmatter(text);
+      const description = [data.description, data.when_to_use].filter(Boolean).join(' ');
+      out.push({
+        scope: 'plugin', plugin, project: null, name: `${plugin}:${data.name || d.name}`, file, description,
+        descriptionChars: description.length, userOnly: String(data['disable-model-invocation']) === 'true',
+        origin: null, chars: text.length, mtime: safeStat(file)?.mtimeMs ?? null,
+      });
+    }
+  }
+  return out;
+}
+
 export function listInstructionFiles(cwds = []) {
   const files = [{ scope: 'global', file: path.join(claudeDir(), 'CLAUDE.md') }];
   for (const cwd of new Set(cwds.filter(Boolean))) {

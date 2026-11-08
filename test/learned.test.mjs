@@ -43,7 +43,7 @@ test('a patch records what it learned, why and the session; the dashboard shows 
     }],
   }, { actor: 'inloop', autonomy: 'auto' });
   assert.equal(r.status, 'patched', r.reason);
-  const [c] = api('changes');
+  const [c] = api('changes').rows;
   assert.equal(c.title, 'Missing migration makes the API die at startup');
   assert.equal(c.why, 'The API crashed twice before the migration was applied.');
   assert.equal(c.session.id, 'sess-1');
@@ -56,10 +56,10 @@ test('a patch records what it learned, why and the session; the dashboard shows 
 
 test('a write recorded without a title is named by its first added line', () => {
   db.prepare('UPDATE writes SET title = NULL, why = NULL').run();
-  const [c] = api('changes');
+  const [c] = api('changes').rows;
   assert.equal(c.title, 'The API dies with SQL error 207 when a migration is missing; apply it first.');
   db.prepare("UPDATE writes SET after = replace(after, 'apply it first.', 'apply it first. Then restart the `api` container.')").run();
-  assert.equal(api('changes')[0].title, 'The API dies with SQL error 207 when a migration is missing; apply it first.', 'cut at the first sentence, without backticks');
+  assert.equal(api('changes').rows[0].title, 'The API dies with SQL error 207 when a migration is missing; apply it first.', 'cut at the first sentence, without backticks');
   db.prepare("UPDATE writes SET after = replace(after, ' Then restart the `api` container.', '')").run();
 });
 
@@ -68,17 +68,19 @@ test('archiving a file Ouroboros only changed is refused; its changes are undone
   const f = curator.forget(db, { match: lid });
   assert.equal(f.status, 'refused');
   assert.ok(fs.existsSync(skill), 'the skill is still there');
-  const [c] = api('changes');
+  const [c] = api('changes').rows;
   const u = curator.undo(db, { batch: c.batch });
   assert.equal(u.status, 'undone', u.reason);
   assert.doesNotMatch(fs.readFileSync(skill, 'utf8'), /SQL error 207/);
-  assert.equal(api('changes')[0].undone, true);
+  assert.equal(api('changes').rows.find((x) => x.batch === c.batch), undefined, 'undone entries are hidden by default');
+  assert.equal(api('changes').undone, 1);
+  assert.equal(api('changes', { undone: '1' }).rows[0].undone, true);
 });
 
 test('Keep: a kept learning is not archived when unused; the dashboard says when one would be', async () => {
   const [m] = curator.apply(db, { cwd, items: [{ kind: 'memory', memory_type: 'project', title: 'Seed before e2e', description: 'Seed the local database before end-to-end tests', confidence: 0.5, why: 'The e2e run failed on an empty database.' }] });
   assert.equal(m.status, 'created', m.reason);
-  const entry = api('changes').find((c) => c.learning?.id === m.id);
+  const entry = api('changes').rows.find((c) => c.learning?.id === m.id);
   assert.equal(entry.lifecycle.state, 'decays');
   assert.ok(entry.lifecycle.at > Date.now());
   assert.equal(entry.canArchive, true);
@@ -86,7 +88,7 @@ test('Keep: a kept learning is not archived when unused; the dashboard says when
   const old = Date.now() - 90 * 86_400_000;
   db.prepare('UPDATE learnings SET created_at = ?, last_used_at = NULL WHERE id = ?').run(old, m.id);
   assert.equal(curator.pin(db, m.id, true).status, 'kept');
-  assert.equal(api('changes').find((c) => c.learning?.id === m.id).lifecycle.state, 'kept');
+  assert.equal(api('changes').rows.find((c) => c.learning?.id === m.id).lifecycle.state, 'kept');
   const { decay } = await import('../scripts/maintenance.mjs');
   const { loadSettings } = await import('../scripts/settings.mjs');
   assert.deepEqual(decay(db, loadSettings()), []);
