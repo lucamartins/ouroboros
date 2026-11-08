@@ -89,8 +89,10 @@ test('profile writes are surgical: prose, other sections and long bullets surviv
 });
 
 test('one memory directory per repository: worktrees and subfolders share it; settings can move it', () => {
-  const main = path.join(tmp, 'repo-main');
-  const wt = path.join(tmp, 'repo-wt');
+  // Long-form paths: git records them so, while os.tmpdir() may be an 8.3 short path on Windows.
+  const base = fs.realpathSync.native(tmp);
+  const main = path.join(base, 'repo-main');
+  const wt = path.join(base, 'repo-wt');
   fs.mkdirSync(main, { recursive: true });
   spawnSync('git', ['-C', main, 'init', '-q']);
   spawnSync('git', ['-C', main, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'init']);
