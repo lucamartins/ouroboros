@@ -185,7 +185,7 @@ function debounce(fn, ms) {
 }
 
 function showTip(target, ...lines) {
-  tooltip.replaceChildren(...lines);
+  tooltip.replaceChildren(...lines.filter(Boolean));
   tooltip.hidden = false;
   const r = target.getBoundingClientRect();
   const t = tooltip.getBoundingClientRect();
@@ -1124,6 +1124,8 @@ const GRAPH_EDGES = [
   ['similar', 'Similar', 'Close wording: a hint, not a relation'],
   ['belongs', 'Project', 'The project an item belongs to'],
 ];
+/** Hidden until turned on: "similar" is only a hint, and the project regions already show what belongs where. */
+const GRAPH_OFF_DEFAULT = ['similar', 'belongs'];
 /** How an edge reads from the selected item's side: [outgoing, incoming]. */
 const EDGE_READS = {
   link: ['Links to', 'Linked from'], mention: ['Names', 'Named by'], contains: ['Contains', 'Part of'],
@@ -1132,26 +1134,33 @@ const EDGE_READS = {
 const GRAPH_HEIGHT = { wide: 640, narrow: 440 };
 const ZOOM_MIN = 0.2;
 const ZOOM_MAX = 4;
-/** Above this zoom every skill and memory shows its name, not only hubs and the focused ones. */
+/** Above this zoom memories and instruction files show their names too. */
 const ZOOM_LABELS = 1.5;
-/** Kinds always drawn with their name (the rest on zoom); the layout keeps room for it. */
-const GRAPH_LABELLED = new Set(['project', 'skill']);
 /** Rest length and stiffness of each kind of connection in the layout. */
 const GRAPH_LINK = {
-  belongs: { dist: 80, k: 0.25 },
+  belongs: { dist: 80, k: 0.1 },
   contains: { dist: 38, k: 0.9 },
   link: { dist: 70, k: 0.7 },
   mention: { dist: 90, k: 0.5 },
   used: { dist: 100, k: 0.3 },
   similar: { dist: 120, k: 0.08 },
 };
+const GRAPH_CENTER = { x: 0, y: 0 };
+/** How far from its hub a project item can be and still widen the project's region. */
+const REGION_REACH = 190;
 
 const listParam = (k) => new Set(param(k).split(',').filter(Boolean));
+/** Connection types hidden now: the URL's list, the defaults when it names none, nothing for `none`. */
+function offEdges() {
+  const raw = param('off');
+  if (!raw) return new Set(GRAPH_OFF_DEFAULT);
+  return raw === 'none' ? new Set() : listParam('off');
+}
 
 function nodeRadius(n) {
-  if (n.kind === 'project') return 13;
+  if (n.kind === 'project') return 7;
   const base = { skill: 8, reference: 4.5, memory: 7, instructions: 7.5, rules: 5.5 }[n.kind] || 6;
-  return Math.min(base + Math.sqrt(n.uses || 0) * 1.1 + Math.min(n.degree || 0, 12) * 0.2, 19);
+  return Math.min(base + Math.sqrt(n.uses || 0) * 1.1 + Math.min(n.degree || 0, 12) * 0.2 + Math.sqrt(n.folded || 0) * 0.8, 21);
 }
 
 /** Where an item lives in the Knowledge lists, to see it there. */
@@ -1159,6 +1168,27 @@ function knowledgeLink(n) {
   const seg = { skill: 'skills', memory: 'memories', instructions: 'instructions' }[n.kind];
   if (!seg) return null;
   return hashOf('knowledge', seg, new URLSearchParams({ q: n.kind === 'instructions' ? n.path : n.name }));
+}
+
+/**
+ * One fixed place per project on an ellipse around the center, where what applies
+ * everywhere sits. Projects with connected items share the inner ring; projects whose
+ * items are all unconnected (drawn only on request) wait on an outer one. Stable across
+ * filters: by name, from the whole data.
+ */
+function projectAnchors(data) {
+  const hubs = data.nodes.filter((n) => n.kind === 'project').sort((a, b) => a.label.localeCompare(b.label));
+  const connected = new Set(data.nodes.filter((n) => n.kind !== 'project' && n.degree && n.project_id).map((n) => n.project_id));
+  const inner = hubs.filter((hub) => connected.has(hub.project_id));
+  const outer = hubs.filter((hub) => !connected.has(hub.project_id));
+  const anchors = new Map();
+  const ring = (list, r, turn) => list.forEach((hub, i) => {
+    const a = -Math.PI / 2 + turn + (i * 2 * Math.PI) / list.length;
+    anchors.set(hub.project_id, { x: Math.cos(a) * r * 1.3, y: Math.sin(a) * r * 0.8 });
+  });
+  ring(inner, inner.length < 2 && !outer.length ? 0 : 260 + inner.length * 20, 0);
+  ring(outer, 420 + outer.length * 20, Math.PI / Math.max(outer.length, 1));
+  return anchors;
 }
 
 async function graphList(project) {
@@ -1174,56 +1204,124 @@ async function graphList(project) {
  * The graph page: filters, the drawing and a side panel with the selected item (or a
  * summary). Everything the drawing shows is also reachable from the panel's lists, so the
  * page works with a keyboard and a screen reader.
+ *
+ * To stay legible it draws less than the data holds: a skill's reference files fold into
+ * it until the skill (or one of its files) is selected, unconnected items wait in the
+ * panel, and "similar" and project lines are off. Each can be turned back on.
  */
 function graphView(data) {
-  const hideKinds = listParam('hide');
-  const hideEdges = listParam('off');
+  const byId = new Map(data.nodes.map((n) => [n.id, n]));
+  const hasRefs = new Set(data.nodes.filter((n) => n.kind === 'reference' && n.parent).map((n) => n.parent));
+  const anchors = projectAnchors(data);
+  /** The view, kept while this page redraws (filters, opening a skill). */
+  const cam = { t: null };
   const wrap = h('div', { class: 'graph-page' });
 
   const kindChips = h('div', { class: 'chips', role: 'group', 'aria-label': 'Kinds of items' }, GRAPH_KINDS
     .filter(([k]) => data.nodes.some((n) => n.kind === k))
     .map(([k, label]) => h('button', {
-      type: 'button', class: 'chip', 'aria-pressed': String(!hideKinds.has(k)), 'data-fk': `kind:${k}`,
-      onclick: () => { toggleIn('hide', k); paint(); },
+      type: 'button', class: 'chip', 'data-fk': `kind:${k}`,
+      onclick: () => { toggleHidden(k); paint(); },
     }, h('span', { class: `swatch k-${k}` }), label, h('span', { class: 'n' }, fmt.int(data.nodes.filter((n) => n.kind === k).length)))));
   const edgeChips = h('div', { class: 'chips', role: 'group', 'aria-label': 'Kinds of connections' }, GRAPH_EDGES
     .filter(([t]) => data.stats.edges[t])
     .map(([t, label, tip]) => h('button', {
-      type: 'button', class: 'chip', title: tip, 'aria-pressed': String(!hideEdges.has(t)), 'data-fk': `edge:${t}`,
-      onclick: () => { toggleIn('off', t); paint(); },
+      type: 'button', class: 'chip', title: tip, 'data-fk': `edge:${t}`,
+      onclick: () => { toggleOff(t); paint(); },
     }, s('svg', { class: 'edge-sample', viewBox: '0 0 18 6', 'aria-hidden': 'true' }, s('line', { x1: 1, y1: 3, x2: 17, y2: 3, class: `e-${t}` })), label, h('span', { class: 'n' }, fmt.int(data.stats.edges[t])))));
-  const pluginsToggle = h('label', { class: 'check small muted', title: 'Plugin skills nothing here uses or names are left out by default' },
-    h('input', { type: 'checkbox', checked: param('plugins') === 'all', 'data-fk': 'plugins', onchange: (e) => { setNav({ set: { plugins: e.target.checked ? 'all' : '' }, push: false }); fillKnowledge(document.querySelector('.results'), 'graph'); } }),
-    'All plugin skills');
+  const check = (key, on, label, title, change) => h('label', { class: 'check small muted', title },
+    h('input', { type: 'checkbox', checked: on, 'data-fk': key, onchange: (e) => change(e.target.checked) }), label);
+  const toggles = h('div', { class: 'graph-toggles' },
+    check('refs', param('refs') === 'all', 'Open every skill', 'Reference files fold into their skill; selecting a skill opens it', (on) => { setNav({ set: { refs: on ? 'all' : '' }, push: false }); paint(); }),
+    check('lonely', param('lonely') === 'show', 'Unconnected items', 'Items nothing links to, names or uses with something else; listed in the panel', (on) => { setNav({ set: { lonely: on ? 'show' : '' }, push: false }); paint(); }),
+    check('plugins', param('plugins') === 'all', 'All plugin skills', 'Plugin skills nothing here uses or names are left out by default', (on) => { setNav({ set: { plugins: on ? 'all' : '' }, push: false }); fillKnowledge(document.querySelector('.results'), 'graph'); }));
 
-  function toggleIn(key, value) {
-    const set = listParam(key);
-    if (set.has(value)) set.delete(value); else set.add(value);
-    setNav({ set: { [key]: [...set].join(',') }, push: false });
+  function toggleHidden(kind) {
+    const set = listParam('hide');
+    if (set.has(kind)) set.delete(kind); else set.add(kind);
+    setNav({ set: { hide: [...set].join(',') }, push: false });
+  }
+  function toggleOff(type) {
+    const set = offEdges();
+    if (set.has(type)) set.delete(type); else set.add(type);
+    const isDefault = set.size === GRAPH_OFF_DEFAULT.length && GRAPH_OFF_DEFAULT.every((t) => set.has(t));
+    setNav({ set: { off: isDefault ? '' : set.size ? [...set].join(',') : 'none' }, push: false });
+  }
+
+  /** The skill whose reference files are open: the selected skill, or the selected file's skill. */
+  function familyOf(id) {
+    const n = byId.get(id);
+    if (!n) return null;
+    if (n.kind === 'skill' && hasRefs.has(n.id)) return n.id;
+    return n.kind === 'reference' && n.parent ? n.parent : null;
+  }
+  /** Whether selecting an item can bring it into the drawing (only a kind filter keeps it out). */
+  const revealable = (id) => byId.has(id) && !listParam('hide').has(byId.get(id).kind);
+
+  /** What to draw now: the visible items, their connections (a folded file's drawn from its skill) and what was left out. */
+  function visible() {
+    const hidden = listParam('hide');
+    const off = offEdges();
+    const allRefs = param('refs') === 'all';
+    const showLonely = param('lonely') === 'show';
+    const sel = param('sel');
+    const open = allRefs ? null : familyOf(sel);
+    const shown = (n) => n.kind !== 'project' && !hidden.has(n.kind)
+      && (n.kind !== 'reference' || !n.parent || allRefs || n.parent === open)
+      && (n.degree || showLonely || n.id === sel);
+    const items = data.nodes.filter(shown);
+    const ids = new Set(items.map((n) => n.id));
+    const hubs = hidden.has('project') ? [] : data.nodes.filter((n) => n.kind === 'project' && items.some((m) => m.project_id === n.project_id));
+    for (const hub of hubs) ids.add(hub.id);
+    const at = (id) => {
+      if (ids.has(id)) return id;
+      const n = byId.get(id);
+      return n?.kind === 'reference' && n.parent && ids.has(n.parent) ? n.parent : null;
+    };
+    const edges = [];
+    const seen = new Set();
+    for (const e of data.edges) {
+      if (off.has(e.type)) continue;
+      const a = at(e.source);
+      const b = at(e.target);
+      if (!a || !b || a === b) continue;
+      const key = a < b ? `${a}|${b}|${e.type}` : `${b}|${a}|${e.type}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edges.push(a === e.source && b === e.target ? e : { ...e, source: a, target: b });
+    }
+    const folded = new Map();
+    if (!hidden.has('reference')) {
+      for (const n of data.nodes) if (n.kind === 'reference' && n.parent && !ids.has(n.id) && ids.has(n.parent)) folded.set(n.parent, (folded.get(n.parent) || 0) + 1);
+    }
+    const lonelyHidden = showLonely ? 0 : data.nodes.filter((n) => n.kind !== 'project' && !n.degree && !hidden.has(n.kind) && n.id !== sel).length;
+    return { nodes: [...items, ...hubs].map((n) => (folded.has(n.id) ? { ...n, folded: folded.get(n.id) } : n)), edges, open, folding: !allRefs, lonelyHidden };
   }
 
   const holder = h('div', { class: 'graph-holder' });
   const side = h('aside', { class: 'panel graph-side', 'aria-live': 'polite' });
-  wrap.append(h('div', { class: 'graph-filters' }, kindChips, edgeChips, pluginsToggle), h('div', { class: 'graph-body' }, holder, side));
+  wrap.append(h('div', { class: 'graph-filters' }, kindChips, edgeChips, toggles), h('div', { class: 'graph-body' }, holder, side));
 
   let drawing = null;
-  function paint() {
-    const hk = listParam('hide');
-    const he = listParam('off');
-    for (const b of kindChips.children) b.setAttribute('aria-pressed', String(!hk.has(b.dataset.fk.slice(5))));
-    for (const b of edgeChips.children) b.setAttribute('aria-pressed', String(!he.has(b.dataset.fk.slice(5))));
+  function paint({ focus = false } = {}) {
+    const hidden = listParam('hide');
+    const off = offEdges();
+    for (const b of kindChips.children) b.setAttribute('aria-pressed', String(!hidden.has(b.dataset.fk.slice(5))));
+    for (const b of edgeChips.children) b.setAttribute('aria-pressed', String(!off.has(b.dataset.fk.slice(5))));
     drawing?.stop();
-    const nodes = data.nodes.filter((n) => !hk.has(n.kind));
-    const ids = new Set(nodes.map((n) => n.id));
-    const edges = data.edges.filter((e) => !he.has(e.type) && ids.has(e.source) && ids.has(e.target));
-    drawing = drawGraph({ nodes, edges, all: data, holder, side });
+    drawing = drawGraph({
+      ...visible(), all: data, holder, side, anchors, cam, focus, familyOf, revealable,
+      /** Select an item that needs a redraw: it is folded or unconnected, or its skill opens or closes. */
+      focusOn: (id) => { setNav({ set: { sel: id || '' }, push: false }); paint({ focus: !!id }); },
+      showLonely: () => { setNav({ set: { lonely: 'show' }, push: false }); toggles.querySelector('[data-fk="lonely"]').checked = true; paint(); },
+    });
     state.graph = drawing;
   }
   paint();
   return wrap;
 }
 
-function drawGraph({ nodes, edges, all, holder, side }) {
+function drawGraph({ nodes, edges, all, holder, side, anchors, cam, focus, open, folding, lonelyHidden, familyOf, revealable, focusOn, showLonely }) {
   const saved = (state.graphPos ||= new Map());
   const motion = !reducedMotion();
   const neighbors = new Map(nodes.map((n) => [n.id, new Set()]));
@@ -1233,29 +1331,35 @@ function drawGraph({ nodes, edges, all, holder, side }) {
     neighbors.get(e.target)?.add(e.source);
     for (const id of [e.source, e.target]) degree.set(id, (degree.get(id) || 0) + 1);
   }
-  const sim = nodes.map((n) => ({ ...n, r: nodeRadius(n), charge: n.kind === 'project' ? -560 : -(80 + Math.min(n.degree || 0, 12) * 14) }));
+  const sim = nodes.map((n) => ({ ...n, r: nodeRadius(n), labelText: shortLabel(n), charge: n.kind === 'project' ? -160 : -(80 + Math.min(n.degree || 0, 12) * 14) }));
   const byId = new Map(sim.map((n) => [n.id, n]));
   const allById = new Map(all.nodes.map((n) => [n.id, n]));
+  const anchorOf = (n) => (n.project_id && anchors.get(n.project_id)) || GRAPH_CENTER;
 
-  // Saved positions survive filter changes. A newcomer starts next to a placed neighbor;
-  // with nothing placed, d3 packs everything in a small spiral that the forces unfold.
+  // Saved positions survive redraws. A newcomer starts next to a placed neighbor; with
+  // nothing placed, near the center on the way to its project, so the drawing unfolds.
   let fresh = 0;
   sim.forEach((n, i) => {
     const p = saved.get(n.id);
     if (p) { n.x = p.x; n.y = p.y; return; }
     fresh++;
     const near = [...neighbors.get(n.id)].map((id) => saved.get(id)).find(Boolean);
-    if (near) { n.x = near.x + Math.cos(i * 2.4) * 14; n.y = near.y + Math.sin(i * 2.4) * 14; }
+    const a = anchorOf(n);
+    const base = near || { x: a.x * 0.25, y: a.y * 0.25 };
+    const d = near ? 14 : 6 * Math.sqrt(i + 1);
+    n.x = base.x + Math.cos(i * 2.4) * d;
+    n.y = base.y + Math.sin(i * 2.4) * d;
   });
 
   const links = edges.map((e) => ({ e, source: e.source, target: e.target, ...(GRAPH_LINK[e.type] || GRAPH_LINK.link) }));
   const simulation = d3.forceSimulation(sim)
     .force('link', d3.forceLink(links).id((n) => n.id).distance((l) => l.dist)
       .strength((l) => l.k / Math.min(degree.get(l.e.source) || 1, degree.get(l.e.target) || 1)))
-    .force('charge', d3.forceManyBody().strength((n) => n.charge).distanceMax(700))
-    .force('collide', d3.forceCollide((n) => n.r + (GRAPH_LABELLED.has(n.kind) ? 16 : 5)).strength(0.75))
-    .force('x', d3.forceX(0).strength(0.035))
-    .force('y', d3.forceY(0).strength(0.035))
+    .force('charge', d3.forceManyBody().strength((n) => n.charge).distanceMax(500))
+    .force('collide', d3.forceCollide((n) => n.r + (n.kind === 'skill' ? 14 : 5)).strength(0.75))
+    // Each project's items gather at its place; what applies everywhere, at the center.
+    .force('x', d3.forceX((n) => anchorOf(n).x).strength((n) => (n.kind === 'project' ? 0.5 : n.project_id ? 0.3 : 0.05)))
+    .force('y', d3.forceY((n) => anchorOf(n).y).strength((n) => (n.kind === 'project' ? 0.5 : n.project_id ? 0.3 : 0.05)))
     .alpha(!fresh ? 0.06 : fresh === sim.length ? 1 : 0.5)
     .stop();
 
@@ -1264,10 +1368,20 @@ function drawGraph({ nodes, edges, all, holder, side }) {
   const pattern = s('pattern', { id: 'graph-grid', width: 26, height: 26, patternUnits: 'userSpaceOnUse' }, s('circle', { class: 'grid-dot', cx: 13, cy: 13, r: 0.9 }));
   const grid = s('rect', { class: 'graph-grid', fill: 'url(#graph-grid)' });
   const viewport = s('g', {});
+  const regionLayer = s('g', { class: 'regions' });
   const edgeLayer = s('g', { class: 'edges' });
   const nodeLayer = s('g', { class: 'nodes' });
-  viewport.append(edgeLayer, nodeLayer);
+  viewport.append(regionLayer, edgeLayer, nodeLayer);
   svg.append(s('defs', {}, pattern), grid, viewport);
+
+  // One soft region per project, around its items, named on top.
+  const regions = sim.filter((n) => n.kind === 'project').map((hub) => {
+    const circle = s('circle', { class: 'region' });
+    const label = s('text', { class: 'region-label' }, hub.label);
+    const g = s('g', { class: 'region-g' }, circle, label);
+    regionLayer.append(g);
+    return { hub, members: sim.filter((n) => n.project_id === hub.project_id), circle, label, g };
+  });
 
   const edgeEls = links.map((l) => {
     const el = s('path', { class: `edge e-${l.e.type} k-${byId.get(l.e.source)?.kind}` });
@@ -1278,7 +1392,11 @@ function drawGraph({ nodes, edges, all, holder, side }) {
   sim.forEach((n, i) => {
     const g = s('g', { class: `node k-${n.kind}${n.learned ? ' learned' : ''}${n.degree || n.kind === 'project' ? '' : ' lonely'}`, 'data-id': n.id });
     const body = s('g', { class: 'body' }, s('circle', { class: 'halo', r: n.r + 6 }), s('circle', { class: 'core', r: n.r }));
-    g.append(body, s('text', { y: n.r + 4 }, n.kind === 'project' ? n.label : shortLabel(n)));
+    // A folded skill wears a dashed ring and the number of files it holds.
+    if (n.folded) body.append(s('circle', { class: 'stack', r: n.r + 3.5 }));
+    g.append(body);
+    if (n.kind !== 'project') g.append(s('text', { class: 'label', y: n.r + 4 }, n.labelText));
+    if (n.folded) g.append(s('text', { class: 'count', x: n.r + 3, y: -n.r + 1 }, `+${n.folded}`));
     if (motion && !saved.has(n.id)) {
       g.classList.add('enter');
       body.style.animationDelay = `${Math.min(i * 7, 520)}ms`; // CSSOM: allowed under the CSP
@@ -1290,8 +1408,8 @@ function drawGraph({ nodes, edges, all, holder, side }) {
   const controls = h('div', { class: 'graph-controls' },
     h('button', { type: 'button', class: 'btn icon small', 'aria-label': 'Zoom in', title: 'Zoom in', onclick: () => zoomBy(1.5) }, '+'),
     h('button', { type: 'button', class: 'btn icon small', 'aria-label': 'Zoom out', title: 'Zoom out', onclick: () => zoomBy(1 / 1.5) }, '−'),
-    h('button', { type: 'button', class: 'btn small', title: 'Fit everything in view', onclick: () => { userMoved = true; moveTo(frameOf(sim)); } }, 'Fit'));
-  const hint = h('p', { class: 'graph-hint' }, 'Drag to move · scroll to zoom · click an item');
+    h('button', { type: 'button', class: 'btn small', title: 'Fit everything in view', onclick: () => { userMoved = true; moveTo(frameAll()); } }, 'Fit'));
+  const hint = h('p', { class: 'graph-hint' }, folding ? 'Drag to move · scroll to zoom · click a skill to open its files' : 'Drag to move · scroll to zoom · click an item');
   holder.replaceChildren(svg, controls, hint);
 
   let size = { w: holder.clientWidth || 800, h: holder.clientHeight || GRAPH_HEIGHT.wide };
@@ -1301,29 +1419,34 @@ function drawGraph({ nodes, edges, all, holder, side }) {
   };
   setBox();
 
-  // Camera: d3-zoom owns pan, wheel, pinch and the animated moves. Until the user takes
-  // the view over, it follows the layout as it unfolds.
+  // Camera: d3-zoom owns pan, wheel, pinch and the animated moves. On a first drawing it
+  // follows the layout as it unfolds, until the user takes the view over; a redraw keeps
+  // the view it had.
   let view = d3.zoomIdentity;
-  let userMoved = false;
+  let userMoved = !!cam.t;
   const zoom = d3.zoom().scaleExtent([ZOOM_MIN, ZOOM_MAX]).on('zoom', (ev) => {
     if (ev.sourceEvent) { userMoved = true; hideTip(); }
     view = ev.transform;
+    cam.t = view;
     const t = view.toString();
     viewport.setAttribute('transform', t);
     pattern.setAttribute('patternTransform', t);
     svg.style.setProperty('--zoom', String(view.k));
     svg.classList.toggle('zoomed', view.k >= ZOOM_LABELS);
+    queueDeclutter();
   });
   const svgSel = d3.select(svg).call(zoom).on('dblclick.zoom', null);
 
-  function frameOf(list, maxK = 1.6) {
+  function frameOf(list, maxK = 1.6, extra = []) {
     if (!list.length) return view;
-    const xs = list.map((n) => n.x);
-    const ys = list.map((n) => n.y);
-    const [x0, x1, y0, y1] = [Math.min(...xs) - 40, Math.max(...xs) + 40, Math.min(...ys) - 40, Math.max(...ys) + 50];
+    const xs = [...list.map((n) => n.x), ...extra.map((b) => b.x)];
+    const ys = [...list.map((n) => n.y), ...extra.map((b) => b.y)];
+    const [x0, x1, y0, y1] = [Math.min(...xs) - 50, Math.max(...xs) + 50, Math.min(...ys) - 60, Math.max(...ys) + 50];
     const k = Math.min(Math.max(Math.min(size.w / (x1 - x0), size.h / (y1 - y0)), ZOOM_MIN), maxK);
     return d3.zoomIdentity.translate(-((x0 + x1) / 2) * k, -((y0 + y1) / 2) * k).scale(k);
   }
+  /** The whole drawing, its project regions and their names included. */
+  const frameAll = () => frameOf(sim, 1.6, regions.flatMap((r) => (r.box ? [{ x: r.box.x0, y: r.box.y0 }, { x: r.box.x1, y: r.box.y1 }] : [])));
   function moveTo(t, ms = 700) {
     if (motion && ms) svgSel.transition().duration(ms).ease(d3.easeCubicInOut).call(zoom.transform, t);
     else svgSel.interrupt().call(zoom.transform, t);
@@ -1332,16 +1455,23 @@ function drawGraph({ nodes, edges, all, holder, side }) {
   /** Ease the view toward the whole drawing, a little each tick. */
   function follow() {
     if (userMoved) return;
-    const t = frameOf(sim);
+    const t = frameAll();
     const f = 0.1;
     svgSel.call(zoom.transform, d3.zoomIdentity.translate(view.x + (t.x - view.x) * f, view.y + (t.y - view.y) * f).scale(view.k + (t.k - view.k) * f));
+  }
+  /** Glide to an item and its neighbors, zooming in no further than needed. */
+  function centerOn(id) {
+    const n = byId.get(id);
+    if (!n) return;
+    userMoved = true;
+    moveTo(frameOf([n, ...[...neighbors.get(id)].map((m) => byId.get(m))], Math.max(view.k, 1.3)));
   }
 
   const ro = new ResizeObserver(() => {
     if (!svg.isConnected) { ro.disconnect(); return; }
     size = { w: holder.clientWidth || size.w, h: holder.clientHeight || size.h };
     setBox();
-    if (!userMoved) moveTo(frameOf(sim), 0);
+    if (!userMoved) moveTo(frameAll(), 0);
   });
   ro.observe(holder);
 
@@ -1355,12 +1485,52 @@ function drawGraph({ nodes, edges, all, holder, side }) {
   function paintPositions() {
     for (const { l, el } of edgeEls) el.setAttribute('d', arc(l.source, l.target, l.e.type));
     for (const n of sim) nodeEls.get(n.id).setAttribute('transform', `translate(${n.x.toFixed(1)} ${n.y.toFixed(1)})`);
+    for (const r of regions) {
+      // Around the project's hub; an item its links pull far away stays outside the region.
+      const cx = r.hub.x;
+      const cy = r.hub.y;
+      const radius = Math.max(44, ...r.members.map((m) => Math.hypot(m.x - cx, m.y - cy) + m.r).filter((d) => d < REGION_REACH).map((d) => d + 22));
+      r.circle.setAttribute('cx', cx.toFixed(1));
+      r.circle.setAttribute('cy', cy.toFixed(1));
+      r.circle.setAttribute('r', radius.toFixed(1));
+      r.label.setAttribute('x', cx.toFixed(1));
+      r.label.setAttribute('y', (cy - radius - 6).toFixed(1));
+      // frameOf pads by about 50: the box leaves that out, but keeps the name's width.
+      const half = Math.max(radius, (r.hub.label.length * 7) / 2 + 20) - 40;
+      r.box = { x0: cx - half, x1: cx + half, y0: cy - radius - 4, y1: cy + radius - 40 };
+    }
   }
   const save = () => { for (const n of sim) saved.set(n.id, { x: n.x, y: n.y }); };
+
+  // Names that would overlap another one wait for zoom, hover or selection; the larger,
+  // better connected item keeps its name.
+  let declutterQueued = false;
+  function declutter() {
+    const k = view.k;
+    const zoomed = k >= ZOOM_LABELS;
+    const boxes = [];
+    const crowded = new Set();
+    const named = sim.filter((n) => n.kind === 'skill' || (zoomed && (n.kind === 'memory' || n.kind === 'instructions' || n.kind === 'rules')))
+      .sort((a, b) => b.r - a.r || (b.degree || 0) - (a.degree || 0));
+    for (const n of named) {
+      const w = (n.labelText.length * 6 + 6) / k;
+      const box = { x0: n.x - w / 2, x1: n.x + w / 2, y0: n.y + n.r + 3, y1: n.y + n.r + 3 + 13 / k };
+      if (boxes.some((o) => box.x0 < o.x1 && box.x1 > o.x0 && box.y0 < o.y1 && box.y1 > o.y0)) crowded.add(n.id);
+      else boxes.push(box);
+    }
+    for (const [id, g] of nodeEls) g.classList.toggle('crowded', crowded.has(id));
+  }
+  function queueDeclutter() {
+    if (declutterQueued) return;
+    declutterQueued = true;
+    requestAnimationFrame(() => { declutterQueued = false; declutter(); });
+  }
 
   // Layout: unfolds on screen, or is computed at once when the user prefers less motion.
   let seen = false;
   let waited = 0;
+  let ticks = 0;
+  if (cam.t) svgSel.call(zoom.transform, cam.t);
   if (motion) {
     simulation.on('tick', () => {
       if (!svg.isConnected) {
@@ -1371,16 +1541,18 @@ function drawGraph({ nodes, edges, all, holder, side }) {
       seen = true;
       paintPositions();
       follow();
-    }).on('end', save);
+      if (++ticks % 6 === 0) queueDeclutter();
+    }).on('end', () => { save(); declutter(); });
     paintPositions();
-    moveTo(frameOf(sim), 0);
+    if (!cam.t) moveTo(frameAll(), 0);
     simulation.restart();
   } else {
     simulation.tick(Math.ceil(Math.log(simulation.alphaMin()) / Math.log(1 - simulation.alphaDecay())));
     paintPositions();
-    moveTo(frameOf(sim), 0);
+    if (!cam.t) moveTo(frameAll(), 0);
     save();
   }
+  declutter();
 
   // Dragging an item pulls its neighbors along while the layout stays warm.
   let dragging = false;
@@ -1400,7 +1572,7 @@ function drawGraph({ nodes, edges, all, holder, side }) {
     })
     .on('end', (ev, n) => {
       n.fx = null; n.fy = null;
-      if (dragging) { simulation.alphaTarget(0); save(); }
+      if (dragging) { simulation.alphaTarget(0); save(); queueDeclutter(); }
       dragging = false;
       svg.classList.remove('dragging');
     });
@@ -1416,52 +1588,65 @@ function drawGraph({ nodes, edges, all, holder, side }) {
     if (!g || dragging) return;
     const n = byId.get(g.dataset.id);
     hover(n.id);
-    showTip(g, h('b', {}, n.label), h('div', { class: 'faint' }, [GRAPH_KIND_ONE[n.kind], n.project_name].filter(Boolean).join(' · ')));
+    showTip(g, h('b', {}, n.label), h('div', { class: 'faint' }, [GRAPH_KIND_ONE[n.kind], n.project_name].filter(Boolean).join(' · ')),
+      n.folded ? h('div', { class: 'faint' }, `${fmt.plural(n.folded, 'reference file')} · click to open`) : null);
   });
   svg.addEventListener('pointerout', (ev) => {
     if (ev.target.closest?.('.node') && !ev.relatedTarget?.closest?.('.node')) { hover(null); hideTip(); }
   });
 
+  /** Keep the regions of the items in focus lit while the rest dims. */
+  function lightRegions(ids) {
+    const projects = new Set([...ids].map((id) => byId.get(id)?.project_id).filter(Boolean));
+    for (const r of regions) r.g.classList.toggle('on', projects.has(r.hub.project_id));
+  }
+
   function hover(id) {
     svg.classList.toggle('hovering', !!id);
     for (const g of nodeLayer.querySelectorAll('.hot')) g.classList.remove('hot', 'pointed');
     for (const { el } of edgeEls) el.classList.remove('hot');
-    if (!id) return;
+    if (!id) { lightRegions(selected ? [selected, ...neighbors.get(selected)] : []); return; }
     nodeEls.get(id)?.classList.add('hot', 'pointed');
     for (const m of neighbors.get(id) || []) nodeEls.get(m)?.classList.add('hot');
     for (const { l, el } of edgeEls) if (l.e.source === id || l.e.target === id) el.classList.add('hot');
+    lightRegions([id, ...neighbors.get(id)]);
   }
 
   let selected = null;
   let matches = new Set();
   function select(id, { center = false } = {}) {
-    selected = id && byId.has(id) ? id : null;
+    // Folded or unconnected items, and opening or closing a skill, need a redraw.
+    if (id && !byId.has(id) && revealable(id)) { focusOn(id); return; }
+    if (id && !byId.has(id)) id = null;
+    if (folding && familyOf(id) !== open) { focusOn(id); return; }
+    selected = id;
     setNav({ set: { sel: selected || '' }, push: false });
     svg.classList.toggle('focusing', !!selected);
     for (const g of nodeEls.values()) g.classList.remove('on', 'sel');
     for (const { l, el } of edgeEls) el.classList.toggle('on', !!selected && (l.e.source === selected || l.e.target === selected));
+    lightRegions(selected ? [selected, ...neighbors.get(selected)] : []);
     if (selected) {
       nodeEls.get(selected).classList.add('on', 'sel');
       for (const m of neighbors.get(selected)) nodeEls.get(m)?.classList.add('on');
-      if (center) {
-        // Glide to the item and its neighbors, zooming in no further than needed.
-        userMoved = true;
-        const group = [byId.get(selected), ...[...neighbors.get(selected)].map((m) => byId.get(m))];
-        moveTo(frameOf(group, Math.max(view.k, 1.3)));
-      }
+      if (center) centerOn(selected);
     }
     side.replaceChildren(...(selected ? detailPanel(byId.get(selected)) : summaryPanel()).filter(Boolean));
   }
 
+  const matchesText = (n, text) => [n.label, n.name, n.description, n.path, n.project_name].some((x) => String(x || '').toLowerCase().includes(text));
   function search(q) {
     const text = String(q || '').toLowerCase();
-    matches = new Set(text ? sim.filter((n) => [n.label, n.name, n.description, n.path, n.project_name].some((x) => String(x || '').toLowerCase().includes(text))).map((n) => n.id) : []);
+    matches = new Set(text ? sim.filter((n) => matchesText(n, text)).map((n) => n.id) : []);
     svg.classList.toggle('searching', !!text);
     for (const [id, g] of nodeEls) g.classList.toggle('match', matches.has(id));
     return matches;
   }
 
+  /** A button to an item: drawn ones are selected in place; folded or unconnected ones are brought in. */
   function itemButton(n, extra) {
+    if (!byId.has(n.id) && !revealable(n.id)) {
+      return h('span', { class: 'graph-item hidden-item' }, h('span', { class: `swatch k-${n.kind}` }), h('span', { class: 'graph-item-label' }, n.label), h('span', { class: 'faint' }, 'hidden by a filter'));
+    }
     return h('button', { type: 'button', class: 'graph-item', 'data-fk': `item:${n.id}`, onclick: () => select(n.id, { center: true }) },
       h('span', { class: `swatch k-${n.kind}` }), h('span', { class: 'graph-item-label' }, n.label), extra ? h('span', { class: 'faint' }, extra) : null);
   }
@@ -1495,8 +1680,7 @@ function drawGraph({ nodes, edges, all, holder, side }) {
       groups.size ? h('div', { class: 'graph-conns' }, [...groups].map(([label, list]) => h('section', {},
         h('h3', {}, label, h('span', { class: 'n' }, fmt.int(list.length))),
         h('ul', { class: 'graph-list' }, list.sort((a, b) => a.other.label.localeCompare(b.other.label)).slice(0, 60).map(({ other, e }) => h('li', {},
-          byId.has(other.id) ? itemButton(other, e.type === 'used' ? `${e.sessions} sessions` : e.type === 'similar' ? `${Math.round(e.score * 100)}%` : null)
-            : h('span', { class: 'graph-item hidden-item' }, h('span', { class: `swatch k-${other.kind}` }), other.label, h('span', { class: 'faint' }, 'hidden by a filter'))))))))
+          itemButton(other, e.type === 'used' ? `${e.sessions} sessions` : e.type === 'similar' ? `${Math.round(e.score * 100)}%` : null)))))))
         : h('p', { class: 'faint' }, 'No connections: nothing links to it, names it or was used with it.'),
       link ? h('p', {}, h('a', { href: link }, 'Show in the Knowledge list')) : null,
     ];
@@ -1506,15 +1690,16 @@ function drawGraph({ nodes, edges, all, holder, side }) {
     const st = all.stats;
     const lonely = all.nodes.filter((n) => n.kind !== 'project' && !n.degree);
     const dangling = all.nodes.filter((n) => n.dangling?.length);
-    const byKind = GRAPH_KINDS.filter(([k]) => k !== 'project').map(([k, label]) => [k, label, sim.filter((n) => n.kind === k).sort((a, b) => (b.degree || 0) - (a.degree || 0) || a.label.localeCompare(b.label))]).filter(([, , l]) => l.length);
+    const byKind = GRAPH_KINDS.filter(([k]) => k !== 'project').map(([k, label]) => [k, label, all.nodes.filter((n) => n.kind === k).sort((a, b) => (b.degree || 0) - (a.degree || 0) || a.label.localeCompare(b.label))]).filter(([, , l]) => l.length);
     return [
       h('h2', {}, 'What connects to what'),
-      h('p', { class: 'muted' }, `${fmt.plural(st.items, 'item')} and ${fmt.plural(Object.entries(st.edges).filter(([t]) => t !== 'belongs').reduce((s, [, v]) => s + v, 0), 'connection')}. Bigger circles are used more; a ring marks what Ouroboros wrote or changed.`),
+      h('p', { class: 'muted' }, `${fmt.plural(st.items, 'item')} and ${fmt.plural(Object.entries(st.edges).filter(([t]) => t !== 'belongs').reduce((s, [, v]) => s + v, 0), 'connection')}. Each project has its region; what applies everywhere sits in the middle. Bigger circles are used more; a ring marks what Ouroboros wrote or changed; a dashed ring holds a skill's reference files.`),
+      lonelyHidden ? h('p', { class: 'faint small-text' }, `${fmt.plural(lonelyHidden, 'unconnected item')} not drawn. `, h('button', { type: 'button', class: 'linklike', 'data-fk': 'show-lonely', onclick: showLonely }, 'Draw them')) : null,
       lonely.length ? disclose(`Unconnected (${fmt.int(lonely.length)})`,
         h('p', { class: 'faint small-text' }, 'Nothing links to these, names them or used them with something else. Candidates to link, merge or retire.'),
-        h('ul', { class: 'graph-list' }, lonely.map((n) => h('li', {}, byId.has(n.id) ? itemButton(n) : h('span', { class: 'graph-item hidden-item' }, n.label))))) : null,
+        h('ul', { class: 'graph-list' }, lonely.map((n) => h('li', {}, itemButton(n))))) : null,
       dangling.length ? disclose(`Broken links (${fmt.int(st.dangling)})`,
-        h('ul', { class: 'graph-list' }, dangling.map((n) => h('li', {}, byId.has(n.id) ? itemButton(n, n.dangling.map((d) => `[[${d}]]`).join(', ')) : n.label)))) : null,
+        h('ul', { class: 'graph-list' }, dangling.map((n) => h('li', {}, itemButton(n, n.dangling.map((d) => `[[${d}]]`).join(', ')))))) : null,
       disclose('Browse every item', ...byKind.map(([k, label, list]) => h('section', { class: 'graph-browse' },
         h('h3', {}, label, h('span', { class: 'n' }, fmt.int(list.length))),
         h('ul', { class: 'graph-list' }, list.map((n) => h('li', {}, itemButton(n, n.degree ? fmt.plural(n.degree, 'link') : null))))))),
@@ -1522,16 +1707,26 @@ function drawGraph({ nodes, edges, all, holder, side }) {
   }
 
   const initial = param('sel');
-  if (initial && byId.has(initial)) select(initial); else side.replaceChildren(...summaryPanel().filter(Boolean));
+  if (initial && byId.has(initial)) {
+    select(initial);
+    // After a redraw that opened a skill, glide there once its files have started to unfold.
+    if (focus) setTimeout(() => { if (svg.isConnected && selected === initial) centerOn(initial); }, motion ? 420 : 0);
+  } else side.replaceChildren(...summaryPanel().filter(Boolean));
   if (param('q')) search(param('q'));
 
   return {
-    stop() { simulation.stop(); svgSel.interrupt(); ro.disconnect(); if (seen) save(); },
+    stop() { simulation.stop(); svgSel.interrupt(); ro.disconnect(); if (seen || !motion) save(); },
     search(q) {
       // A search replaces the selection: one highlight at a time.
       if (selected && q) select(null);
       const found = search(q);
-      if (found.size === 1) select([...found][0], { center: true });
+      if (found.size === 1) { select([...found][0], { center: true }); return; }
+      // Nothing drawn matches: one folded or unconnected match is brought in.
+      const text = String(q || '').toLowerCase();
+      if (!found.size && text) {
+        const hidden = all.nodes.filter((n) => n.kind !== 'project' && !byId.has(n.id) && revealable(n.id) && matchesText(n, text));
+        if (hidden.length === 1) select(hidden[0].id, { center: true });
+      }
     },
   };
 }

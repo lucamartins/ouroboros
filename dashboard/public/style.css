@@ -521,6 +521,8 @@ th.num .sort { flex-direction: row-reverse; }
 .k-project { --k: var(--k-project); }
 
 .graph-filters { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s4); align-items: center; margin-bottom: var(--s3); }
+.graph-toggles { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s4); align-items: center; }
+.linklike { padding: 0; border: 0; background: none; color: var(--accent); font: inherit; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip {
   display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; border-radius: 999px;
@@ -576,12 +578,25 @@ th.num .sort { flex-direction: row-reverse; }
   opacity: 0; transition: opacity .25s ease; font-size: calc(10.5px / var(--zoom, 1)); fill: var(--text-2); text-anchor: middle; dominant-baseline: hanging; pointer-events: none;
   paint-order: stroke; stroke: var(--surface); stroke-width: calc(3px / var(--zoom, 1)); stroke-linejoin: round;
 }
-.graph .node.k-project text { font-size: calc(12px / var(--zoom, 1)); font-weight: 600; fill: var(--text); letter-spacing: .01em; }
-/* Projects and skills are few and named for what they do: always labelled. The rest on zoom. */
-.graph .node:is(.k-project, .k-skill) text,
+/* Skills are few and named for what they do: always labelled, unless the name would overlap
+   a bigger one's (.crowded, until zoom, hover or selection). The rest on zoom. */
+.graph .node.k-skill text,
 .graph.zoomed .node:is(.k-memory, .k-instructions, .k-rules) text,
 .graph .node:is(.hot, .on, .match) text { opacity: 1; }
 .graph .node:is(.pointed, .sel) text { fill: var(--text); font-weight: 600; }
+.graph .node.crowded:not(.hot):not(.on):not(.match) text.label { opacity: 0; }
+/* A folded skill: a dashed ring and how many reference files it holds. */
+.graph .node .stack { fill: none; stroke: var(--k); stroke-opacity: .75; stroke-width: 1.2; stroke-dasharray: 2 2.5; }
+.graph .node text.count { opacity: 1; font-size: calc(9px / var(--zoom, 1)); font-weight: 600; fill: var(--text-3); text-anchor: start; dominant-baseline: auto; stroke-width: calc(2.5px / var(--zoom, 1)); }
+
+/* Project regions: soft areas around each project's items, named on top. */
+.graph .region-g { transition: opacity .25s ease; }
+.graph .region { fill: var(--k-project); fill-opacity: .05; stroke: var(--k-project); stroke-opacity: .35; stroke-width: 1; stroke-dasharray: 3 4; vector-effect: non-scaling-stroke; }
+.graph .region-label {
+  font-size: calc(12px / var(--zoom, 1)); font-weight: 600; letter-spacing: .02em; fill: var(--text-2); text-anchor: middle; pointer-events: none;
+  paint-order: stroke; stroke: var(--surface); stroke-width: calc(3px / var(--zoom, 1)); stroke-linejoin: round;
+}
+.graph:is(.hovering, .focusing) .region-g:not(.on) { opacity: .35; }
 
 .graph .edge { transition: stroke-opacity .25s ease, stroke-width .25s ease; }
 .graph.hovering .node:not(.hot), .graph.focusing:not(.hovering) .node:not(.on), .graph.searching:not(.hovering):not(.focusing) .node:not(.match) { opacity: .15; }
@@ -626,5 +641,5 @@ th.num .sort { flex-direction: row-reverse; }
   .graph-side { max-height: none; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .graph .node, .graph .node .body, .graph .node .halo, .graph .node text, .graph .edge { transition: none; animation: none; }
+  .graph .node, .graph .node .body, .graph .node .halo, .graph .node text, .graph .edge, .graph .region-g { transition: none; animation: none; }
 }
