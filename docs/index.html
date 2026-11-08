@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ouroboros — self-learning for Claude Code</title>
+  <meta name="description" content="Ouroboros is an open-source Claude Code plugin that turns your corrections, conventions and hard-won fixes into memories and skills, checks them against what is already written, and lets you undo any of it.">
+  <meta property="og:title" content="Ouroboros — self-learning for Claude Code">
+  <meta property="og:description" content="Teach Claude Code once. Ouroboros turns your sessions into memories and skills, with a local dashboard of what it learned and what it costs.">
+  <meta property="og:image" content="https://lucamartins.github.io/ouroboros/screenshots/overview.png">
+  <meta name="theme-color" content="#121211" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#f4f3ef" media="(prefers-color-scheme: light)">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500..800&display=swap">
+  <link rel="stylesheet" href="site.css">
+  <script src="site.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <header class="top">
+    <div class="wrap top-row">
+      <a class="brand" href="#" aria-label="Ouroboros, back to top">
+        <svg class="brand-mark" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+          <path d="M16 4a12 12 0 1 1-11.3 8" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+          <path d="M2.2 8.5 4.7 12l3.9-1.6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+          <circle cx="16" cy="16" r="3" fill="currentColor"/>
+        </svg>
+        <span>Ouroboros</span>
+      </a>
+      <nav aria-label="Sections">
+        <a href="#loop">How it learns</a>
+        <a href="#control">Control</a>
+        <a href="#dashboard">Dashboard</a>
+        <a href="#facts">Cost &amp; privacy</a>
+      </nav>
+      <a class="btn btn-ghost" href="https://github.com/lucamartins/ouroboros">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        GitHub
+      </a>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero">
+      <div class="wrap hero-grid">
+        <div class="hero-copy">
+          <h1>Teach Claude Code <span class="accent">once.</span></h1>
+          <p class="lede">Ouroboros reviews your sessions and turns your corrections, conventions and hard-won fixes into memories and skills. It checks each one against what is already written, puts it in the file that owns the topic, and lets you undo any of it.</p>
+
+          <div class="install" data-install>
+            <div class="install-head">
+              <span>Install in Claude Code</span>
+              <button class="copy" type="button" data-copy="/plugin marketplace add lucamartins/ouroboros&#10;/plugin install ouroboros@ouroboros">
+                <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5" y="5" width="9" height="9" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2h-6A1.5 1.5 0 0 0 2 3.5v6A1.5 1.5 0 0 0 3.5 11H5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+                <span data-copy-label>Copy</span>
+              </button>
+            </div>
+            <pre><code><span class="prompt">&gt;</span> /plugin marketplace add lucamartins/ouroboros
+<span class="prompt">&gt;</span> /plugin install ouroboros@ouroboros</code></pre>
+          </div>
+          <p class="fine">Open source, MIT. Needs Node.js 22.13 or newer. Windows, macOS and Linux.</p>
+        </div>
+
+        <figure class="loop-demo" aria-label="Example: how a correction becomes a learning">
+          <div class="ring">
+            <svg class="ring-art" viewBox="0 0 440 440" aria-hidden="true">
+              <circle class="ring-track" cx="220" cy="220" r="170"/>
+              <path class="ring-arc" d="M220 50a170 170 0 1 1-160.1 113.3"/>
+              <path class="ring-head" d="M40.4 136 59.9 163.3l30.4-12.5"/>
+              <g class="ring-dot" data-dot><circle cx="220" cy="50" r="11"/></g>
+            </svg>
+            <ol class="stations">
+              <li><button type="button" class="station s0" data-step="0">You correct</button></li>
+              <li><button type="button" class="station s1" data-step="1">Claude reviews</button></li>
+              <li><button type="button" class="station s2" data-step="2">Curator saves</button></li>
+              <li><button type="button" class="station s3" data-step="3">Next session</button></li>
+            </ol>
+            <div class="ring-center">
+              <div class="frame" data-frame="0">
+                <p class="frame-meta">Session 12 · turn 4</p>
+                <p class="bubble you">No — this repo uses <code>pnpm</code>. Never <code>npm</code>.</p>
+              </div>
+              <div class="frame" data-frame="1" hidden>
+                <p class="frame-meta">In-session review · every 10 turns</p>
+                <p class="bubble">Reviewed turns 1–10: <strong>1 correction</strong>, nothing already written about it.</p>
+              </div>
+              <div class="frame" data-frame="2" hidden>
+                <p class="frame-meta">Curator</p>
+                <p class="bubble out"><span class="out-line">📝 learned: Use pnpm in this repo</span><span class="out-where">memory · bakery-shop · undoable</span></p>
+              </div>
+              <div class="frame" data-frame="3" hidden>
+                <p class="frame-meta">Session 13</p>
+                <p class="bubble">Running <code>pnpm test</code> before the commit.</p>
+                <p class="frame-note">Nobody had to say it again.</p>
+              </div>
+            </div>
+          </div>
+          <figcaption>An example session, not a recording.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section class="problem">
+      <div class="wrap narrow">
+        <p>Claude Code already has places to remember things: memories, skills, <code>CLAUDE.md</code>. <strong>Nothing fills them for you.</strong> So you make the same correction on Monday, again on Thursday, and again next month.</p>
+      </div>
+    </section>
+
+    <section class="loop" id="loop" aria-labelledby="loop-title">
+      <div class="wrap">
+        <h2 id="loop-title">A loop that closes itself.</h2>
+        <p class="section-lede">Hooks capture what happens. A model decides what is worth keeping. Deterministic code decides where it goes, and keeps a ledger of every write.</p>
+        <ol class="track">
+          <li>
+            <h3>Session start</h3>
+            <p>A short protocol tells Claude to save preferences, corrections, conventions and working paths as it goes, without being asked.</p>
+          </li>
+          <li>
+            <h3>Every 10 turns</h3>
+            <p>Claude reviews only the turns since the last review. Right after a fix that took several tries, it reviews sooner, while the working path is fresh.</p>
+          </li>
+          <li>
+            <h3>Session end</h3>
+            <p>An isolated Haiku call reviews whatever was not reviewed yet: no tools, no MCP servers, typically well under a cent.</p>
+          </li>
+          <li>
+            <h3>Every day</h3>
+            <p>Maintenance archives what nobody uses and consolidates what grew past its budget. Archived, never deleted.</p>
+          </li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="curate" aria-labelledby="curate-title">
+      <div class="wrap split">
+        <div>
+          <h2 id="curate-title">Written where it belongs. Never twice.</h2>
+          <p>Every proposal is checked against your <code>CLAUDE.md</code> files, rules, skills and memories before anything is saved. What is already said is dropped. A detail about a procedure goes into the skill that owns it, not into a new note beside it. A workaround for something you could fix once becomes a suggested fix instead.</p>
+          <p>One rubric, nine rules, applied the same way by every path that saves: would it change what Claude does, is it a standing rule, is it absent from the repo, is it verified, will it still hold in six months.</p>
+        </div>
+        <figure class="diff-card">
+          <figcaption><span class="path">~/src/bakery-shop/.claude/skills/stripe-webhooks/SKILL.md</span><span class="tag">adds text</span></figcaption>
+<pre><code><span class="ctx">  2. Events we handle: see events.md.</span>
+<span class="ctx">  3. Replays: see replay.md.</span>
+<span class="ins">+ 4. Restart `stripe listen` after changing the endpoint</span>
+<span class="ins">+    secret; the old one keeps signing.</span></code></pre>
+          <p class="why"><strong>Why:</strong> webhooks failed signature checks until the listener restarted.</p>
+        </figure>
+      </div>
+    </section>
+
+    <section class="control" id="control" aria-labelledby="control-title">
+      <div class="wrap">
+        <div class="control-head">
+          <h2 id="control-title">Nothing changes your instructions behind your back.</h2>
+          <p class="section-lede">Facts and skills can be written right away. Edits to your <code>CLAUDE.md</code> and rule files, and anything that rewrites existing text, wait for you as a diff.</p>
+        </div>
+        <div class="control-grid">
+          <ul class="points">
+            <li><strong>An inbox of what waits.</strong> Approve, reject or edit each change in the dashboard, or talk it through with Claude, one entry at a time, with <code>/ouroboros:inbox</code>.</li>
+            <li><strong>Conflicts go to you.</strong> When a learning contradicts a written rule, you decide: a new rule, or the current one stands.</li>
+            <li><strong>Every write can be undone.</strong> <code>/ouroboros:undo</code> reverts only the lines that write changed, even after you edited the file.</li>
+            <li><strong>Your call how much runs alone.</strong> <code>auto</code>, <code>hybrid</code> or <code>queue</code>: from writing right away to holding everything for approval.</li>
+          </ul>
+          <figure class="shot">
+            <img src="screenshots/inbox.png" width="2880" height="1800" loading="lazy" alt="The Ouroboros inbox: a pending addition to a rule file and to the global CLAUDE.md, each shown as a diff with Approve and Reject.">
+            <figcaption>The inbox. Demo data.</figcaption>
+          </figure>
+        </div>
+      </div>
+    </section>
+
+    <section class="dash" id="dashboard" aria-labelledby="dash-title">
+      <div class="wrap">
+        <h2 id="dash-title">See whether it is working.</h2>
+        <p class="section-lede">A local dashboard answers the question that matters: are you correcting Claude less since learning turned on? It also shows what was learned and why, what it costs, and how your knowledge fits together.</p>
+        <figure class="shot shot-wide">
+          <img src="screenshots/overview.png" width="2880" height="1800" loading="lazy" alt="Ouroboros overview: corrections per 100 turns before and after learning turned on, what was learned, sessions using a learning, and cost against the monthly budget.">
+          <figcaption>Overview: corrections per 100 turns, before and after. Demo data.</figcaption>
+        </figure>
+        <div class="split split-graph">
+          <div>
+            <h3>Your knowledge, as a map.</h3>
+            <p>Skills, memories and instruction files, grouped by project, with the links, mentions and shared use between them. Broken links and items nothing connects to stand out, so you know what to merge or retire.</p>
+          </div>
+          <figure class="shot">
+            <img src="screenshots/graph.png" width="2880" height="2020" loading="lazy" alt="The knowledge graph: projects drawn as regions, with skills and memories connected by links, mentions and shared use.">
+            <figcaption>Knowledge graph. Demo data.</figcaption>
+          </figure>
+        </div>
+      </div>
+    </section>
+
+    <section class="facts" id="facts" aria-labelledby="facts-title">
+      <div class="wrap">
+        <h2 id="facts-title">Cheap, local, and boring in the right places.</h2>
+        <dl class="fact-list">
+          <div><dt>Capture</dt><dd>Hooks make no model calls and run in the background. A session never waits on them.</dd></div>
+          <div><dt>Reviews</dt><dd>In-session reviews read mostly cached context. The end-of-session review is one isolated <code>claude -p --safe-mode</code> call, measured at US$&nbsp;0.002–0.008 per session with Haiku.</dd></div>
+          <div><dt>Budget</dt><dd>A monthly cap, US$&nbsp;5 by default, checked before every model call Ouroboros makes.</dd></div>
+          <div><dt>Data</dt><dd>Stays on your machine in a SQLite file. The dashboard listens on <code>127.0.0.1</code> only.</dd></div>
+          <div><dt>Trust</dt><dd>Learns from your turns and observed outcomes, never from text a tool or web page returned. A secret filter checks every write.</dd></div>
+          <div><dt>Install</dt><dd>Zero dependencies, no <code>npm install</code>, no build step. Node.js 22.13+ on Windows, macOS and Linux.</dd></div>
+        </dl>
+      </div>
+    </section>
+
+    <section class="commands" aria-labelledby="commands-title">
+      <div class="wrap">
+        <h2 id="commands-title">Six commands. Most days you need none.</h2>
+        <ul class="cmd-list">
+          <li><code>/ouroboros:learn</code><span>Save what this session taught, now.</span></li>
+          <li><code>/ouroboros:inbox</code><span>Go through what waits for you, in the conversation.</span></li>
+          <li><code>/ouroboros:undo</code><span>Revert the last write, or a given one.</span></li>
+          <li><code>/ouroboros:forget</code><span>Archive a learning so it stops loading.</span></li>
+          <li><code>/ouroboros:dashboard</code><span>Open the local dashboard.</span></li>
+          <li><code>/ouroboros:backfill</code><span>Measure, or learn from, past sessions.</span></li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="close" aria-labelledby="close-title">
+      <div class="wrap close-grid">
+        <div>
+          <h2 id="close-title">Stop repeating yourself.</h2>
+          <p>Install it, work as usual, and open the dashboard in a week.</p>
+        </div>
+        <div>
+          <div class="install install-on-blue">
+            <div class="install-head">
+              <span>Install in Claude Code</span>
+              <button class="copy" type="button" data-copy="/plugin marketplace add lucamartins/ouroboros&#10;/plugin install ouroboros@ouroboros">
+                <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5" y="5" width="9" height="9" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2h-6A1.5 1.5 0 0 0 2 3.5v6A1.5 1.5 0 0 0 3.5 11H5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+                <span data-copy-label>Copy</span>
+              </button>
+            </div>
+            <pre><code><span class="prompt">&gt;</span> /plugin marketplace add lucamartins/ouroboros
+<span class="prompt">&gt;</span> /plugin install ouroboros@ouroboros</code></pre>
+          </div>
+          <p class="close-links"><a href="https://github.com/lucamartins/ouroboros#readme">Read the docs</a><a href="https://github.com/lucamartins/ouroboros/blob/main/DESIGN.md">How it is built</a></p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <div class="wrap foot-row">
+      <p>Ouroboros is an independent open-source project under the MIT license, made in the spirit of Nous Research's Hermes Agent. It is not affiliated with Anthropic.</p>
+      <p><a href="https://github.com/lucamartins/ouroboros">GitHub</a> · <a href="https://github.com/lucamartins/ouroboros/blob/main/CHANGELOG.md">Changelog</a> · <a href="https://github.com/lucamartins/ouroboros/blob/main/SECURITY.md">Security</a></p>
+    </div>
+  </footer>
+</body>
+</html>
