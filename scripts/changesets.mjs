@@ -17,6 +17,21 @@ export const MAX_GROWTH_CHARS = 6000;
 export const MAX_REMOVED_CHARS = 800;
 const MIN_OLD_CHARS = 4;
 
+/**
+ * A knowledge file as people name it: a skill's SKILL.md by the skill ("nisus-local"), a
+ * skill's reference file as "<skill>/<file>", anything else by its file name.
+ */
+export function fileDisplayName(file) {
+  const parts = String(file || '').split(/[\\/]/);
+  const base = parts[parts.length - 1] || '';
+  const i = parts.map((p) => p.toLowerCase()).lastIndexOf('skills');
+  if (i >= 0 && parts.length > i + 2) {
+    const skill = parts[i + 1];
+    return /^skill\.md$/i.test(base) ? skill : `${skill}/${parts.slice(i + 2).join('/')}`;
+  }
+  return base;
+}
+
 export function hashText(text) {
   return crypto.createHash('sha1').update(String(text ?? '')).digest('hex').slice(0, 16);
 }
@@ -165,7 +180,7 @@ export function applyChangeset(db, id, { actor = 'manual' } = {}) {
   const claims = claimsOf(db, id);
   const r = writeText(db, {
     file: cs.file, after, actor, expectBefore: current,
-    title: claims.length === 1 ? claims[0].title : `${path.basename(cs.file)}: ${claims.length} updates`,
+    title: claims.length === 1 ? claims[0].title : `${fileDisplayName(cs.file)}: ${claims.length} updates`,
     why: claims.map((c) => `- ${c.title}: ${String(c.claim || c.summary || '').replace(/\s+/g, ' ').slice(0, 300)}${c.evidence ? ` (${String(c.evidence).replace(/\s+/g, ' ').slice(0, 160)})` : ''}`).join('\n'),
     confidence: claims.length ? Math.max(...claims.map((c) => c.confidence ?? 0.6)) : 0.6,
   });

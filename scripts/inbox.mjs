@@ -10,7 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDb } from './db.mjs';
-import { applyChangeset, applyEdits, claimsOf, getChangeset, hashText, rejectChangeset } from './changesets.mjs';
+import { applyChangeset, applyEdits, claimsOf, fileDisplayName, getChangeset, hashText, rejectChangeset } from './changesets.mjs';
 import { containsSecret, decideQueued, writeText } from './curator.mjs';
 import { options } from './config.mjs';
 import { knowledgeKind } from './knowledge.mjs';
@@ -60,7 +60,7 @@ export function inboxEntries(db, { project } = {}) {
     const claims = claimsOf(db, cs.id);
     return {
       key: `cs:${cs.id}`, type: 'change', file: cs.file, project: cs.project, cwd: cs.cwd, stale: cs.status === 'stale', corrects: !!cs.corrects,
-      title: claims.length === 1 ? claims[0].title : `${claims.length} updates to ${path.basename(cs.file)}`,
+      title: claims.length === 1 ? claims[0].title : `${claims.length} updates to ${fileDisplayName(cs.file)}`,
       claims: claims.map((c) => c.title), at: claims.reduce((m, c) => Math.min(m, started(c)), cs.created_at),
     };
   });

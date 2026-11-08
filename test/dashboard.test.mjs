@@ -160,3 +160,10 @@ test('Overview misses count the period; the inventory groups by scope with plugi
   assert.equal(api('inventory', { kind: 'skills', group: 'plugin', offset: 0, limit: 10 }).rows.length, 1);
   assert.equal(api('nope'), undefined);
 });
+
+test('a skill file is named by its skill in titles', async () => {
+  const { fileDisplayName } = await import('../scripts/changesets.mjs');
+  assert.equal(fileDisplayName(String.raw`C:\Users\x\.claude\skills\nisus-local\SKILL.md`), 'nisus-local');
+  assert.equal(fileDisplayName('/home/x/.claude/skills/nisus/reference/business-rules.md'), 'nisus/reference/business-rules.md');
+  assert.equal(fileDisplayName('/repo/.claude/rules/testing.md'), 'testing.md');
+});

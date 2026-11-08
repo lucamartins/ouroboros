@@ -7,7 +7,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { changesetView, getChangeset } from '../scripts/changesets.mjs';
+import { changesetView, fileDisplayName, getChangeset } from '../scripts/changesets.mjs';
 import { getMeta, monthSpend, monthStart } from '../scripts/db.mjs';
 import { blockChars, parseProfile, readProfileText } from '../scripts/profile.mjs';
 import { loadSettings } from '../scripts/settings.mjs';
@@ -307,7 +307,10 @@ export function createApi(db) {
     }
     return {
       batch: b.batch, ts: b.ts, op: b.op, actor: b.actor, undone: !!b.reverted_at,
-      title: b.title || (b.op === 'create' && l ? l.title : fallbackTitle(files, l)),
+      // Batches recorded as "SKILL.md: 2 updates" are named by their skill (or "<skill>/<file>").
+      title: (b.title && files[0] && b.title.startsWith(`${path.basename(files[0].file)}:`)
+        ? `${fileDisplayName(files[0].file)}${b.title.slice(path.basename(files[0].file).length)}` : b.title)
+        || (b.op === 'create' && l ? l.title : fallbackTitle(files, l)),
       why: b.why, files,
       project_id: b.project, project_name: b.project ? idx.byId.get(b.project)?.name || null : null,
       session: s ? { id: s.id, started_at: s.started_at, project: s.project, cwd: s.cwd } : null,
