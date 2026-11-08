@@ -10,7 +10,7 @@ import { buildDigest, readTranscript } from '../scripts/transcript.mjs';
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
 
 test('projectKey matches Claude Code sanitization', () => {
-  assert.equal(projectKey('C:\\Users\\lucam'), 'C--Users-lucam');
+  assert.equal(projectKey('C:\\Users\\alice'), 'C--Users-alice');
   assert.equal(projectKey('/home/a/my.repo'), '-home-a-my-repo');
 });
 

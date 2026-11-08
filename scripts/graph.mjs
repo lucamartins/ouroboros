@@ -4,7 +4,7 @@
 //
 // Edge types, from the strongest evidence to the weakest:
 //   link      an explicit [[name]] or markdown link from one file to another
-//   mention   a file names a skill (`nisus-back`, /ouroboros:learn, "skill `nisus`")
+//   mention   a file names a skill (`acme-api`, /ouroboros:learn, "skill `acme`")
 //   contains  a skill and one of its reference files
 //   used      both were used in the same sessions (at least USED_MIN_SESSIONS of them)
 //   similar   their text is lexically close (TF-IDF cosine): a hint, not a relation
@@ -46,8 +46,8 @@ function skillDirOf(file) {
 
 /**
  * Matchers for skill names in free text. A distinctive name (with a hyphen or a colon,
- * like `nisus-back` or `ouroboros:learn`) counts wherever it appears as a whole token;
- * a plain word (`nisus`, `run`) only in code (`nisus`), as a command (/run) or next to
+ * like `acme-api` or `ouroboros:learn`) counts wherever it appears as a whole token;
+ * a plain word (`acme`, `run`) only in code (`acme`), as a command (/run) or next to
  * the word "skill", since as a word it usually means something else.
  */
 function skillMatchers(skills) {

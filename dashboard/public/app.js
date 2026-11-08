@@ -10,7 +10,7 @@
 //   System     health and cost (capture, reviewer, quality, budgets, problems)
 //
 // Page state lives in the URL hash: `#<tab>[/<segment or anchor>][?filters]`, e.g.
-// `#knowledge/learned?q=nisus&project=…` or `#activity/proposals?kind=skill&days=90`.
+// `#knowledge/learned?q=deploy&project=…` or `#activity/proposals?kind=skill&days=90`.
 // Lists are paged by the server ("Showing 50 of 1,240" and "Load more").
 
 import * as d3 from './d3.min.js';
@@ -138,7 +138,7 @@ function projectName(row) {
   return String(row.project).split('-').filter(Boolean).pop() || row.project;
 }
 
-/** "…/nisus-staging/SKILL.md" → { dir: "skills/nisus-staging/", name: "SKILL.md" }. */
+/** "…/acme-deploy/SKILL.md" → { dir: "skills/acme-deploy/", name: "SKILL.md" }. */
 function fileLabel(file) {
   const parts = String(file || '').split(/[\\/]/).filter(Boolean);
   const name = parts.pop() || file;

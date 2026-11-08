@@ -5,11 +5,6 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
-    inputs:
-      macos:
-        description: Also run on macOS (10x minutes on private repos)
-        type: boolean
-        default: false
 
 jobs:
   test:
@@ -17,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.macos && '["ubuntu-latest","windows-latest","macos-latest"]' || '["ubuntu-latest","windows-latest"]') }}
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     defaults:
       run:

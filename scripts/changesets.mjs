@@ -18,7 +18,7 @@ export const MAX_REMOVED_CHARS = 800;
 const MIN_OLD_CHARS = 4;
 
 /**
- * A knowledge file as people name it: a skill's SKILL.md by the skill ("nisus-local"), a
+ * A knowledge file as people name it: a skill's SKILL.md by the skill ("acme-local"), a
  * skill's reference file as "<skill>/<file>", anything else by its file name.
  */
 export function fileDisplayName(file) {

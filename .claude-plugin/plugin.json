@@ -73,8 +73,8 @@
     },
     "monthly_budget_usd": {
       "type": "number",
-      "title": "Monthly reviewer budget (USD)",
-      "description": "End-of-session reviews stop for the rest of the month once this is spent.",
+      "title": "Monthly budget (USD)",
+      "description": "Every Ouroboros model call (reviews, knowledge check, consolidation) stops for the rest of the month once this is spent.",
       "default": 5,
       "min": 0
     }

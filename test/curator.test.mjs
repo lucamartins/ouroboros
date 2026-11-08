@@ -60,10 +60,10 @@ test('a global fact is an addition to the global CLAUDE.md, deduplicated against
 test('a global memory becomes a global fact; proposed by Claude or the reviewer it waits for approval', () => {
   const file = path.join(tmp, 'claude', 'CLAUDE.md');
   fs.writeFileSync(file, '# Me\n');
-  const [r] = apply([{ kind: 'memory', scope: 'global', memory_type: 'reference', title: 'gh is authenticated as lucamartins' }]);
+  const [r] = apply([{ kind: 'memory', scope: 'global', memory_type: 'reference', title: 'gh is authenticated as octocat' }]);
   assert.equal(r.status, 'patched', r.reason);
   assert.equal(r.kind, 'instructions');
-  assert.match(read(file), /- gh is authenticated as lucamartins/);
+  assert.match(read(file), /- gh is authenticated as octocat/);
   const [q] = curator.apply(db, { cwd, items: [{ kind: 'global', text: 'Uses Windows with Git Bash for hooks', confidence: 0.9 }] }, { actor: 'background', autonomy: 'auto' });
   assert.equal(q.status, 'queued', q.reason);
   assert.ok(q.changesetId);

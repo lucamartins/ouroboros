@@ -2,7 +2,16 @@
 
 Self-learning for Claude Code. Ouroboros reviews your sessions, turns what is worth keeping into memories and skills, and shows on a local dashboard what it learned, how much that is used, and what it costs — in the spirit of Nous Research's Hermes Agent.
 
-> **Status: v0.8 — complete loop.** Each session starts with a short learning protocol. Every 10 turns (and right after a turn that worked through repeated failures) Claude briefly reviews the recent turns and saves what is worth keeping; when the session ends, a small isolated model call reviews whatever was not reviewed yet. Everything goes through one curator — deduplicated, routed, budgeted and undoable — and a daily maintenance pass archives what nobody uses and consolidates what grew too big. The local dashboard shows whether corrections are going down, what it costs, and lets you confirm, undo, archive or approve. See [DESIGN.md](DESIGN.md).
+## How it works
+
+- **At session start**, Claude gets a short learning protocol: save preferences, corrections, conventions and working paths as you go, without being asked.
+- **During the session**, every 10 user turns (and right after a turn that worked through repeated failures) Claude briefly reviews the recent turns and saves what is worth keeping.
+- **When the session ends**, a small isolated model call reviews whatever was not reviewed yet.
+- **Everything goes through one curator**: checked against what your CLAUDE.md files, rules, skills and memories already say, deduplicated, routed to the file that owns the topic, budgeted and undoable. Changes to existing files and corrections wait for your approval.
+- **Daily maintenance** archives what nobody uses and consolidates what grew too big.
+- **A local dashboard** shows what was learned and why, whether corrections are going down, what it costs, and a graph of how your skills, memories and instruction files connect.
+
+The full design, with the reasoning and measurements behind each decision, is in [DESIGN.md](DESIGN.md).
 
 ## Install
 
@@ -20,11 +29,11 @@ For a local checkout: `/plugin marketplace add /path/to/ouroboros`.
 | Command | What it does |
 |---|---|
 | `/ouroboros:learn [focus]` | Saves what was learned (Claude also uses it on its own) |
-| `/ouroboros:inbox [this project | key]` | Goes through what waits for your decision in the conversation, one entry at a time: Claude shows the diff, checks it and recommends; you approve, reject, skip, or discuss and edit it before it is saved |
+| `/ouroboros:inbox [this project \| key]` | Goes through what waits for your decision in the conversation, one entry at a time: Claude shows the diff, checks it and recommends; you approve, reject, skip, or discuss and edit it before it is saved |
 | `/ouroboros:undo [id]` | Reverts the last (or a given) learning write |
 | `/ouroboros:forget <match>` | Archives a learning so it stops loading |
 | `/ouroboros:dashboard` | Opens the local dashboard (`http://127.0.0.1:4747`): an inbox of what waits for you, what was learned (each item with what it changed, why and from which session; undo, archive, keep), a graph of how skills, memories and instruction files connect, value, activity, cost and health |
-| `/ouroboros:backfill [days] [limit]` | Reviews past sessions to build the baseline right away (asks before spending) |
+| `/ouroboros:backfill [measure \| learn] [days] [limit]` | Reviews past sessions: `measure` builds the correction baseline right away, `learn` sends what they would have taught to the inbox (asks before spending) |
 
 Everything else is automatic: capture hooks record turns, tool calls, error → fix recoveries, skill uses and memory reads/writes; a background reviewer runs when a session ends.
 
@@ -91,6 +100,10 @@ node scripts/eval.mjs --replay     # agreement with what you approved/rejected (
 
 Run both evals before and after changing the rubric or a prompt.
 
+## Contributing
+
+Issues and pull requests are welcome. Every file in the repository is in English, the runtime has no dependencies, and hooks must work on Windows, macOS and Linux (see [.claude/CLAUDE.md](.claude/CLAUDE.md)). Read [DESIGN.md](DESIGN.md) before changing behavior and update it when a decision changes; run the tests and `claude plugin validate --strict .` before opening a pull request.
+
 ## License
 
-MIT
+[MIT](LICENSE)

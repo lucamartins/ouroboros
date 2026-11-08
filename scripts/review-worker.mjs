@@ -1,9 +1,11 @@
-// Background reviewer. Phase 1 runs in `measure` mode: it reads a finished session,
-// asks an isolated model call to count corrections and list what could have been
-// learned, and records the result. Nothing is written to memories or skills.
+// Background reviewer (reflection B). Reads the unreviewed tail of a finished session,
+// asks an isolated model call to count corrections and propose what is worth keeping,
+// and sends the proposals through the learning evaluation and the curator. In `measure`
+// mode (learning off, or a measure backfill) it only records corrections and candidates.
 //
 //   node review-worker.mjs --session <id> [--trigger session_end|orphan]
-//   node review-worker.mjs --backfill [--limit 20] [--days 30] [--dry-run]
+//   node review-worker.mjs --backfill [--learn] [--limit 20] [--days 30] [--dry-run]
+//   node review-worker.mjs --drain | --triage-queue | --maintain [--force]
 //   (both accept --data <dir>)
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';

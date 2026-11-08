@@ -33,9 +33,9 @@ Then present the card in this exact shape, translated, without dropping fields:
 
 ```
 **[3/13] cs:26 · Change to a file · adds text**
-**File:** `~/.claude/skills/nisus/reference/windows-gotchas.md` — reference file of the global skill "nisus"
+**File:** `~/.claude/skills/acme/reference/windows-gotchas.md` — reference file of the global skill "acme"
 **Teaches:** <one sentence: what Claude will do differently>
-**Came from:** session of 2026-11-01 in repos (end-of-session review) — you said: "<the quote, shortened to the part that matters>"
+**Came from:** session of 2026-11-01 in acme-api (end-of-session review) — you said: "<the quote, shortened to the part that matters>"
 **Waited because:** <from the card>
 **Diff:**
 <the diff from `show`, in a plain code block>
@@ -51,7 +51,7 @@ Each field is one short line with one kind of information: what it teaches never
 Use the AskUserQuestion tool (when it is unavailable, ask in plain text with the same options). The dialog covers the rest of the screen, so the question stands on its own:
 
 - `header`: the position, e.g. `3/13`.
-- `question`: key, the file's short name and what it teaches in a few words — e.g. "cs:26 · windows-gotchas.md (skill nisus): add 'bash in PowerShell opens WSL; use Git Bash by full path'?"
+- `question`: key, the file's short name and what it teaches in a few words — e.g. "cs:26 · windows-gotchas.md (skill acme): add 'bash in PowerShell opens WSL; use Git Bash by full path'?"
 - `options` (your recommendation first, marked as recommended), **each with a `preview`** that shows what happens if chosen:
   - **Approve** — preview: the file's short path on the first line, then the diff lines from `show`, unchanged.
   - **Edit** — preview: the diff that `preview` printed for the version you would propose (run it before asking); if you have no concrete edit in mind, the parts the user could change, in words.

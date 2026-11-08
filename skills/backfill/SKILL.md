@@ -21,4 +21,4 @@ Arguments: `$ARGUMENTS` — first the mode (`measure`, the default, or `learn`),
 
 2. Tell the user how many sessions and user turns that is, and that each session costs one isolated small-model call (typically under US$ 0.01 with Haiku, plus small merge calls in learn mode; capped by the plugin's monthly budget). Ask for confirmation.
 
-3. On confirmation, run the same command without `--dry-run` (run it in the background if it is long) and report the final lines (calls, cost and, in learn mode, how many proposals are waiting). In learn mode, point the user to `/ouroboros:dashboard` → Learnings → "Waiting for approval".
+3. On confirmation, run the same command without `--dry-run` (run it in the background if it is long) and report the final lines (calls, cost and, in learn mode, how many proposals are waiting). In learn mode, point the user to the inbox: `/ouroboros:inbox`, or the Inbox page of `/ouroboros:dashboard`.

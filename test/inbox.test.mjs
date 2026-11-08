@@ -207,8 +207,8 @@ test('the card says what the file is and quotes what the user said in that sessi
 
 test('describeFile names what a knowledge file is', () => {
   const home = os.homedir();
-  assert.equal(inbox.describeFile(path.join(home, '.claude', 'skills', 'nisus', 'reference', 'windows-gotchas.md')), 'A reference file of the global skill "nisus"');
-  assert.equal(inbox.describeFile(path.join(home, '.claude', 'skills', 'nisus-local', 'SKILL.md')), 'The global skill "nisus-local"');
+  assert.equal(inbox.describeFile(path.join(home, '.claude', 'skills', 'acme', 'reference', 'windows-gotchas.md')), 'A reference file of the global skill "acme"');
+  assert.equal(inbox.describeFile(path.join(home, '.claude', 'skills', 'acme-local', 'SKILL.md')), 'The global skill "acme-local"');
   assert.match(inbox.describeFile(path.join(home, 'src', 'api', '.claude', 'rules', 'testing.md')), /rule file of project api/);
   assert.match(inbox.describeFile(path.join(home, 'src', 'api', 'CLAUDE.md')), /instructions of api/);
   assert.match(inbox.describeFile(path.join(home, '.claude', 'CLAUDE.md')), /global instructions/i);
