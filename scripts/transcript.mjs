@@ -49,10 +49,12 @@ function describeToolUse(c) {
 }
 
 /**
- * Build the digest of entries [fromLine, end). Returns the text, the number of human
- * turns it covers and the line index where the next review should start.
+ * Build the digest of entries [fromLine, end). Returns `chunks` (the digest, in one or
+ * more parts of at most ~maxChars each; `text` is the first), `omitted` (parts dropped
+ * past `maxParts`), the number of human turns it covers and the line index where the
+ * next review should start.
  */
-export function buildDigest(entries, { fromLine = 0, maxChars = 80_000 } = {}) {
+export function buildDigest(entries, { fromLine = 0, maxChars = 80_000, maxParts = 8 } = {}) {
   const lines = [];
   let humanTurns = 0;
 
@@ -82,16 +84,34 @@ export function buildDigest(entries, { fromLine = 0, maxChars = 80_000 } = {}) {
     }
   }
 
-  let text = render(lines);
-  if (text.length > maxChars) text = render(lines.filter((l) => l.kind !== 'tool'));
-  if (text.length > maxChars) {
-    text = render(lines.filter((l) => l.kind !== 'tool').map((l) => (l.kind === 'assistant' ? { ...l, text: clip(l.text, 200) } : l)));
+  // Shrink in steps (tool calls first, then long assistant text); what still does not
+  // fit is split into parts at user turns, each reviewed on its own, so nothing in the
+  // middle of a long session is lost.
+  let kept = lines;
+  if (render(kept).length > maxChars) kept = kept.filter((l) => l.kind !== 'tool');
+  if (render(kept).length > maxChars) kept = kept.map((l) => (l.kind === 'assistant' ? { ...l, text: clip(l.text, 200) } : l));
+  const parts = [];
+  let cur = [];
+  let size = 0;
+  for (const l of kept) {
+    const len = l.text.length + 1;
+    if (cur.length && size + len > maxChars && (l.kind === 'user' || size + len > maxChars * 1.25)) {
+      parts.push(cur);
+      cur = [];
+      size = 0;
+    }
+    cur.push(l.text.length > maxChars ? { ...l, text: clip(l.text, maxChars - 1) } : l);
+    size += len;
   }
-  if (text.length > maxChars) {
-    const half = Math.floor(maxChars / 2);
-    text = `${text.slice(0, half)}\n[… middle of the session omitted …]\n${text.slice(-half)}`;
+  if (cur.length || !parts.length) parts.push(cur);
+  let omitted = 0;
+  if (parts.length > maxParts) {
+    // Beyond the cap, keep the first part and the most recent ones.
+    omitted = parts.length - maxParts;
+    parts.splice(1, omitted);
   }
-  return { text, humanTurns, nextLine: entries.length };
+  const chunks = parts.map((p) => render(p));
+  return { text: chunks[0], chunks, omitted, humanTurns, nextLine: entries.length };
 }
 
 /** Number of lines in a transcript (the cursor unit), or null if unreadable. */

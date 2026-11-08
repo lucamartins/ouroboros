@@ -263,8 +263,9 @@ export function createApi(db) {
         FROM writes w LEFT JOIN learnings l ON l.id = w.learning_id
         GROUP BY w.batch ORDER BY MIN(w.id) DESC LIMIT 50`).all();
       const candidates = db.prepare(`
-        SELECT c.*, s.started_at session_started_at, s.cwd FROM candidates c
-        JOIN sessions s ON s.id = c.session_id ORDER BY s.started_at DESC, c.id LIMIT 300`).all();
+        SELECT c.*, s.started_at session_started_at, s.cwd, cs.status cs_status, cs.batch cs_batch FROM candidates c
+        JOIN sessions s ON s.id = c.session_id LEFT JOIN changesets cs ON cs.id = c.changeset_id
+        ORDER BY s.started_at DESC, c.id LIMIT 300`).all();
       const corrections = db.prepare(`
         SELECT c.quote, c.kind, c.session_id, s.started_at session_started_at, s.project, s.cwd FROM corrections c
         JOIN sessions s ON s.id = c.session_id ORDER BY s.started_at DESC, c.id LIMIT 300`).all();

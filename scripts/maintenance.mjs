@@ -95,11 +95,11 @@ export async function consolidate(db, settings, opts) {
       const result = await runModel({
         prompt: consolidatePrompt({ title: BLOCKS[key], bullets: blocks[key], targetChars: Math.floor(limit * TARGET_RATIO) }),
         schema: CONSOLIDATE_SCHEMA,
-        model: opts.reviewerModel,
+        model: opts.judgeModel,
       });
       report.cost += Number(result.total_cost_usd) || 0;
       db.prepare("INSERT INTO reviews (session_id, mode, trigger, model, status, cost_usd, output_tokens, input_tokens, ts) VALUES ('maintenance', 'maintenance', ?, ?, 'ok', ?, ?, ?, ?)")
-        .run(`consolidate:${key}`, opts.reviewerModel, Number(result.total_cost_usd) || 0, result.usage?.output_tokens || 0,
+        .run(`consolidate:${key}`, opts.judgeModel, Number(result.total_cost_usd) || 0, result.usage?.output_tokens || 0,
           (result.usage?.input_tokens || 0) + (result.usage?.cache_creation_input_tokens || 0), Date.now());
       const r = rewriteProfileBlock(db, key, result.structured_output.bullets);
       report.profile.push({ block: key, ...r });
@@ -139,12 +139,12 @@ export async function maintain(db, { force = false, now = Date.now() } = {}) {
   const opts = options();
   const decayed = decay(db, settings, now);
   let tidied = null;
-  const waiting = db.prepare("SELECT COUNT(*) n FROM candidates WHERE outcome = 'queued' AND triaged_at IS NULL").get().n
+  const waiting = db.prepare("SELECT COUNT(*) n FROM candidates WHERE outcome IN ('pending', 'queued') AND triaged_at IS NULL AND changeset_id IS NULL").get().n
     + db.prepare("SELECT COUNT(*) n FROM changesets WHERE status = 'stale'").get().n;
   if (waiting && opts.monthlyBudgetUsd > monthSpend(db)) {
     try {
-      const { tidyQueue } = await import('./evaluate.mjs');
-      tidied = await tidyQueue(db);
+      const { drainQueue } = await import('./evaluate.mjs');
+      tidied = await drainQueue(db);
     } catch (err) {
       logError(db, 'maintenance:triage', err);
     }

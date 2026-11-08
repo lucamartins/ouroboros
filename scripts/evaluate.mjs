@@ -16,7 +16,7 @@ import path from 'node:path';
 import { options } from './config.mjs';
 import { apply as curatorApply } from './curator.mjs';
 import { applyChangeset, applyEdits, changesetNeedsApproval, claimsOf, getChangeset, pendingChangeset, saveChangeset } from './changesets.mjs';
-import { logError } from './db.mjs';
+import { acquireLease, assertBudget, BudgetError, logError, releaseLease } from './db.mjs';
 import { buildIndex, groundIdentifiers, identifiersIn, knowledgeFiles, knowledgeKind, PATCHABLE, resolveOwner, tokenize } from './knowledge.mjs';
 import { insertReview, runModel, usageOf } from './review-worker.mjs';
 import { rubricText } from './rubric.mjs';
@@ -253,9 +253,10 @@ export async function composeRoutes(db, routes, ctx) {
     if (!claims.length) continue;
     let composed;
     try {
+      assertBudget(db, options().monthlyBudgetUsd);
       composed = await composeFile({ file, claims, cwd: ctx.cwd, model: ctx.model });
     } catch (err) {
-      logError(db, 'evaluate:editor', err);
+      if (!(err instanceof BudgetError)) logError(db, 'evaluate:editor', err);
       // Leave them waiting: the next queue check tries again.
       for (const c of fresh) setOutcome(db, c.id, 'queued', `could not compose the change to ${file} yet`, { triaged_at: null, target: file });
       continue;
@@ -263,6 +264,15 @@ export async function composeRoutes(db, routes, ctx) {
     report.calls++;
     report.cost += composed.usage.cost;
     insertReview(db, { sessionId: ctx.sessionId || 'maintenance', mode: ctx.sessionId ? 'background' : 'maintenance', trigger: 'editor', model: ctx.model, status: 'ok', usage: composed.usage, sessionStartedAt: ctx.sessionStartedAt });
+
+    // The editor ran for a while: if the user approved or rejected a change to this file
+    // meanwhile (dashboard), this composition is out of date. Compose again next round.
+    const moved = previous.some((id) => !['pending', 'stale'].includes(getChangeset(db, id)?.status))
+      || carried.some((c) => db.prepare('SELECT outcome FROM candidates WHERE id = ?').get(c.id)?.outcome !== 'queued');
+    if (moved) {
+      for (const c of fresh) setOutcome(db, c.id, 'queued', null, { triaged_at: null, target: file, changeset_id: null });
+      continue;
+    }
 
     const appliedFor = (id) => composed.applied.some((e) => e.claims.includes(id));
     const rejectedFor = (id) => composed.rejected.filter((r) => r.edit.claims?.includes(id)).map((r) => r.reason);
@@ -287,8 +297,11 @@ export async function composeRoutes(db, routes, ctx) {
         setOutcome(db, c.id, 'dropped', `not written to ${where}: ${rejectedFor(c.id).join('; ') || 'no edit was given'}`, { target: file, changeset_id: null });
       } else {
         inChangeset.push(c.id);
+        // An "adds" whose edit rewrites existing text is a correction: it waits for the user.
+        const rewrites = s.status !== 'corrects' && composed.applied.some((e) => e.rewrites && e.claims.includes(c.id));
+        const label = s.status === 'corrects' ? `✎ corrects ${file}` : rewrites ? `✎ rewrites text in ${file}` : `adds to ${file}`;
         db.prepare('UPDATE candidates SET note = ?, claim = ?, target = ?, triaged_at = ? WHERE id = ?')
-          .run(`${s.status === 'corrects' ? `✎ corrects ${file}` : `adds to ${file}`}: ${s.reason}`, c.claim, file, Date.now(), c.id);
+          .run(`${label}: ${s.reason}`, c.claim, file, Date.now(), c.id);
       }
     }
     for (const id of previous) db.prepare("UPDATE changesets SET status = 'superseded', decided_at = ? WHERE id = ? AND status IN ('pending', 'stale')").run(Date.now(), id);
@@ -324,10 +337,12 @@ export async function evaluate(db, rows, ctx) {
     return [r.id, item];
   }));
   const proposals = rows.map((r) => ({ id: r.id, ...items.get(r.id), claim: r.claim || undefined, target: r.target || undefined, evidence: r.evidence, when: when(r) }));
-  const screen = await triage(proposals, { cwd: ctx.cwd, db, lang: ctx.lang, model: ctx.model, exclude: rows.map((r) => r.id) });
+  // Each screening call is recorded as it happens, so the budget check before the next
+  // call (and the month's spend) always counts it.
+  const record = (usage) => insertReview(db, { sessionId: ctx.sessionId || 'maintenance', mode: ctx.sessionId ? 'background' : 'maintenance', trigger: 'triage', model: ctx.model, status: 'ok', usage, sessionStartedAt: ctx.sessionStartedAt });
+  const screen = await triage(proposals, { cwd: ctx.cwd, db, lang: ctx.lang, model: ctx.model, exclude: rows.map((r) => r.id), record });
   report.cost += screen.cost;
   report.calls += screen.calls;
-  insertReview(db, { sessionId: ctx.sessionId || 'maintenance', mode: ctx.sessionId ? 'background' : 'maintenance', trigger: 'triage', model: ctx.model, status: 'ok', usage: { cost: screen.cost }, sessionStartedAt: ctx.sessionStartedAt });
 
   const routes = new Map();
   const route = (file, claim) => {
@@ -417,12 +432,42 @@ export async function evaluate(db, rows, ctx) {
   return report;
 }
 
-// ---------- the approval queue ----------
+// ---------- the evaluation queue ----------
+
+/** Proposals waiting for the evaluation (fresh from a review, or retried after an error). */
+const WAITING_SQL = `
+  SELECT c.*, s.started_at session_started_at FROM candidates c LEFT JOIN sessions s ON s.id = c.session_id
+  WHERE c.outcome IN ('pending', 'queued') AND c.changeset_id IS NULL AND c.triaged_at IS NULL
+  ORDER BY COALESCE(s.started_at, c.ts), c.id`;
+
+function payloadOf(row) {
+  try { return JSON.parse(row.payload || '{}'); } catch { return {}; }
+}
+
+/** Whether anything waits for the evaluation. */
+export function queueHasWork(db) {
+  return !!db.prepare("SELECT 1 FROM candidates WHERE outcome IN ('pending', 'queued') AND changeset_id IS NULL AND triaged_at IS NULL LIMIT 1").get()
+    || !!db.prepare("SELECT 1 FROM changesets WHERE status = 'stale' LIMIT 1").get();
+}
+
+/** The notice lines for what an evaluation did, as the next session shows them. */
+export function noticeLines(results) {
+  return [
+    ...results.filter((r) => r.status === 'created').map((r) => `📝 learned: ${r.title}`),
+    ...results.filter((r) => r.status === 'patched').map((r) => `📝 updated: ${r.title}`),
+    ...results.filter((r) => r.status === 'queued').map((r) => `⏳ waiting for approval: ${r.title}`),
+    ...results.filter((r) => r.status === 'conflict').map((r) => `⚖ conflicts with a written rule, decide in the dashboard: ${r.title}`),
+  ];
+}
 
 /**
- * Evaluate the approval queue: untriaged proposals, and changesets that went stale
- * (the file changed, or the user removed one of their learnings). `force` evaluates
- * everything waiting again, from scratch. Records the cost as a maintenance review.
+ * Evaluate what waits in the queue: proposals not evaluated yet, and changesets that
+ * went stale (the file changed, a learning was removed, or a new change did not fit).
+ * `force` evaluates everything waiting again, from scratch. Proposals are grouped by
+ * project directory (retrieval and grounding depend on it) and by the autonomy they
+ * were proposed under; those from a live session's review are evaluated per session,
+ * so its notice can say what happened. Call through `drainQueue`, which makes sure only
+ * one process evaluates at a time.
  */
 export async function tidyQueue(db, { force = false, autonomy = 'queue' } = {}) {
   const opts = options();
@@ -430,38 +475,45 @@ export async function tidyQueue(db, { force = false, autonomy = 'queue' } = {}) 
     db.prepare("UPDATE changesets SET status = 'superseded', decided_at = ? WHERE status IN ('pending', 'stale')").run(Date.now());
     db.prepare("UPDATE candidates SET changeset_id = NULL, triaged_at = NULL WHERE outcome = 'queued'").run();
   }
-  const rows = db.prepare(`
-    SELECT c.*, s.started_at session_started_at FROM candidates c LEFT JOIN sessions s ON s.id = c.session_id
-    WHERE c.outcome = 'queued' AND c.changeset_id IS NULL AND c.triaged_at IS NULL
-    ORDER BY COALESCE(s.started_at, c.ts), c.id`).all();
+  const rows = db.prepare(WAITING_SQL).all();
   // A conflict the user settled ("it's a new rule") goes straight to its file's editor.
-  const confirmed = rows.filter((r) => r.target && /"confirmed":true/.test(r.payload || ''));
-  rows.splice(0, rows.length, ...rows.filter((r) => !confirmed.includes(r)));
+  const confirmed = rows.filter((r) => r.target && payloadOf(r).confirmed);
+  const fresh = rows.filter((r) => !confirmed.includes(r));
   const staleSets = db.prepare("SELECT * FROM changesets WHERE status = 'stale'").all();
-  const report = { total: rows.length, recomposed: 0, kept: 0, created: 0, dropped: 0, merged: 0, routed: 0, suggested: 0, stale: 0, queued: 0, patched: 0, cost: 0, byRule: {} };
-  if (!rows.length && !staleSets.length && !confirmed.length) return report;
+  const report = { total: fresh.length, recomposed: 0, kept: 0, created: 0, dropped: 0, merged: 0, routed: 0, suggested: 0, stale: 0, queued: 0, patched: 0, cost: 0, byRule: {} };
+  if (!fresh.length && !staleSets.length && !confirmed.length) return report;
 
-  // Retrieval and grounding depend on the project, so evaluate one directory at a time.
   const groups = new Map();
-  const group = (cwd) => {
-    const key = cwd || '';
-    if (!groups.has(key)) groups.set(key, { rows: [], stale: [], confirmed: [] });
+  const group = (key, init) => {
+    if (!groups.has(key)) groups.set(key, { rows: [], stale: [], confirmed: [], ...init });
     return groups.get(key);
   };
-  for (const r of rows) {
-    let payload = {};
-    try { payload = JSON.parse(r.payload || '{}'); } catch { /* ignore */ }
-    group(payload.cwd || r.cwd).rows.push(r);
+  for (const r of fresh) {
+    const p = payloadOf(r);
+    const cwd = p.cwd || r.cwd || '';
+    const auto = p.autonomy || autonomy;
+    const live = p.notify ? r.session_id : '';
+    group(`${cwd}|${auto}|${live}`, {
+      cwd, autonomy: auto, notify: !!p.notify, sessionId: live || null, sessionStartedAt: r.session_started_at,
+      reviewId: p.notify ? r.review_id : null, trigger: p.trigger,
+    }).rows.push(r);
   }
-  for (const cs of staleSets) group(cs.cwd).stale.push(cs);
-  for (const r of confirmed) group(r.cwd).confirmed.push(r);
+  for (const cs of staleSets) group(`${cs.cwd || ''}|${autonomy}|`, { cwd: cs.cwd || '', autonomy }).stale.push(cs);
+  for (const r of confirmed) group(`${r.cwd || ''}|${autonomy}|`, { cwd: r.cwd || '', autonomy }).confirmed.push(r);
 
-  for (const [cwd, g] of groups) {
-    const ctx = { cwd: cwd || undefined, actor: 'background', autonomy, lang: opts.learningLanguage, model: opts.reviewerModel, payload: { trigger: 'session_end' } };
+  for (const g of groups.values()) {
+    assertBudget(db, opts.monthlyBudgetUsd);
+    const ctx = {
+      cwd: g.cwd || undefined, actor: 'background', autonomy: g.autonomy, lang: opts.learningLanguage, model: opts.judgeModel,
+      sessionId: g.sessionId || undefined, sessionStartedAt: g.sessionStartedAt, payload: { trigger: g.trigger || 'session_end' },
+    };
+    const results = [];
     if (g.rows.length) {
       const r = await evaluate(db, g.rows, ctx);
       for (const k of ['kept', 'created', 'dropped', 'merged', 'routed', 'suggested', 'stale', 'queued', 'patched', 'cost']) report[k] += r[k] || 0;
       for (const [rule, n] of Object.entries(r.byRule)) report.byRule[rule] = (report.byRule[rule] || 0) + n;
+      results.push(...r.results);
+      if (g.reviewId) db.prepare('UPDATE reviews SET learned = learned + ?, patched = patched + ? WHERE id = ?').run(r.created || 0, r.patched || 0, g.reviewId);
     }
     if (g.stale.length || g.confirmed.length) {
       const routes = new Map();
@@ -476,8 +528,49 @@ export async function tidyQueue(db, { force = false, autonomy = 'queue' } = {}) 
       report.queued += r.queued;
       report.patched += r.applied;
     }
+    const lines = noticeLines(results);
+    if (g.notify && lines.length) {
+      const project = db.prepare('SELECT project FROM sessions WHERE id = ?').get(g.sessionId)?.project ?? null;
+      db.prepare('INSERT INTO notices (ts, session_id, project, text) VALUES (?, ?, ?, ?)').run(Date.now(), g.sessionId, project, lines.join('\n'));
+    }
   }
   db.prepare("INSERT INTO reviews (session_id, mode, trigger, model, status, detail, cost_usd, ts) VALUES ('maintenance', 'maintenance', 'triage-summary', ?, 'ok', ?, 0, ?)")
-    .run(opts.reviewerModel, JSON.stringify(report), Date.now());
+    .run(opts.judgeModel, JSON.stringify(report), Date.now());
   return report;
+}
+
+const LEASE = 'evaluate';
+const MAX_ROUNDS = 4;
+
+/**
+ * Run the evaluation queue as its single consumer. Any process may call it (a session's
+ * review, the daily maintenance, the dashboard); only the one holding the lease
+ * evaluates, and it keeps going until the queue is empty, so work queued by the others
+ * meanwhile is not left behind. Returns { status: 'busy' } when another process is on it.
+ */
+export async function drainQueue(db, { force = false, autonomy = 'queue' } = {}) {
+  const total = { status: 'done', rounds: 0, cost: 0, reports: [] };
+  let first = true;
+  for (;;) {
+    const token = acquireLease(db, LEASE);
+    if (!token) return first ? { status: 'busy', reason: 'another process is evaluating the queue; it will pick this up' } : total;
+    try {
+      while (total.rounds < MAX_ROUNDS && ((first && force) || queueHasWork(db))) {
+        const r = await tidyQueue(db, { force: first && force, autonomy });
+        first = false;
+        total.rounds++;
+        total.cost += r.cost || 0;
+        total.reports.push(r);
+      }
+    } catch (err) {
+      if (err instanceof BudgetError) return { ...total, status: 'budget', reason: err.message };
+      throw err;
+    } finally {
+      releaseLease(db, LEASE, token);
+    }
+    first = false;
+    // Work queued by another process just before the lease was released would wait for
+    // the next drain: look once more now that the lease is free.
+    if (total.rounds >= MAX_ROUNDS || !queueHasWork(db)) return total;
+  }
 }

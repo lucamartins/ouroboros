@@ -73,7 +73,6 @@ test('applyEdits keeps only safe edits', () => {
   const r = cs.applyEdits(text, [
     { old: 'not in the file', new: 'x' },
     { old: 'line here.', new: 'y' },
-    { old: 'One line here.', new: 'Totally different.' },
     { old: 'One line here.', new: 'One line here.\nAdded after it.' },
     { old: 'Two line here.', new: 'Two lines here.', corrects: true },
     { old: '---\nname: x', new: '---\nname: y', corrects: true },
@@ -83,13 +82,34 @@ test('applyEdits keeps only safe edits', () => {
   assert.deepEqual(r.rejected.map((x) => x.reason), [
     'the fragment is not in the file',
     'the fragment appears 2 times',
-    'removes existing text, but none of its learnings corrects that text',
     'changes the frontmatter',
     'removes a heading',
     'adds something that looks like a secret',
   ]);
   assert.equal(r.applied.length, 2);
   assert.match(r.after, /One line here\.\nAdded after it\.\nTwo lines here\./);
+});
+
+test('an edit that rewrites text is a correction, however small', () => {
+  const doc = '# Deploy\n\nRun migrations on startup in staging.\n';
+  for (const next of ['Never run migrations on startup in staging.', 'Run migrations on startup in production, not staging.', 'Run migrations on startup in staging']) {
+    const r = cs.applyEdits(doc, [{ old: 'Run migrations on startup in staging.', new: next }]);
+    assert.equal(r.applied.length, 1);
+    assert.equal(r.applied[0].corrects, true, next);
+    assert.equal(r.applied[0].rewrites, true, next);
+  }
+  // A pure insertion stays an addition.
+  const add = cs.applyEdits(doc, [{ old: 'Run migrations on startup in staging.', new: 'Run migrations on startup in staging.\nSeed data after.' }]);
+  assert.equal(add.applied[0].corrects, undefined);
+  // A changeset holding a rewrite waits for the user even in auto mode.
+  assert.equal(curator.needsApproval({ op: 'patch', corrects: true, kind: 'skill', confidence: 0.9 }, 'background', 'auto'), true);
+});
+
+test('a secret is caught in the added text even when the file already looks like it has one', () => {
+  const doc = '# Notes\n\nExample: token: abcdefghijkl\n';
+  const r = cs.applyEdits(doc, [{ old: 'Example: token: abcdefghijkl', new: 'Example: token: abcdefghijkl\nReal key: sk-ABCDEFGHIJKLMNOPQRSTUVWX' }]);
+  assert.equal(r.applied.length, 0);
+  assert.equal(r.rejected[0].reason, 'adds something that looks like a secret');
 });
 
 test('identifiers a learning names are looked up in the tracked files', () => {

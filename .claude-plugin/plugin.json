@@ -1,7 +1,7 @@
 {
   "name": "ouroboros",
   "displayName": "Ouroboros",
-  "version": "0.7.4",
+  "version": "0.8.0",
   "description": "Self-learning for Claude Code: reviews your sessions, turns what is worth keeping into memories and skills, and shows usage, value and cost on a local dashboard.",
   "author": {
     "name": "Luca Martins",
@@ -61,6 +61,13 @@
       "type": "string",
       "title": "Reviewer model",
       "description": "Model used by the end-of-session reviewer.",
+      "options": ["haiku", "sonnet"],
+      "default": "haiku"
+    },
+    "judge_model": {
+      "type": "string",
+      "title": "Evaluation model",
+      "description": "Model that checks each proposed learning against what is already written and composes the edits (screen and editor). haiku is cheap and scored the same as sonnet on the evaluation suite; sonnet costs about 15 times more.",
       "options": ["haiku", "sonnet"],
       "default": "haiku"
     },

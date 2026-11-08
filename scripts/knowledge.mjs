@@ -7,7 +7,9 @@
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { classifyPath, claudeDir, projectKey } from './paths.mjs';
+import { classifyPath, claudeDir, gitRoot, home, memoryDirFor } from './paths.mjs';
+
+export { gitRoot };
 import { parseFrontmatter } from './inventory.mjs';
 import { profileFile } from './profile.mjs';
 
@@ -27,17 +29,6 @@ function isDir(p) {
 
 function isFile(p) {
   try { return fs.statSync(p).isFile(); } catch { return false; }
-}
-
-export function gitRoot(dir) {
-  let d = dir && path.resolve(dir);
-  while (d) {
-    if (fs.existsSync(path.join(d, '.git'))) return d;
-    const up = path.dirname(d);
-    if (up === d) return null;
-    d = up;
-  }
-  return null;
 }
 
 /** The origin remote URL of a repository directory, if any. */
@@ -125,7 +116,16 @@ export function knowledgeFiles(cwd) {
   const add = (file) => { if (isFile(file) && !files.includes(file)) files.push(file); };
   add(path.join(claudeDir(), 'CLAUDE.md'));
   add(profileFile());
-  const memDir = path.join(claudeDir(), 'projects', projectKey(gitRoot(cwd) || cwd || ''), 'memory');
+  // Claude Code loads CLAUDE.md files from the working directory and every directory above it.
+  for (let d = cwd ? path.resolve(cwd) : null; d; ) {
+    add(path.join(d, 'CLAUDE.md'));
+    add(path.join(d, 'CLAUDE.local.md'));
+    // ~/.claude/CLAUDE.md is the user's global file, already added from the config dir.
+    if (path.resolve(d).toLowerCase() !== path.resolve(home).toLowerCase()) add(path.join(d, '.claude', 'CLAUDE.md'));
+    const up = path.dirname(d);
+    d = up === d ? null : up;
+  }
+  const memDir = memoryDirFor({ cwd });
   for (const f of safeList(memDir)) if (f.name.endsWith('.md') && f.name !== 'MEMORY.md') add(path.join(memDir, f.name));
   for (const root of projectRoots(cwd)) {
     add(path.join(root, 'CLAUDE.md'));

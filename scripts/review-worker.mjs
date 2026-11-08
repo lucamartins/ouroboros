@@ -65,8 +65,14 @@ export const MEASURE_SCHEMA = {
   },
 };
 
-export function measurePrompt({ digest, inventory }) {
-  return `Review the session digest below and return:
+function partNote(part) {
+  return part ? `
+This digest is part ${part.index} of ${part.of} of a long session; USER numbers continue across parts. Judge only what this part shows.
+` : '';
+}
+
+export function measurePrompt({ digest, inventory, part = null }) {
+  return `Review the session digest below and return:${partNote(part)}
 
 1. "corrections": every user turn that pushes back on or redirects something the assistant did, said or assumed.
    - explicit: "no, use pnpm", "that's wrong", "I already told you…", "stop doing X".
@@ -128,9 +134,9 @@ export const LEARN_SCHEMA = {
   },
 };
 
-export function learnPrompt({ digest, inventory, lang = options().learningLanguage }) {
+export function learnPrompt({ digest, inventory, part = null, lang = options().learningLanguage }) {
   const LANG_RULE = lang === 'auto' ? 'Write in the same language the user writes in.' : `Write in ${lang === 'pt-BR' ? 'Brazilian Portuguese' : 'English'}, whatever language the session is in.`;
-  return `Review the session digest below. It is the part of the session not reviewed yet. Return:
+  return `Review the session digest below. It is the part of the session not reviewed yet.${partNote(part)} Return:
 
 1. "corrections": every user turn that pushes back on or redirects something the assistant did, said or assumed (explicit or implicit). Not corrections: new tasks, follow-ups, answers to questions, approvals, first-time standing instructions. Quote briefly with the USER # number.
 
@@ -259,50 +265,33 @@ function finish(db, sessionId, state, cursor) {
 }
 
 /**
- * Record learn-mode proposals and run them through the learning evaluation
- * (evaluate.mjs): screen, ground, compose per file, validate, write or queue.
+ * Record learn-mode proposals and hand them to the evaluation queue (evaluate.mjs):
+ * screen, ground, compose per file, validate, write or queue. The queue has a single
+ * consumer; if another process is evaluating, it picks these up before it stops. The
+ * notice for the session is written when they are evaluated.
  */
-async function applyLearnings(db, session, reviewId, out, opts, { notices = true } = {}) {
+async function applyLearnings(db, session, reviewId, items, opts, { notify = true } = {}) {
   const ts = Date.now();
   const insert = db.prepare(`
     INSERT INTO candidates (review_id, session_id, project, kind, scope, memory_type, title, summary, evidence, confidence, repeats, outcome, payload, cwd, ts)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`);
-  const ids = [];
-  for (const raw of out.items) {
+  for (const raw of items) {
     const item = { op: 'create', ...raw, scope: raw.kind === 'profile' ? 'global' : raw.scope || 'project' };
-    const r = insert.run(reviewId, session.id, session.project, item.kind, item.scope, item.memory_type ?? null,
+    insert.run(reviewId, session.id, session.project, item.kind, item.scope, item.memory_type ?? null,
       String(item.title || item.text || '').slice(0, 200), String(item.text || item.body || item.description || '').slice(0, 1500),
       String(item.evidence || '').slice(0, 800), item.confidence ?? null, item.repeats || null,
-      JSON.stringify({ item, cwd: session.cwd, trigger: 'session_end', actor: 'background' }), session.cwd, ts);
-    ids.push(Number(r.lastInsertRowid));
+      JSON.stringify({ item, cwd: session.cwd, trigger: 'session_end', actor: 'background', autonomy: opts.autonomy, notify }), session.cwd, ts);
   }
-  if (!ids.length) return [];
-  const rows = db.prepare(`
-    SELECT c.*, s.started_at session_started_at FROM candidates c LEFT JOIN sessions s ON s.id = c.session_id
-    WHERE c.id IN (${ids.map(() => '?').join(',')}) ORDER BY c.id`).all(...ids);
-  const { evaluate } = await import('./evaluate.mjs');
-  let report = { results: [], created: 0, patched: 0 };
+  if (!items.length) return null;
+  const { drainQueue } = await import('./evaluate.mjs');
   try {
-    report = await evaluate(db, rows, {
-      cwd: session.cwd, sessionId: session.id, sessionStartedAt: session.started_at, actor: 'background',
-      autonomy: opts.autonomy, lang: opts.learningLanguage, model: opts.reviewerModel, payload: { trigger: 'session_end' },
-    });
+    return await drainQueue(db);
   } catch (err) {
-    // Without the knowledge check nothing is written on its own: the proposals wait
-    // in the queue, and the next queue check evaluates them.
+    // Without the evaluation nothing is written: the proposals wait, and the next
+    // drain (another session's review or the daily maintenance) evaluates them.
     logError(db, 'review-worker:evaluate', err);
+    return null;
   }
-  db.prepare(`UPDATE candidates SET outcome = 'queued', triaged_at = NULL WHERE outcome = 'pending' AND id IN (${ids.map(() => '?').join(',')})`).run(...ids);
-  const results = report.results || [];
-  const lines = [
-    ...results.filter((r) => r.status === 'created').map((r) => `📝 learned: ${r.title}`),
-    ...results.filter((r) => r.status === 'patched').map((r) => `📝 updated: ${r.title}`),
-    ...results.filter((r) => r.status === 'queued').map((r) => `⏳ waiting for approval: ${r.title}`),
-    ...results.filter((r) => r.status === 'conflict').map((r) => `⚖ conflicts with a written rule, decide in the dashboard: ${r.title}`),
-  ];
-  if (notices && lines.length) db.prepare('INSERT INTO notices (ts, session_id, text) VALUES (?, ?, ?)').run(Date.now(), session.id, lines.join('\n'));
-  db.prepare('UPDATE reviews SET learned = ?, patched = ? WHERE id = ?').run(report.created || 0, report.patched || 0, reviewId);
-  return results;
 }
 
 /** Review one queued session. Returns a short status string. */
@@ -335,6 +324,7 @@ export async function reviewSession(db, sessionId, trigger, overrides = {}) {
 
   const entries = readTranscript(session.transcript_path);
   const digest = buildDigest(entries, { fromLine: learnBackfill ? 0 : session.review_cursor || 0 });
+  const parts = digest.chunks;
   if (digest.humanTurns < MIN_HUMAN_TURNS) {
     insertReview(db, { ...base, status: 'skipped', detail: `only ${digest.humanTurns} user turn(s)`, turns: digest.humanTurns });
     finish(db, sessionId, 'skipped', digest.nextLine);
@@ -344,20 +334,49 @@ export async function reviewSession(db, sessionId, trigger, overrides = {}) {
   const started = Date.now();
   let reviewId = null;
   try {
-    const promptArgs = { digest: digest.text, inventory: inventoryForPrompt(session.cwd) };
-    const result = await runModel({
-      prompt: mode === 'background' ? learnPrompt(promptArgs) : measurePrompt(promptArgs),
-      schema: mode === 'background' ? LEARN_SCHEMA : MEASURE_SCHEMA,
-      model: opts.reviewerModel,
-    });
-    const out = result.structured_output;
+    // A long tail is reviewed in parts (USER numbers continue across them); the results
+    // are merged into one review.
+    const inventory = inventoryForPrompt(session.cwd);
+    const out = { corrections: [], items: [], candidates: [] };
+    const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+    let reviewed = 0;
+    for (let i = 0; i < parts.length; i++) {
+      if (i > 0 && monthSpend(db) + usage.cost >= opts.monthlyBudgetUsd) break;
+      const part = parts.length > 1 ? { index: i + 1, of: parts.length } : null;
+      const promptArgs = { digest: parts[i], inventory, part };
+      let result;
+      try {
+        result = await runModel({
+          prompt: mode === 'background' ? learnPrompt(promptArgs) : measurePrompt(promptArgs),
+          schema: mode === 'background' ? LEARN_SCHEMA : MEASURE_SCHEMA,
+          model: opts.reviewerModel,
+        });
+      } catch (err) {
+        if (i === 0) throw err;
+        logError(db, 'review-worker:part', err);
+        break;
+      }
+      const u = usageOf(result);
+      for (const k of Object.keys(usage)) usage[k] += u[k];
+      const o = result.structured_output;
+      out.corrections.push(...(o.corrections || []));
+      out.items.push(...(o.items || []));
+      out.candidates.push(...(o.candidates || []));
+      reviewed++;
+    }
+    const partial = reviewed < parts.length || digest.omitted;
     reviewId = insertReview(db, {
       ...base,
       status: 'ok',
       turns: learnBackfill ? 0 : digest.humanTurns,
       corrections: learnBackfill ? 0 : out.corrections.length,
-      detail: learnBackfill ? `learned from a past session (${digest.humanTurns} turns, ${out.corrections.length} corrections already counted)` : null,
-      usage: usageOf(result),
+      detail: [
+        learnBackfill ? `learned from a past session (${digest.humanTurns} turns, ${out.corrections.length} corrections already counted)` : null,
+        parts.length > 1 ? `reviewed in ${reviewed} of ${parts.length} parts` : null,
+        digest.omitted ? `${digest.omitted} part(s) of a very long session skipped` : null,
+        partial && reviewed < parts.length ? 'stopped early (budget or a failed part)' : null,
+      ].filter(Boolean).join('; ') || null,
+      usage,
       durationMs: Date.now() - started,
     });
     const ts = Date.now();
@@ -366,7 +385,7 @@ export async function reviewSession(db, sessionId, trigger, overrides = {}) {
         .run(reviewId, sessionId, String(c.quote).slice(0, 500), c.kind, ts);
     }
     if (mode === 'background') {
-      await applyLearnings(db, session, reviewId, out, opts, { notices: !learnBackfill });
+      await applyLearnings(db, session, reviewId, out.items, opts, { notify: !learnBackfill });
       finish(db, sessionId, 'done', digest.nextLine);
       return 'ok';
     }
@@ -489,9 +508,10 @@ async function main() {
       });
     } else if (args.session) {
       await reviewSession(db, args.session, args.trigger || 'session_end');
-    } else if (args['triage-queue']) {
-      const { tidyQueue } = await import('./evaluate.mjs');
-      console.log(JSON.stringify(await tidyQueue(db, { force: !!args.force }), null, 2));
+    } else if (args['triage-queue'] || args.drain) {
+      const { drainQueue } = await import('./evaluate.mjs');
+      const r = await drainQueue(db, { force: !!args.force });
+      if (args['triage-queue']) console.log(JSON.stringify(r, null, 2));
     } else if (args.maintain) {
       const { maintain } = await import('./maintenance.mjs');
       const report = await maintain(db, { force: !!args.force });

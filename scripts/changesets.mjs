@@ -9,14 +9,13 @@ import path from 'node:path';
 import { appendToSection, containsSecret, needsApproval, writeText } from './curator.mjs';
 import { knowledgeKind } from './knowledge.mjs';
 import { projectKey } from './paths.mjs';
+import { addedText, isInsertion } from './textdiff.mjs';
 
 /** A changeset may grow a file by at most this many characters. */
 export const MAX_GROWTH_CHARS = 6000;
 /** A correcting edit may remove at most this much text; other edits only add. */
 export const MAX_REMOVED_CHARS = 800;
-/** Words an adding edit may change (punctuation moved around an insertion). */
-const ADD_SLACK_WORDS = 1;
-const MIN_OLD_CHARS = 8;
+const MIN_OLD_CHARS = 4;
 
 export function hashText(text) {
   return crypto.createHash('sha1').update(String(text ?? '')).digest('hex').slice(0, 16);
@@ -46,9 +45,14 @@ export function removedWords(old, next) {
 /**
  * Apply edits in order to `text`, keeping only the safe ones. An edit is either
  * { old, new } (an exact fragment found once, replaced) or { append, section }.
- * Rules: the fragment exists exactly once; only an edit marked `corrects` may remove
- * text (and not much); the frontmatter, headings and secrets are protected; the file
- * grows by a bounded amount. Returns { after, applied, rejected: [{ edit, reason }] }.
+ * Rules: the fragment exists exactly once; an edit that is not a pure insertion (the
+ * old fragment must survive intact inside the new text) rewrites existing text, so it
+ * is a correction: it is marked `corrects` (which always waits for the user) and may
+ * remove only a bounded amount; the frontmatter and headings are protected; the text
+ * an edit adds may hold no secret; the file grows by a bounded amount.
+ * Returns { after, applied, rejected: [{ edit, reason }] }; applied edits carry
+ * `corrects: true` when they rewrite text (and `rewrites: true` when the caller had not
+ * marked them as a correction).
  */
 export function applyEdits(text, edits) {
   const original = String(text);
@@ -58,9 +62,12 @@ export function applyEdits(text, edits) {
   for (const e of edits || []) {
     const reject = (reason) => rejected.push({ edit: e, reason });
     let next;
+    let edit = e;
+    let added;
     if (e.append !== undefined) {
       if (!String(e.append || '').trim()) { reject('empty addition'); continue; }
       next = appendToSection(cur, e.section, e.append);
+      added = String(e.append);
     } else {
       const old = String(e.old ?? '');
       const repl = String(e.new ?? '');
@@ -68,20 +75,23 @@ export function applyEdits(text, edits) {
       const count = cur.split(old).length - 1;
       if (count !== 1) { reject(count ? `the fragment appears ${count} times` : 'the fragment is not in the file'); continue; }
       if (old === repl) { reject('changes nothing'); continue; }
-      const removed = removedWords(old, repl);
-      if (e.corrects) {
-        if (removed.join(' ').length > MAX_REMOVED_CHARS) { reject(`removes too much text (${removed.join(' ').length} chars)`); continue; }
-      } else if (removed.length > ADD_SLACK_WORDS) {
-        reject('removes existing text, but none of its learnings corrects that text');
-        continue;
+      if (isInsertion(old, repl)) {
+        added = repl.replace(old.trimEnd(), '');
+      } else {
+        // Rewriting text (even one word: "Run X" -> "Never run X") changes what the file
+        // says: only a correction may do it, and a correction waits for the user.
+        const removed = removedWords(old, repl).join(' ').length;
+        if (removed > MAX_REMOVED_CHARS) { reject(`removes too much text (${removed} chars)`); continue; }
+        if (!e.corrects) edit = { ...e, corrects: true, rewrites: true };
+        added = addedText(old, repl) || repl;
       }
       next = cur.replace(old, () => repl);
     }
     if (frontmatter(next) !== frontmatter(cur)) { reject('changes the frontmatter'); continue; }
     if (headingCount(next) < headingCount(cur)) { reject('removes a heading'); continue; }
-    if (containsSecret(next) && !containsSecret(cur)) { reject('adds something that looks like a secret'); continue; }
+    if (containsSecret(added)) { reject('adds something that looks like a secret'); continue; }
     cur = next;
-    applied.push(e);
+    applied.push(edit);
   }
   if (cur.length - original.length > MAX_GROWTH_CHARS) {
     return { after: original, applied: [], rejected: [...rejected, ...applied.map((edit) => ({ edit, reason: `the changes grow the file by ${cur.length - original.length} chars` }))] };
@@ -154,15 +164,19 @@ export function applyChangeset(db, id, { actor = 'manual' } = {}) {
   }
   const claims = claimsOf(db, id);
   const r = writeText(db, {
-    file: cs.file, after, actor,
+    file: cs.file, after, actor, expectBefore: current,
     title: claims.length === 1 ? claims[0].title : `${path.basename(cs.file)}: ${claims.length} updates`,
     confidence: claims.length ? Math.max(...claims.map((c) => c.confidence ?? 0.6)) : 0.6,
   });
+  if (r.status === 'stale') {
+    db.prepare("UPDATE changesets SET status = 'stale', note = ? WHERE id = ?").run(r.reason, id);
+    return { status: 'stale', reason: 'the file changed while this was being applied; the next check composes it again' };
+  }
   if (r.status !== 'patched') return r;
   const now = Date.now();
   const rebased = hashText(current) !== cs.base_hash;
-  db.prepare("UPDATE changesets SET status = 'applied', decided_at = ?, learning_id = ?, note = COALESCE(?, note) WHERE id = ?")
-    .run(now, r.id, rebased ? 'applied on top of a newer version of the file' : null, id);
+  db.prepare("UPDATE changesets SET status = 'applied', decided_at = ?, learning_id = ?, batch = ?, note = COALESCE(?, note) WHERE id = ?")
+    .run(now, r.id, r.batch, rebased ? 'applied on top of a newer version of the file' : null, id);
   db.prepare("UPDATE candidates SET outcome = 'patched', learning_id = ?, decided_at = ? WHERE changeset_id = ? AND outcome = 'queued'").run(r.id, now, id);
   return { ...r, status: 'patched', title: r.title || path.basename(cs.file), claims: claims.length, rebased };
 }
@@ -197,22 +211,22 @@ export function queueEdit(db, item, payload, actor) {
   const cid = Number(r.lastInsertRowid);
   edit.claims = [cid];
   const pending = pendingChangeset(db, file);
-  let edits = [edit];
-  let claimIds = [cid];
-  let replaces = null;
-  let note = null;
-  if (pending) {
-    const combined = [...JSON.parse(pending.edits), edit];
-    if (!applyEdits(base, combined).rejected.length) {
-      edits = combined;
-      claimIds = [...claimsOf(db, pending.id).map((c) => c.id), cid];
-      replaces = pending.id;
-    } else {
-      note = `does not fit together with pending change #${pending.id} to the same file`;
-    }
+  if (!pending) {
+    const changesetId = saveChangeset(db, { file, cwd: payload.cwd, base, edits: applyEdits(base, [edit]).applied, claimIds: [cid] });
+    return { id: cid, changesetId, replaced: false };
   }
-  const changesetId = saveChangeset(db, { file, cwd: payload.cwd, base, edits, claimIds, replaces, note });
-  return { id: cid, changesetId, replaced: !!replaces };
+  const combined = applyEdits(base, [...JSON.parse(pending.edits), edit]);
+  if (!combined.rejected.length) {
+    const claimIds = [...claimsOf(db, pending.id).map((c) => c.id), cid];
+    const changesetId = saveChangeset(db, { file, cwd: payload.cwd, base, edits: combined.applied, claimIds, replaces: pending.id });
+    return { id: cid, changesetId, replaced: true };
+  }
+  // The new edit does not fit with what is already waiting for this file. One file never
+  // has two pending changes: the waiting one goes stale with the new learning attached,
+  // and the editor composes them together (`--drain`, started by the caller).
+  db.prepare('UPDATE candidates SET changeset_id = ?, claim = ? WHERE id = ?').run(pending.id, String(item.append ?? item.new ?? '').slice(0, 2000), cid);
+  db.prepare("UPDATE changesets SET status = 'stale', note = ? WHERE id = ?").run('a new change to this file did not fit with it; composing them together', pending.id);
+  return { id: cid, changesetId: pending.id, replaced: false, recompose: true };
 }
 
 /** A changeset as the dashboard shows it. */

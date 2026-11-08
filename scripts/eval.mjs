@@ -32,7 +32,7 @@ function pad(s, n) {
   return t.length >= n ? t.slice(0, n) : t + ' '.repeat(n - t.length);
 }
 
-async function synthetic({ model }) {
+async function synthetic({ model, judge }) {
   const spec = JSON.parse(fs.readFileSync(path.join(here, '..', 'test', 'eval', 'synthetic.json'), 'utf8'));
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ouroboros-eval-'));
   // The model call keeps the real Claude config (its login); knowledge lives in tmp.
@@ -41,10 +41,16 @@ async function synthetic({ model }) {
   process.env.OUROBOROS_HOME = path.join(tmp, 'ouroboros');
   process.env.CLAUDE_PLUGIN_DATA = path.join(tmp, 'data');
   if (model) process.env.CLAUDE_PLUGIN_OPTION_REVIEWER_MODEL = model;
+  if (judge) process.env.CLAUDE_PLUGIN_OPTION_JUDGE_MODEL = judge;
   const proj = path.join(tmp, 'work', 'shop');
   for (const [rel, text] of Object.entries(spec.project)) {
     fs.mkdirSync(path.dirname(path.join(proj, rel)), { recursive: true });
     fs.writeFileSync(path.join(proj, rel), text);
+  }
+  for (const [rel, text] of Object.entries(spec.parent || {})) {
+    // Files above the project (Claude Code loads CLAUDE.md files from every parent directory).
+    fs.mkdirSync(path.dirname(path.join(proj, '..', rel)), { recursive: true });
+    fs.writeFileSync(path.join(proj, '..', rel), text);
   }
   for (const [rel, text] of Object.entries(spec.skills)) {
     const file = path.join(tmp, 'claude', 'skills', rel);
@@ -150,6 +156,6 @@ async function replay({ data, limit }) {
 }
 
 const a = args(process.argv.slice(2));
-if (a.synthetic) await synthetic({ model: typeof a.model === 'string' ? a.model : null });
+if (a.synthetic) await synthetic({ model: typeof a.model === 'string' ? a.model : null, judge: typeof a.judge === 'string' ? a.judge : null });
 else if (a.replay) await replay({ data: typeof a.data === 'string' ? a.data : undefined, limit: a.limit });
-else console.log('usage: node eval.mjs --synthetic [--model <m>] | --replay [--data <dir>] [--limit <n>]');
+else console.log('usage: node eval.mjs --synthetic [--model <m>] [--judge <m>] | --replay [--data <dir>] [--limit <n>]');

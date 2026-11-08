@@ -2,7 +2,7 @@
 // Used by the reviewer (to spot repeats) and by the dashboard.
 import fs from 'node:fs';
 import path from 'node:path';
-import { claudeDir, ouroborosDir, projectKey } from './paths.mjs';
+import { claudeDir, memoryDirFor, ouroborosDir, projectKey } from './paths.mjs';
 import { profileForContext, readProfileText } from './profile.mjs';
 
 export function parseFrontmatter(text) {
@@ -36,34 +36,36 @@ function safeList(dir) {
   try { return fs.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
 }
 
+/** Memory files in one memory directory (`project` labels them). */
+export function listMemoriesIn(dir, project = path.basename(path.dirname(dir))) {
+  const out = [];
+  for (const f of safeList(dir)) {
+    if (!f.isFile() || !f.name.endsWith('.md')) continue;
+    const file = path.join(dir, f.name);
+    const text = safeRead(file) ?? '';
+    const st = safeStat(file);
+    const { data } = parseFrontmatter(text);
+    out.push({
+      project,
+      file,
+      index: f.name === 'MEMORY.md',
+      name: data.name || f.name.replace(/\.md$/, ''),
+      description: data.description || '',
+      type: data.metadata?.type || data.type || (f.name === 'MEMORY.md' ? 'index' : ''),
+      origin: data.metadata?.origin || null,
+      chars: text.length,
+      lines: text.split('\n').length,
+      mtime: st?.mtimeMs ?? null,
+    });
+  }
+  return out;
+}
+
 /** Memory files of one project key (or all projects when key is omitted). */
 export function listMemories(key) {
   const root = path.join(claudeDir(), 'projects');
   const keys = key ? [key] : safeList(root).filter((d) => d.isDirectory()).map((d) => d.name);
-  const out = [];
-  for (const k of keys) {
-    const dir = path.join(root, k, 'memory');
-    for (const f of safeList(dir)) {
-      if (!f.isFile() || !f.name.endsWith('.md')) continue;
-      const file = path.join(dir, f.name);
-      const text = safeRead(file) ?? '';
-      const st = safeStat(file);
-      const { data } = parseFrontmatter(text);
-      out.push({
-        project: k,
-        file,
-        index: f.name === 'MEMORY.md',
-        name: data.name || f.name.replace(/\.md$/, ''),
-        description: data.description || '',
-        type: data.metadata?.type || data.type || (f.name === 'MEMORY.md' ? 'index' : ''),
-        origin: data.metadata?.origin || null,
-        chars: text.length,
-        lines: text.split('\n').length,
-        mtime: st?.mtimeMs ?? null,
-      });
-    }
-  }
-  return out;
+  return keys.flatMap((k) => listMemoriesIn(path.join(root, k, 'memory'), k));
 }
 
 /** Skill directories to scan: personal skills plus .claude/skills of known project dirs. */
@@ -139,7 +141,7 @@ export function inventoryForPrompt(cwd) {
     const ctx = profileForContext(profile);
     if (ctx) lines.push('Global profile (user.md):', ctx);
   }
-  const mems = listMemories(projectKey(cwd)).filter((m) => !m.index);
+  const mems = listMemoriesIn(memoryDirFor({ cwd })).filter((m) => !m.index);
   if (mems.length) {
     lines.push('Project memories:');
     for (const m of mems.slice(0, 80)) lines.push(`- ${m.name}: ${m.description.slice(0, 160)}`);

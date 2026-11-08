@@ -211,6 +211,63 @@
           "queued"
         ]
       }
+    },
+    {
+      "id": "covered-elsewhere",
+      "note": "Real error #68: a fact another file already states was copied into the owner the screen picked.",
+      "proposal": {
+        "kind": "skill",
+        "scope": "project",
+        "title": "Store money in cents",
+        "description": "Use when handling prices in the shop.",
+        "body": "Prices are stored in cents (integers), never as decimals.",
+        "evidence": "USER: lembra que preço é em centavos"
+      },
+      "expect": {
+        "outcome": [
+          "dropped",
+          "duplicate",
+          "merged"
+        ]
+      }
+    },
+    {
+      "id": "covered-by-parent",
+      "note": "Knowledge in a CLAUDE.md above the project, which Claude Code also loads.",
+      "proposal": {
+        "kind": "memory",
+        "memory_type": "feedback",
+        "title": "Write docs in English",
+        "description": "Code comments and docs are written in English even when the user writes in Portuguese.",
+        "evidence": "USER: escreve os comentários em inglês"
+      },
+      "expect": {
+        "outcome": [
+          "dropped",
+          "duplicate",
+          "merged"
+        ]
+      }
+    },
+    {
+      "id": "preference-not-stale",
+      "note": "Real error #115: a preference stated once was turned into a correction of documentation.",
+      "proposal": {
+        "kind": "memory",
+        "memory_type": "feedback",
+        "title": "Deploy by hand",
+        "description": "This time the user ran scripts/deploy.sh from their own machine instead of starting the workflow.",
+        "evidence": "USER: deixa que eu rodo o deploy na minha máquina hoje"
+      },
+      "expect": {
+        "outcome": [
+          "dropped",
+          "conflict"
+        ]
+      }
     }
-  ]
+  ],
+  "parent": {
+    "CLAUDE.md": "# Workspace\n\nEvery file written to disk (code, comments, docs, commit messages) is in English, even when the conversation is not.\n"
+  }
 }

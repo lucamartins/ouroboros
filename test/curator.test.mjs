@@ -111,8 +111,18 @@ test('patch, undo, conflict, forget and undo of forget', () => {
   // Undo the skill link created earlier? No: the last remaining write is the routed skill.
   const [p2] = apply([{ op: 'patch', kind: 'memory', target: 'use-pnpm-not-npm', old: 'Use pnpm.', new: 'Use pnpm!' }]);
   assert.equal(p2.status, 'patched');
+  // A later, unrelated edit survives the undo: only the patched line goes back.
   fs.appendFileSync(file, 'hand edit\n');
+  const u2 = curator.undo(db, { last: true });
+  assert.equal(u2.status, 'undone', u2.reason);
+  assert.match(read(file), /Use pnpm\.\n/);
+  assert.match(read(file), /hand edit\n/);
+  // When the patched line itself was edited since, undo refuses.
+  const [p3] = apply([{ op: 'patch', kind: 'memory', target: 'use-pnpm-not-npm', old: 'Use pnpm.', new: 'Use pnpm!' }]);
+  assert.equal(p3.status, 'patched');
+  fs.writeFileSync(file, read(file).replace('Use pnpm!', 'Use pnpm?'));
   assert.equal(curator.undo(db, { last: true }).status, 'conflict');
+  fs.writeFileSync(file, read(file).replace('Use pnpm?', 'Use pnpm.'));
 
   const f = curator.forget(db, { match: 'use-pnpm-not-npm' });
   assert.equal(f.status, 'archived', f.reason);

@@ -10,7 +10,8 @@
 // Screening never writes text into existing files; it only sees excerpts of them.
 import { options } from './config.mjs';
 import { buildIndex, ownersMap } from './knowledge.mjs';
-import { runModel } from './review-worker.mjs';
+import { assertBudget } from './db.mjs';
+import { runModel, usageOf } from './review-worker.mjs';
 import { languageRule, rubricText } from './rubric.mjs';
 
 const BATCH = 12;
@@ -161,7 +162,7 @@ export function rejectionDocs(db, { exclude = [] } = {}) {
   if (!db) return [];
   const since = Date.now() - REJECTIONS_DAYS * 86_400_000;
   const skip = new Set(exclude);
-  const rejected = db.prepare("SELECT id, title, summary, claim FROM candidates WHERE outcome = 'rejected_by_user' AND COALESCE(decided_at, ts) >= ?").all(since)
+  const rejected = db.prepare("SELECT id, title, summary, claim FROM candidates WHERE outcome IN ('rejected_by_user', 'undone') AND COALESCE(decided_at, ts) >= ?").all(since)
     .filter((r) => !skip.has(r.id))
     .map((r) => ({ file: '(rejected proposal)', kind: 'rejected', heading: r.title, text: `${r.title}\n${r.claim || r.summary || ''}` }));
   const undone = db.prepare("SELECT title, path FROM learnings WHERE status = 'reverted' AND updated_at >= ?").all(since)
@@ -173,7 +174,13 @@ export function rejectionDocs(db, { exclude = [] } = {}) {
  * Screen proposals ({id, kind, title, description, text, body, claim, ...}) for one
  * project dir. Returns { verdicts: Map(id -> verdict), cost, calls }.
  */
-export async function triage(proposals, { cwd, db = null, lang = options().learningLanguage, model = options().reviewerModel, exclude = [] } = {}) {
+export async function triage(proposals, { cwd, db = null, lang = options().learningLanguage, model = options().judgeModel, exclude = [], record = () => {} } = {}) {
+  const call = async (args) => {
+    if (db) assertBudget(db, options().monthlyBudgetUsd);
+    const result = await runModel(args);
+    record(usageOf(result));
+    return result;
+  };
   const index = buildIndex(cwd, { extra: rejectionDocs(db, { exclude }) });
   const owners = ownersMap(cwd);
   const verdicts = new Map();
@@ -197,7 +204,7 @@ export async function triage(proposals, { cwd, db = null, lang = options().learn
       for (const hit of index.search(query, 1, { kinds: ['rejected'] })) if (hit.score > 4) take(hit);
     }
     const others = proposals.filter((p) => !batch.includes(p));
-    const result = await runModel({ prompt: triagePrompt({ batch, others, excerpts, owners, lang }), schema: TRIAGE_SCHEMA, model });
+    const result = await call({ prompt: triagePrompt({ batch, others, excerpts, owners, lang }), schema: TRIAGE_SCHEMA, model });
     cost += Number(result.total_cost_usd) || 0;
     calls++;
     for (const v of result.structured_output.verdicts || []) {
@@ -213,7 +220,7 @@ export async function triage(proposals, { cwd, db = null, lang = options().learn
       const v = verdicts.get(p.id);
       return v.verdict === 'route' ? { id: p.id, kind: p.kind, title: p.title, owner: v.owner, claim: v.claim } : { id: p.id, ...rewriteItem(p, v) };
     });
-    const result = await runModel({ prompt: dedupePrompt({ items, lang }), schema: DEDUPE_SCHEMA, model });
+    const result = await call({ prompt: dedupePrompt({ items, lang }), schema: DEDUPE_SCHEMA, model });
     cost += Number(result.total_cost_usd) || 0;
     calls++;
     const ids = new Set(items.map((k) => k.id));
@@ -229,7 +236,38 @@ export async function triage(proposals, { cwd, db = null, lang = options().learn
       for (const id of merge) verdicts.set(id, { id, verdict: 'merge', merge_into: g.keep, reason: g.reason, stale: verdicts.get(id)?.stale });
     }
   }
+  resolveMerges(verdicts, proposals);
   return { verdicts, cost, calls };
+}
+
+/**
+ * A merge must land in a proposal that survives. Follow merge chains: when the target
+ * is dropped or becomes a fix, the merged one shares that verdict (with its reason, so
+ * it stays visible and restorable); when the target is unknown or the chain loops, the
+ * merged one is kept and judged on its own.
+ */
+export function resolveMerges(verdicts, proposals) {
+  const ids = new Set(proposals.map((p) => p.id));
+  for (const [id, v] of verdicts) {
+    if (v.verdict !== 'merge') continue;
+    const seen = new Set([id]);
+    let target = v.merge_into;
+    let t = verdicts.get(target);
+    while (t?.verdict === 'merge' && !seen.has(target)) {
+      seen.add(target);
+      target = t.merge_into;
+      t = verdicts.get(target);
+    }
+    if (!ids.has(target) || !t || seen.has(target)) {
+      verdicts.set(id, { ...v, verdict: 'keep', merge_into: undefined, reason: `kept: it was to merge into #${v.merge_into}, which is not being saved (${v.reason})` });
+    } else if (t.verdict === 'drop') {
+      verdicts.set(id, { ...v, verdict: 'drop', drop_kind: t.drop_kind, rule: t.rule, covered_by: t.covered_by, reason: `same as #${target}, dropped: ${t.reason}` });
+    } else if (t.verdict === 'fix') {
+      verdicts.set(id, { ...v, verdict: 'fix', fix: t.fix, rule: t.rule, reason: `same as #${target}: ${t.reason}` });
+    } else if (target !== v.merge_into) {
+      verdicts.set(id, { ...v, merge_into: target });
+    }
+  }
 }
 
 /** Apply a "keep" verdict's rewrite on top of the original proposal. */

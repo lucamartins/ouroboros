@@ -13,6 +13,7 @@ const DEFAULTS = {
   long_turn_tool_calls: 15,
   background_review: true,
   reviewer_model: 'haiku',
+  judge_model: 'haiku',
   monthly_budget_usd: 5,
 };
 
@@ -50,6 +51,8 @@ function fromEnv() {
     // `measure_review` was the phase 1 name of this option.
     backgroundReview: asBool(raw('background_review') ?? raw('measure_review'), DEFAULTS.background_review),
     reviewerModel: raw('reviewer_model') || DEFAULTS.reviewer_model,
+    // Screen and editor of the learning evaluation; follows the reviewer unless set.
+    judgeModel: raw('judge_model') || raw('reviewer_model') || DEFAULTS.judge_model,
     monthlyBudgetUsd: asNumber(raw('monthly_budget_usd'), DEFAULTS.monthly_budget_usd),
   };
 }

@@ -12,13 +12,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { options } from './config.mjs';
-import { applyChangeset, claimsOf, queueEdit, rejectChangeset } from './changesets.mjs';
+import { applyChangeset, applyEdits, claimsOf, queueEdit, rejectChangeset } from './changesets.mjs';
 import { getMeta, logError, openDb, setMetaOnce } from './db.mjs';
-import { listMemories, listSkills, parseFrontmatter } from './inventory.mjs';
+import { listMemories, listMemoriesIn, listSkills, parseFrontmatter } from './inventory.mjs';
 import { knowledgeKind, PATCHABLE } from './knowledge.mjs';
-import { claudeDir, classifyPath, normalize, ouroborosDir, projectKey } from './paths.mjs';
-import { BLOCKS, blockChars, parseProfile, profileFile, renderProfile } from './profile.mjs';
+import { claudeDir, classifyPath, gitRoot, memoryDirFor, normalize, ouroborosDir, projectKey } from './paths.mjs';
+import { BLOCKS, blockChars, parseProfile, profileFile, profileReplaceBullet, profileWithBlock, profileWithBullet, profileWithoutBullet } from './profile.mjs';
 import { ensureSettingsFile, expandHome, loadSettings, routeFor } from './settings.mjs';
+import { addedText, isInsertion, revertChange } from './textdiff.mjs';
 
 // ---------- small helpers ----------
 
@@ -81,34 +82,7 @@ function today() {
   return new Date().toISOString().slice(0, 10);
 }
 
-export function gitRoot(dir) {
-  let d = dir && path.resolve(dir);
-  while (d) {
-    if (fs.existsSync(path.join(d, '.git'))) return d;
-    const up = path.dirname(d);
-    if (up === d) return null;
-    d = up;
-  }
-  return null;
-}
-
-function autoMemoryDirectory() {
-  try {
-    const s = JSON.parse(fs.readFileSync(path.join(claudeDir(), 'settings.json'), 'utf8'));
-    return s.autoMemoryDirectory ? expandHome(s.autoMemoryDirectory) : null;
-  } catch {
-    return null;
-  }
-}
-
-/** The auto-memory directory of the session's project (as Claude Code derives it). */
-export function memoryDirFor({ memoryDir, cwd }) {
-  if (memoryDir) return path.resolve(expandHome(memoryDir));
-  const configured = autoMemoryDirectory();
-  if (configured) return configured;
-  const root = gitRoot(cwd) || cwd || process.cwd();
-  return path.join(claudeDir(), 'projects', projectKey(root), 'memory');
-}
+export { gitRoot, memoryDirFor };
 
 // ---------- ledger: transactional file writes ----------
 
@@ -334,7 +308,8 @@ function createProfile(db, batch, item, settings) {
   const text = String(item.text || item.body || item.title || '').replace(/\s+/g, ' ').trim();
   if (!text) return { status: 'rejected', reason: 'empty profile fact' };
   const file = profileFile();
-  const blocks = parseProfile(readOrNull(file) ?? '');
+  const current = readOrNull(file) ?? '';
+  const blocks = parseProfile(current);
   const dup = findSimilar([...blocks.user, ...blocks.environment].map((b) => ({ ...b, text: b.text })), text);
   if (dup) return { status: 'duplicate', target: dup.id || dup.text, existing: dup.text, reason: 'a similar fact is already in the profile; patch it instead' };
   const limit = item.block === 'user' ? settings.limits.userBlockChars : settings.limits.environmentBlockChars;
@@ -347,8 +322,7 @@ function createProfile(db, batch, item, settings) {
     };
   }
   const id = newId();
-  blocks[item.block].push({ id, text });
-  batch.write(file, renderProfile(blocks), { learningId: id, op: 'create' });
+  batch.write(file, profileWithBullet(current, item.block, { id, text }), { learningId: id, op: 'create' });
   upsertLearning(db, { id, kind: 'profile', scope: 'global', block: item.block, name: slug(text, 40), title: text.slice(0, 120), path: file, confidence: item.confidence, trigger: item.trigger });
   return { status: 'created', id, kind: 'profile', path: file, title: text, warning: budgetWarning(used, limit, settings, `profile block "${BLOCKS[item.block]}"`) };
 }
@@ -364,8 +338,8 @@ function createMemory(db, batch, item, settings, payload) {
   const file = path.join(dir, fileName);
   const indexFile = path.join(dir, 'MEMORY.md');
 
-  const all = listMemories().filter((m) => !m.index);
-  const existing = all.filter((m) => normalize(path.dirname(m.file)) === normalize(dir));
+  const existing = listMemoriesIn(dir).filter((m) => !m.index);
+  const all = [...existing, ...listMemories().filter((m) => !m.index && normalize(path.dirname(m.file)) !== normalize(dir))];
   if (fs.existsSync(file)) return { status: 'duplicate', target: file, reason: `a memory named "${name}" already exists; patch it instead` };
   const probe = `${name} ${title} ${description}`;
   const dup = findSimilar(existing.map((m) => ({ text: `${m.name} ${m.description}`, file: m.file, name: m.name })), probe);
@@ -513,20 +487,18 @@ function patchItem(db, batch, item, settings, payload) {
     const used = blockChars(blocks[blockKey]) - bullet.text.length + nextText.length;
     if (used > limit) return { status: 'over_budget', reason: `profile block would use ${used}/${limit} chars` };
     const id = bullet.id || newId();
-    bullet.text = nextText;
-    bullet.id = id;
-    batch.write(t.file, renderProfile(blocks), { learningId: id, op: 'patch' });
+    batch.write(t.file, profileReplaceBullet(before, bullet, { id, text: nextText }), { learningId: id, op: 'patch' });
     upsertLearning(db, { id, kind: 'profile', scope: 'global', block: blockKey, name: slug(nextText, 40), title: nextText.slice(0, 120), path: t.file, confidence: item.confidence, trigger: item.trigger });
     return { status: 'patched', id, kind: 'profile', path: t.file, title: nextText };
   }
 
   let after = before;
-  if (item.append !== undefined) {
-    after = appendToSection(before, item.section, item.append);
-  } else if (item.old !== undefined) {
-    const count = before.split(item.old).length - 1;
-    if (count !== 1) return { status: 'rejected', reason: `"old" must appear exactly once in ${t.file} (found ${count})` };
-    after = before.replace(item.old, () => item.new ?? '');
+  const edit = editOf(item);
+  if (edit) {
+    // The same rules as changes composed by the editor (changesets.applyEdits).
+    const r = applyEdits(before, [edit]);
+    if (r.rejected.length) return { status: 'rejected', reason: `${r.rejected[0].reason} (${t.file})` };
+    after = r.after;
   }
   if (item.description) {
     if (t.kind === 'skill' && item.description.length > settings.limits.skillDescriptionChars) {
@@ -535,8 +507,43 @@ function patchItem(db, batch, item, settings, payload) {
     after = setDescription(after, item.description);
   }
   if (after === before) return { status: 'rejected', reason: 'patch changes nothing (give "old"/"new" or "description")' };
-  if (containsSecret(after) && !containsSecret(before)) return { status: 'rejected', reason: 'patch would add something that looks like a secret' };
+  if (containsSecret(addedText(before, after))) return { status: 'rejected', reason: 'patch would add something that looks like a secret' };
   return commitText(db, batch, t, after, item);
+}
+
+/** The text edit a patch item makes ({ append, section } or { old, new }), if any. */
+function editOf(item) {
+  if (item.append !== undefined) return { append: item.append, section: item.section || '', corrects: !!item.corrects };
+  if (item.old !== undefined) return { old: item.old, new: item.new ?? '', corrects: !!item.corrects };
+  return null;
+}
+
+/**
+ * Whether a patch rewrites what its target says (rather than only adding to it): a
+ * replaced profile bullet, a changed description, or an edit that is not a pure
+ * insertion. Such a patch is a correction and waits for the user like any other.
+ */
+function rewritesText(db, item, settings, payload) {
+  if (item.op !== 'patch') return false;
+  const t = resolvePatchTarget(db, item, settings, payload);
+  if (!t || t.error) return false;
+  const before = readOrNull(t.file);
+  if (before === null) return false;
+  if (t.kind === 'profile') {
+    const blocks = parseProfile(before);
+    const bullet = [...blocks.user, ...blocks.environment].find((b) => (t.learning && b.id === t.learning.id) || b.id === item.target || (item.old && b.text.includes(item.old)));
+    if (!bullet) return false;
+    const next = item.old && bullet.text.includes(item.old) ? bullet.text.replace(item.old, item.new ?? '') : String(item.new ?? item.text ?? '');
+    return !isInsertion(bullet.text, next);
+  }
+  if (item.description) {
+    const { data } = parseFrontmatter(before);
+    if (data.description && !isInsertion(String(data.description), item.description)) return true;
+  }
+  const edit = editOf(item);
+  if (!edit) return false;
+  const r = applyEdits(before, [edit]);
+  return r.applied.some((e) => e.rewrites);
 }
 
 /** Write new content to a patchable file through the ledger and record it as a learning. */
@@ -583,20 +590,23 @@ export function needsApproval(item, actor, autonomy) {
  * Write a validated changeset result (the whole new text of one knowledge file) in
  * its own transaction, through the ledger so it can be undone.
  */
-export function writeText(db, { file, after, title, confidence = 0.6, trigger = 'session_end', actor = 'background', sessionId = null }) {
+export function writeText(db, { file, after, title, confidence = 0.6, trigger = 'session_end', actor = 'background', sessionId = null, expectBefore }) {
   const kind = knowledgeKind(file);
   if (!PATCHABLE.has(kind)) return { status: 'rejected', reason: 'only memory, skill, profile, rule and CLAUDE.md files can be changed' };
-  const before = readOrNull(file);
-  if (before === null) return { status: 'rejected', reason: `file not found: ${file}` };
-  if (after === before) return { status: 'rejected', reason: 'changes nothing' };
-  if (containsSecret(after) && !containsSecret(before)) return { status: 'rejected', reason: 'would add something that looks like a secret' };
   const batch = new Batch(db, { actor, sessionId });
   try {
     db.exec('BEGIN IMMEDIATE');
+    // Read under the write lock: another writer may have changed the file meanwhile.
+    const before = readOrNull(file);
+    const refuse = (status, reason) => { db.exec('ROLLBACK'); return { status, reason }; };
+    if (before === null) return refuse('rejected', `file not found: ${file}`);
+    if (expectBefore !== undefined && before !== expectBefore) return refuse('stale', 'the file changed while the change was being prepared');
+    if (after === before) return refuse('rejected', 'changes nothing');
+    if (containsSecret(addedText(before, after))) return refuse('rejected', 'would add something that looks like a secret');
     const result = commitText(db, batch, { file, kind }, after, { title, confidence, trigger });
     batch.commit();
     db.exec('COMMIT');
-    return result;
+    return { ...result, batch: batch.id };
   } catch (err) {
     try { db.exec('ROLLBACK'); } catch { /* not in a transaction */ }
     batch.rollback();
@@ -685,6 +695,8 @@ export function apply(db, payload, { actor = 'manual', autonomy = 'auto' } = {})
       results.push({ status: 'rejected', title: item.title, reason: 'looks like it contains a secret (token, key or password); never store secrets' });
       continue;
     }
+    // A patch that rewrites existing text is a correction, whatever the proposer said.
+    if (!item.corrects && rewritesText(db, item, settings, payload || {})) item.corrects = true;
     if (needsApproval(item, actor, autonomy)) {
       // Dry run first: only proposals that would actually be written are queued
       // (duplicates of saved items, rejections and over-budget answers come back as is).
@@ -696,7 +708,10 @@ export function apply(db, payload, { actor = 'manual', autonomy = 'auto' } = {})
       if (item.op === 'patch' && !item.description && path.isAbsolute(String(item.target || '')) && item.kind !== 'profile') {
         // A change to an existing file joins that file's pending changeset.
         const q = queueEdit(db, item, payload || {}, actor);
-        results.push({ status: 'queued', title: item.title || path.basename(item.target), candidateId: q.id, changesetId: q.changesetId, reason: `waiting for approval in the dashboard (autonomy: ${autonomy})` });
+        results.push({
+          status: 'queued', title: item.title || path.basename(item.target), candidateId: q.id, changesetId: q.changesetId, recompose: q.recompose || undefined,
+          reason: q.recompose ? 'waiting for approval; composed together with the change already waiting for this file' : `waiting for approval in the dashboard (autonomy: ${autonomy})`,
+        });
         continue;
       }
       const q = enqueue(db, item, payload || {}, actor);
@@ -721,8 +736,8 @@ export function apply(db, payload, { actor = 'manual', autonomy = 'auto' } = {})
  */
 export function rewriteProfileBlock(db, block, bullets, { actor = 'background' } = {}) {
   const file = profileFile();
-  const blocks = parseProfile(readOrNull(file) ?? '');
-  const before = blocks[block];
+  const current = readOrNull(file) ?? '';
+  const before = parseProfile(current)[block];
   const known = new Set(before.map((b) => b.id).filter(Boolean));
   const next = [];
   const kept = new Set();
@@ -738,8 +753,7 @@ export function rewriteProfileBlock(db, block, bullets, { actor = 'background' }
   const batch = new Batch(db, { actor });
   try {
     db.exec('BEGIN IMMEDIATE');
-    blocks[block] = next;
-    batch.write(file, renderProfile(blocks), { learningId: next[0].id, op: 'consolidate' });
+    batch.write(file, profileWithBlock(current, block, next), { learningId: next[0].id, op: 'consolidate' });
     batch.commit();
     const now = Date.now();
     for (const b of next) {
@@ -792,22 +806,39 @@ export function confirm(db, id) {
 
 // ---------- undo / forget ----------
 
-export function undo(db, { id, last } = {}) {
-  const batchRow = id
-    ? db.prepare('SELECT batch FROM writes WHERE learning_id = ? AND reverted_at IS NULL ORDER BY id DESC LIMIT 1').get(id)
-    : last ? db.prepare('SELECT batch FROM writes WHERE reverted_at IS NULL ORDER BY id DESC LIMIT 1').get() : null;
-  if (!batchRow) return { status: 'nothing', reason: id ? `no write to undo for ${id}` : 'nothing to undo' };
+/**
+ * Undo one ledger batch: the latest write of a learning (`id`), a given `batch`, or the
+ * latest write overall (`last`). When the file changed after the write, only the lines
+ * that write changed are reverted (if they are still there, unchanged), so later edits by
+ * the user or other learnings survive.
+ */
+export function undo(db, { id, last, batch } = {}) {
+  const batchRow = batch
+    ? db.prepare('SELECT batch FROM writes WHERE batch = ? AND reverted_at IS NULL LIMIT 1').get(batch)
+    : id
+      ? db.prepare('SELECT batch FROM writes WHERE learning_id = ? AND reverted_at IS NULL ORDER BY id DESC LIMIT 1').get(id)
+      : last ? db.prepare('SELECT batch FROM writes WHERE reverted_at IS NULL ORDER BY id DESC LIMIT 1').get() : null;
+  if (!batchRow) return { status: 'nothing', reason: batch ? 'that change was already undone' : id ? `no write to undo for ${id}` : 'nothing to undo' };
   const writes = db.prepare('SELECT * FROM writes WHERE batch = ? ORDER BY id').all(batchRow.batch);
 
+  const plan = [];
   for (const w of writes) {
     const current = readLinkOrFile(w.file);
-    if (current !== w.after) {
-      return { status: 'conflict', file: w.file, reason: 'the file changed after this write; edit it by hand or forget the learning instead' };
+    if (current === w.after) { plan.push({ file: w.file, content: w.before }); continue; }
+    const linkish = [current, w.before, w.after].some((x) => x !== null && String(x).startsWith('@link:'));
+    const reverted = current !== null && w.before !== null && w.after !== null && !linkish ? revertChange(current, w.before, w.after) : null;
+    if (reverted === null) {
+      return { status: 'conflict', file: w.file, reason: 'the lines this write changed were edited since; edit the file by hand or forget the learning instead' };
     }
+    plan.push({ file: w.file, content: reverted });
   }
-  for (const w of [...writes].reverse()) restore(w.file, w.before);
+  for (const p of [...plan].reverse()) restore(p.file, p.content);
   const now = Date.now();
   db.prepare('UPDATE writes SET reverted_at = ? WHERE batch = ?').run(now, batchRow.batch);
+  db.prepare("UPDATE changesets SET status = 'reverted', decided_at = ? WHERE batch = ?").run(now, batchRow.batch);
+  // What the user undid is a signal for later evaluations (past rejections).
+  db.prepare(`UPDATE candidates SET outcome = 'undone', decided_at = ? WHERE outcome = 'patched'
+    AND changeset_id IN (SELECT id FROM changesets WHERE batch = ?)`).run(now, batchRow.batch);
   const ops = new Set(writes.map((w) => w.op));
   const learningId = writes.find((w) => w.learning_id)?.learning_id;
   if (learningId) {
@@ -851,9 +882,8 @@ export function forget(db, { match }) {
       const blocks = parseProfile(before);
       const bullet = [...blocks.user, ...blocks.environment].find((b) => b.id === l.id);
       if (!bullet) throw new Error('bullet not found in user.md');
-      for (const k of Object.keys(blocks)) blocks[k] = blocks[k].filter((b) => b.id !== l.id);
       batch.write(path.join(archiveDir, `${today()}-${l.id}.md`), `${bullet.text}\n`, { learningId: l.id, op: 'archive' });
-      batch.write(l.path, renderProfile(blocks), { learningId: l.id, op: 'archive' });
+      batch.write(l.path, profileWithoutBullet(before, l.id), { learningId: l.id, op: 'archive' });
     } else if (l.kind === 'memory') {
       const content = readOrNull(l.path);
       if (content === null) throw new Error(`file not found: ${l.path}`);
@@ -896,7 +926,7 @@ export function inventoryText(db, { cwd, memoryDir }) {
     out.push(...(blocks[k].length ? blocks[k].map((b) => `- ${b.text}${b.id ? `  [${b.id}]` : ''}`) : ['(empty)']));
   }
   const dir = memoryDirFor({ memoryDir, cwd });
-  const mems = listMemories().filter((m) => normalize(path.dirname(m.file)) === normalize(dir));
+  const mems = listMemoriesIn(dir);
   const index = mems.find((m) => m.index);
   const entries = index ? countIndexEntries(readOrNull(index.file)) : 0;
   out.push('', `## Project memories in ${dir} (${entries}/${settings.limits.memoryIndexLines} index entries)`);
@@ -955,6 +985,12 @@ async function main() {
         return;
       }
       const results = apply(db, payload, { actor: payload.actor || 'manual', autonomy: options().autonomy });
+      // A queued edit that did not fit with the change already waiting for its file sends
+      // both back to the editor: start the evaluation queue in the background.
+      if (results.some((r) => r.recompose)) {
+        const { spawnWorker } = await import('./hook.mjs');
+        spawnWorker(['--drain']);
+      }
       console.log(summarize(results));
       console.log(JSON.stringify(results.map(({ items, ...r }) => r)));
     } else if (cmd === 'undo') {

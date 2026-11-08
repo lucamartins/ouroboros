@@ -216,6 +216,11 @@ const MIGRATIONS = [
   ALTER TABLE candidates ADD COLUMN target TEXT;     -- the knowledge file that owns it
   CREATE INDEX candidates_changeset ON candidates(changeset_id);
   `,
+  // 7 — v0.8: undo per change, notices per project
+  `
+  ALTER TABLE changesets ADD COLUMN batch TEXT;       -- the ledger batch that applied it (undo)
+  ALTER TABLE notices ADD COLUMN project TEXT;        -- NULL: for any project (maintenance)
+  `,
 ];
 
 export function openDb(explicitDir) {
@@ -264,6 +269,25 @@ export function setMetaOnce(db, key, value) {
   db.prepare('INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)').run(key, String(value));
 }
 
+/**
+ * A named lease held by one process at a time (stored in `meta`): the learning
+ * evaluation runs as a single consumer so two processes never compose changes to the
+ * same file at once. Returns a token to release with, or null when someone else holds
+ * it. An expired lease (a crashed holder) can be taken over.
+ */
+export function acquireLease(db, name, ttlMs = 30 * 60 * 1000) {
+  const now = Date.now();
+  const token = `${now + ttlMs}|${process.pid}|${Math.random().toString(36).slice(2, 10)}`;
+  const r = db.prepare(`
+    INSERT INTO meta (key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE CAST(meta.value AS INTEGER) < ?`).run(`lease:${name}`, token, now);
+  return r.changes ? token : null;
+}
+
+export function releaseLease(db, name, token) {
+  if (token) db.prepare('DELETE FROM meta WHERE key = ? AND value = ?').run(`lease:${name}`, token);
+}
+
 /** Start of the current calendar month (local time), epoch ms. */
 export function monthStart(now = new Date()) {
   return new Date(now.getFullYear(), now.getMonth(), 1).getTime();
@@ -271,4 +295,17 @@ export function monthStart(now = new Date()) {
 
 export function monthSpend(db, now = new Date()) {
   return db.prepare('SELECT COALESCE(SUM(cost_usd), 0) AS total FROM reviews WHERE ts >= ?').get(monthStart(now)).total;
+}
+
+export class BudgetError extends Error {
+  constructor(spent, budget) {
+    super(`monthly budget reached (US$ ${spent.toFixed(2)} of ${budget})`);
+    this.name = 'BudgetError';
+  }
+}
+
+/** Throw BudgetError when the month's model spend reached the budget; called before every model call. */
+export function assertBudget(db, budgetUsd) {
+  const spent = monthSpend(db);
+  if (budgetUsd <= 0 || spent >= budgetUsd) throw new BudgetError(spent, budgetUsd);
 }

@@ -20,12 +20,22 @@ function decide(db, key, approve) {
   return decideQueued(db, Number(key), approve);
 }
 
+/** Totals of a queue drain (several rounds) for the dashboard's message. */
+function summed(r) {
+  const out = { cost: r.cost };
+  for (const rep of r.reports || []) {
+    for (const [k, v] of Object.entries(rep)) if (typeof v === 'number' && k !== 'cost') out[k] = (out[k] || 0) + v;
+  }
+  return out;
+}
+
 /** Write actions available from the dashboard; all go through the curator (undoable). */
 async function runAction(db, action, id) {
   switch (action) {
     case 'triage_queue': {
-      const { tidyQueue } = await import('../scripts/evaluate.mjs');
-      return { status: 'done', ...(await tidyQueue(db, { force: !!id })) };
+      const { drainQueue } = await import('../scripts/evaluate.mjs');
+      const r = await drainQueue(db, { force: !!id });
+      return r.status === 'done' ? { status: 'done', ...summed(r) } : r;
     }
     case 'restore': {
       const r = db.prepare(`
@@ -47,8 +57,9 @@ async function runAction(db, action, id) {
       try { payload = JSON.parse(c.payload || '{}'); } catch { /* ignore */ }
       db.prepare("UPDATE candidates SET outcome = 'queued', triaged_at = NULL, decided_at = NULL, payload = ?, note = ? WHERE id = ?")
         .run(JSON.stringify({ ...payload, confirmed: true }), 'you said it is a new rule', c.id);
-      const { tidyQueue } = await import('../scripts/evaluate.mjs');
-      await tidyQueue(db);
+      const { drainQueue } = await import('../scripts/evaluate.mjs');
+      const r = await drainQueue(db);
+      if (r.status !== 'done') return { status: 'waiting', reason: r.reason, title: c.title };
       const after = db.prepare('SELECT outcome FROM candidates WHERE id = ?').get(c.id);
       return { status: after.outcome === 'queued' ? 'composed' : after.outcome, title: c.title };
     }
@@ -57,6 +68,10 @@ async function runAction(db, action, id) {
       return r.changes ? { status: 'dismissed' } : { status: 'not_found' };
     }
     case 'undo': return undo(db, { id });
+    case 'undo_change': {
+      const cs = db.prepare("SELECT batch FROM changesets WHERE id = ? AND status = 'applied'").get(Number(id));
+      return cs?.batch ? undo(db, { batch: cs.batch }) : { status: 'not_found', reason: 'no applied change with that id' };
+    }
     case 'forget': return forget(db, { match: id });
     case 'confirm': return confirm(db, id);
     case 'approve': return decide(db, id, true);
@@ -64,8 +79,8 @@ async function runAction(db, action, id) {
       const r = decide(db, id, false);
       // Removing one learning from a change to a file: compose the rest again now.
       if (r.recompose) {
-        const { tidyQueue } = await import('../scripts/evaluate.mjs');
-        await tidyQueue(db);
+        const { drainQueue } = await import('../scripts/evaluate.mjs');
+        await drainQueue(db);
       }
       return r;
     }

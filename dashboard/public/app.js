@@ -213,11 +213,12 @@ function toast(text, bad = false) {
 const why = (r) => `${r.status.replace(/_/g, ' ')}${r.reason ? `: ${r.reason}` : ''}`;
 const ACTION_LABEL = {
   undo: (r) => (r.status === 'undone' ? `Undone: ${r.title || r.id}` : why(r)),
+  undo_change: (r) => (r.status === 'undone' ? `Change undone: ${r.title || ''}` : why(r)),
   forget: (r) => (r.status === 'archived' ? `Archived: ${r.title}` : why(r)),
   confirm: (r) => (r.status === 'confirmed' ? 'Confidence raised' : why(r)),
   approve: (r) => (r.status === 'created' || r.status === 'patched' ? `Saved: ${r.title}${r.rebased ? ' (applied on top of the newer file)' : ''}` : why(r)),
   reject: (r) => (r.status === 'rejected_by_user' ? (r.recompose ? 'Removed; the rest of the change was composed again' : 'Rejected') : why(r)),
-  triage_queue: (r) => `Checked ${fmt.int(r.total)}${r.recomposed ? ` and recomposed ${r.recomposed}` : ''}: ${r.kept} new, ${r.routed} to files, ${r.dropped} dropped, ${r.merged} merged, ${r.suggested} fixes (${fmt.usd(r.cost)})`,
+  triage_queue: (r) => (r.status !== 'done' ? why(r) : `Checked ${fmt.int(r.total)}${r.recomposed ? ` and recomposed ${r.recomposed}` : ''}: ${r.kept} new, ${r.routed} to files, ${r.dropped} dropped, ${r.merged} merged, ${r.suggested} fixes (${fmt.usd(r.cost)})`),
   dismiss: () => 'Dismissed',
   resolve_conflict: (r) => (r.status === 'composed' ? `Composed as a change to approve: ${r.title}` : r.status === 'rejected_by_user' ? 'The current rule stands' : why(r)),
   restore: () => 'Back in the inbox',
@@ -644,7 +645,7 @@ async function renderKnowledge() {
 const OUTCOME = {
   created: ['saved', 'good'], patched: ['saved into a file', 'good'], duplicate: ['already known', ''], dropped: ['dropped', ''],
   merged: ['merged', ''], suggested: ['fix suggested', 'info'], dismissed: ['fix dismissed', ''], queued: ['in the inbox', 'info'],
-  conflict: ['conflict', 'warn'], rejected_by_user: ['rejected by you', 'bad'], rejected: ['rejected', 'bad'], over_budget: ['over budget', 'warn'], error: ['error', 'bad'],
+  conflict: ['conflict', 'warn'], rejected_by_user: ['rejected by you', 'bad'], undone: ['undone by you', 'bad'], pending: ['being checked', 'info'], rejected: ['rejected', 'bad'], over_budget: ['over budget', 'warn'], error: ['error', 'bad'],
 };
 function outcomePill(o) {
   const [label, tone] = OUTCOME[o] || [o ? o.replace(/_/g, ' ') : 'measured only', ''];
@@ -697,7 +698,10 @@ async function renderActivity() {
       { label: 'Project', render: (r) => projectName(r.project, r.cwd) },
       { label: 'Session', render: (r) => fmt.date(r.session_started_at) },
       { label: 'Outcome', render: (r) => outcomePill(r.outcome) },
-    ], proposals, { empty: 'No proposals match.', note: 'Everything reviews proposed to learn, and what happened to each.' }),
+      { label: '', render: (r) => (r.outcome === 'patched' && r.cs_status === 'applied' && r.cs_batch
+        ? actionButton('Undo change', 'undo_change', r.changeset_id, { small: true, variant: 'quiet', iconName: 'undo', confirmText: 'Undo this change?', title: 'Revert only the lines this change wrote; later edits to the file stay' })
+        : null) },
+    ], proposals, { empty: 'No proposals match.', note: 'Everything reviews proposed to learn, and what happened to each. Undo change reverts only the lines that change wrote.' }),
     dropped: () => (dropped.length ? h('ul', { class: 'rows' }, dropped.map((d) => h('li', {},
       h('div', { class: 'row-main' }, h('div', { class: 'row-title' }, d.title), h('div', { class: 'small muted' }, d.note || OUTCOME[d.outcome]?.[0] || d.outcome)),
       actionButton('Restore', 'restore', d.id, { small: true, variant: 'quiet', title: 'Put it back in the inbox to be checked again' }))))

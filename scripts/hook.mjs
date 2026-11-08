@@ -174,8 +174,11 @@ const handlers = {
     // The dashboard runs outside hooks and can't see plugin options; leave a snapshot.
     fs.writeFileSync(path.join(dataDir(), 'options.json'), JSON.stringify({ ...options(), updatedAt: now }));
     if (options().learning) {
-      // What the end-of-session reviewer learned since the last session start.
-      const notices = db.prepare('SELECT id, text FROM notices WHERE delivered_at IS NULL ORDER BY id').all();
+      // What the end-of-session reviewer learned since the last session start, for this
+      // project (a notice from another project waits for a session there); maintenance
+      // notices have no project and go to the next session anywhere.
+      const notices = db.prepare('SELECT id, text FROM notices WHERE delivered_at IS NULL AND (project IS NULL OR project = ?) ORDER BY id')
+        .all(projectKey(input.cwd));
       if (notices.length) {
         db.prepare(`UPDATE notices SET delivered_at = ? WHERE id IN (${notices.map(() => '?').join(',')})`).run(now, ...notices.map((n) => n.id));
       }

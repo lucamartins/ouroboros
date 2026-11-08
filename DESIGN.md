@@ -2,7 +2,7 @@
 
 > A Claude Code plugin that learns from your sessions on its own: it saves memories and creates/refines skills without being asked, in the spirit of Nous Research's Hermes Agent, and shows on a local dashboard what it learned, how much that is being used and what it costs.
 
-Status: all four phases implemented (v0.4.0); next: real-world use, then a fresh install test on another machine. Owner decisions in [§12](#12-decisions).
+Status: v0.8.0 — every phase implemented, plus the learning evaluation (§7.0) and the v0.8 mechanism review (§7.3); next: real-world use, then a fresh install test on another machine. Owner decisions in [§12](#12-decisions).
 
 ---
 
@@ -62,7 +62,7 @@ Dashboard (node, 127.0.0.1) ◄── events.db + scan of memories/skills + tran
 | Global profile + environment notes | `~/.ouroboros/user.md` (two blocks, §3.2) | Survives uninstall/update; hand-editable; injected into every session |
 | Advanced config (routing, limits) | `~/.ouroboros/config.json` | Structures `userConfig` doesn't express well |
 | Telemetry + ledger | `${CLAUDE_PLUGIN_DATA}/events.db` | Plugin state; persists across updates |
-| Project facts | native auto memory (`~/.claude/projects/<proj>/memory/*.md` + `MEMORY.md`), honoring `autoMemoryDirectory` | Cooperates with the native mechanism instead of competing |
+| Project facts | native auto memory (`~/.claude/projects/<proj>/memory/*.md` + `MEMORY.md`), resolved as Claude Code does: one directory per repository (its worktrees and subfolders share it), honoring `autoMemoryDirectory` (local, project or user settings) and `CLAUDE_CODE_PROJECT_DIR_NAME`; `paths.memoryDirFor` is the only place that computes it | Cooperates with the native mechanism instead of competing |
 | Generic learned skills | `~/.claude/skills/learned-<name>/SKILL.md` | Apply to every project; prefix marks the origin |
 | Project learned skills | target from the routing map (e.g. `nisus-*` → `~/source/repos/nisus-skills/...`) or the repo's `.claude/skills/` | Don't leak into other projects |
 
@@ -133,7 +133,8 @@ No `bin/` folder (it blocks installation through claude.ai/Cowork). Every file i
 | `background_review` | boolean | `true` | Toggles reflection B |
 | `review_every_turns` | number | `10` | User turns between in-loop reviews |
 | `long_turn_tool_calls` | number | `15` | Tool calls in one turn that trigger an early review |
-| `monthly_budget_usd` | number | `5` | Reviewer cap; when exceeded, reflection B pauses until next month |
+| `judge_model` | string | `haiku` | Model of the learning evaluation (screen and editor, §7.0); follows `reviewer_model` when unset |
+| `monthly_budget_usd` | number | `5` | Cap on every model call Ouroboros makes (reviewer, evaluation, consolidation), checked before each call; when reached, the work waits until next month |
 | `language` | string | `auto` | Language of learnings and notices written to the user's files (`auto` = the conversation's language) |
 
 ### 4.2 `~/.ouroboros/config.json`
@@ -208,7 +209,7 @@ Cost is measured from transcript `usage` between the request and the next `Stop`
 
 1. **Trigger**: `SessionEnd` (or an orphaned queued session found at the next `SessionStart`).
 2. **Scope**: only the **unreviewed tail** — from the session's cursor to the end. Skipped when the tail has < 2 user turns and no `recovery` events.
-3. **Digest**: `transcript.mjs` reduces the tail to user turns, assistant text, tool names and errors; plus the `recovery` snippets recorded inside subagents (never full subagent transcripts; workflow agents are excluded entirely). Capped at ~20k tokens.
+3. **Digest**: `transcript.mjs` reduces the tail to user turns, assistant text, tool names and errors; plus the `recovery` snippets recorded inside subagents (never full subagent transcripts; workflow agents are excluded entirely). A tail over ~80k characters is first shrunk (tool calls, then long assistant text) and then split into parts at user turns, each reviewed by its own call with the USER numbering continued; the results merge into one review. Nothing in the middle of a long session is dropped (past 8 parts, the oldest middle parts are skipped and the review says so).
 4. **Inventory**: titles + descriptions of the existing memories/skills in scope (so the model picks `patch` over `create`).
 5. **Call**: `claude -p --safe-mode --model <reviewer_model> --output-format json --json-schema <schema> --tools "" --no-session-persistence --max-budget-usd 0.5 --system-prompt <short>`, `cwd` at `${CLAUDE_PLUGIN_DATA}/reviewer`, `OUROBOROS_REVIEWER=1`. Isolation is essential: a plain `claude -p` loads the user's whole environment (MCP servers, plugins, skills, CLAUDE.md) and a trivial call measured **US$ 0.78**; with `--safe-mode` and a custom system prompt the same call costs **US$ 0.0003**, and real session reviews cost US$ 0.002–0.008. `--safe-mode` also disables hooks, so the reviewer can't trigger the plugin; `--no-session-persistence` keeps its transcripts out of the user's projects.
 6. **Output**: `{corrections, items: [{kind: profile|memory|skill, block?, scope?, memory_type?, title, text?, description?, body?, confidence, evidence, repeats?}]}`. Every item is recorded in `candidates` and goes through the **learning evaluation** (§7.0) before anything is written or queued; the reviewer sees only names and descriptions of what exists, so it never writes edits itself. A `duplicate` reinforces the existing learning (+0.1 confidence, max 0.9). `repeats` means "the user had to repeat something already saved" → *miss* metric (§9). If the evaluation fails (model error, budget), nothing is written: the items wait in the queue and the next queue check evaluates them.
@@ -239,7 +240,7 @@ Duplicates are **not** merged automatically: the curator answers `duplicate` wit
 Owner decision: **`autonomy = auto`** (like Hermes). Consequences:
 
 - A proposal that passes the filters is written directly; one-line notice in the session (A) or in the next session (B).
-- **Undo is mandatory from the first write**: `/ouroboros:undo` and a dashboard button revert using the ledger diff.
+- **Undo is mandatory from the first write**: `/ouroboros:undo` and a dashboard button revert using the ledger diff. When the file changed after the write (the user's edits, another learning), undo reverts only the lines that write changed, located by a line diff with surrounding context, and keeps the rest; it refuses only when those very lines were edited since. Each applied changeset records its ledger batch, so the dashboard can undo one change exactly (Activity, Proposals, *Undo change*); what the user undoes joins the past rejections the screen sees.
 - Low confidence (< 0.5) still goes in, but is the first to be archived if unused.
 - `hybrid`/`queue` modes are implemented as options for other users (queue in the dashboard).
 
@@ -279,13 +280,15 @@ Every proposal from a Claude-less path (end-of-session reviewer, learning backfi
 1. **Screen** (`scripts/triage.mjs`, one isolated call per 12 proposals). Inputs: the rubric; BM25 excerpts of what Claude already knows (`scripts/knowledge.mjs`: global and project CLAUDE.md, `.claude/rules`, skill bodies **and their reference files**, memories, profile); sources of truth (CI workflows, manifests, deploy config); past rejections; and the **owners map** (every skill and rule file with description, sections and reference files). Verdicts: `drop` (with a rubric reason), `merge`, `keep` (new item, rewritten), `route` (the topic has an owner file: return the owner and the knowledge as one self-contained *claim*; the screen never writes edits), `fix` (a fixable defect: becomes a **suggested fix**, nothing is learned). Any verdict can flag a **stale owner** a source of truth contradicts, which becomes a correction claim for that file — only when the flag cites a file that really is a source of truth (checked by code: it exists and is not a knowledge file); a user preference can never flag documentation as outdated. A final pass merges duplicates across batches *by fact, not by target*, so the same fact sent to two owners is kept once.
 2. **Ground** (no model). Identifiers the claims name — code spans, paths, dotted names, CONSTANTS, camelCase, `--flags` — are looked up with `git grep` in the tracked code and config of the project's repos (markdown excluded). "Not found" is evidence too.
 3. **Edit** (one isolated call per owner file). The editor reads the **whole file** (outline plus related blocks, verbatim, when it is over 40k chars), **every learning pending for that file** (the new ones and those already waiting in a changeset), the grounding, the rubric, and what **other** files say on the same topics: knowledge the assistant already reads (a learning another file covers is `covered`, never copied) and related sources of truth (project evidence). Per claim: `covered`, `contradicted` (by the project), `adds`, `corrects` (the file is wrong; shown by the project or by the user explicitly changing a rule — a one-time request never overturns a standing rule), `conflict` (with another claim or the file, unsettled). Then **one coherent set of edits**: exact `old` fragments copied from the file, replaced by `new`; additions anchored after the line where they belong, in the file's style and language; only `corrects` edits may remove text; text elsewhere in the file that says the opposite must be fixed in the same set. Disagreements are settled by project evidence, then recency.
-4. **Validate** (`scripts/changesets.mjs`, code, never the model). Each edit applies only if its fragment occurs exactly once, it does not remove text unless a correcting learning backs it (≤ 800 chars), it leaves the frontmatter and headings intact and adds no secret; the whole set grows the file by at most 6,000 chars; an edit that no `adds`/`corrects` learning justifies is dropped. Learnings whose edits all fail are dropped with the reason.
+4. **Validate** (`scripts/changesets.mjs`, code, never the model). Each edit applies only if its fragment occurs exactly once and it leaves the frontmatter and headings intact; the text it **adds** holds no secret (checked on the added text, not the whole file, so a file that already contains something secret-looking does not let a new secret through); the whole set grows the file by at most 6,000 chars; an edit that no `adds`/`corrects` learning justifies is dropped. An edit is an **addition** only when it is a pure insertion: the old fragment survives intact inside the new text. Anything else rewrites what the file says (even one word: "Run X" to "Never run X"), so it is a **correction** whatever the editor called it: it is marked `corrects`, may remove at most 800 chars, and waits for the user. Learnings whose edits all fail are dropped with the reason.
 
 **Conflicts go to the user.** A learning the editor judges `conflict` is never dropped: it waits in the dashboard's *Conflicts — you decide* section (and the session-start notice says so). "It is a new rule" marks it `confirmed`; it then skips the screen and goes to its file's editor, which must write it (as a correction of what the file says). "Keep the current rule" rejects it, which also feeds the past-rejections index.
 
 **Changesets.** The result is at most one pending **changeset per file**: the validated edits, the learnings they implement, and the hash of the text they were composed against. A new learning for that file recomposes the changeset with everything pending, so changes never conflict. Approval (dashboard, `approve`) re-applies the edits to the *current* file: if the file changed but the fragments still fit, the change lands on top of the newer version; otherwise the changeset goes **stale** and the next queue check composes it again. Rejecting one learning of a multi-learning changeset recomposes the rest without it. Applying goes through the curator's ledger, so `undo` works as for any write. New items (`keep`) still go through the curator's create path (dedupe, budgets, routing); a create that turns out to duplicate an existing memory or skill becomes a claim for that file, so the editor folds in only what is new.
 
-**Patches Claude writes in session** (the `learn` skill, which reads the files itself) skip the screen and editor; when they need approval they join the file's pending changeset if the edits still apply together.
+**Patches Claude writes in session** (the `learn` skill, which reads the files itself) skip the screen and editor but not the validation: they pass the same `applyEdits` rules, and one that rewrites text (or replaces a profile bullet or a description) is a correction that waits for the user even in `auto`. When they need approval they join the file's pending changeset if the edits still apply together; if not, the pending changeset goes stale with the new learning attached and the editor composes both (a file never has two pending changes).
+
+**One evaluator at a time.** Sessions end in parallel, the daily maintenance runs on its own and the dashboard can ask for a check, so the evaluation is a **queue with a single consumer**. A review records its proposals as `pending` and calls `drainQueue`, which takes a lease in the database (`meta`, 30 min expiry for a crashed holder) and evaluates until nothing waits, including what other processes queued meanwhile, then looks once more after releasing it. A process that finds the lease taken leaves its work for the holder. A live session's proposals are evaluated together, so its notice says what happened to them. Before a composed changeset is saved, the database is checked again: if the user approved or rejected a change to that file while the model was running, the composition is discarded and redone. A changeset is written under the write lock, and only if the file still holds the text its edits were applied to.
 
 **Why the model writes the edits but code applies them.** A model rewriting whole files would silently lose content, drift in style and, edit after edit, degrade the text. A model is still the right author for *where* and *how* a fact belongs in a document, and for noticing that a line elsewhere now contradicts it. Exact-fragment edits keep both: the model decides and writes, the code guarantees what can change, the user sees a diff, and the ledger undoes it.
 
@@ -320,6 +323,31 @@ How each transition happens (phase 4):
 - **Autonomy** (`auto` | `hybrid` | `queue`): proposals from Claude (`actor: inloop`) or the reviewer (`background`) that need approval are stored as `queued` candidates with their full payload; explicit user requests (`actor: manual`) are always written. `hybrid` writes facts with confidence ≥ 0.7 and queues skills and tentative items. Changes to existing files wait as changesets (§7.0), shown as diffs. Approve/Reject in the dashboard runs the stored proposal through the curator, or applies/rejects the changeset.
 - **Exclusions**: hooks do nothing at all in projects matching `excludeProjects`.
 
+### 7.3 Mechanism review (v0.8)
+
+A full review of the technical mechanisms against the quality bar (a healthy, consistent loop for any user or project) found three that needed a redesign and nine defects. Each has a regression test (`test/v08.test.mjs` and the updated suites).
+
+| Finding | Before | Now |
+|---|---|---|
+| Additions could change meaning | An "addition" was any edit removing at most one word, so "Run X" to "Never run X" was written without approval | Only a pure insertion is an addition; any rewrite is a correction (§7.0, Validate) |
+| In-session patches were not validated | The `learn` skill's patches were written as given; only the model's own `corrects` flag made them wait | The same validator as the editor; a rewrite waits for the user |
+| Parallel evaluations lost learnings | Two processes could compose the same file at once and supersede each other's changeset; an unfit in-session edit created a second pending changeset | Single-consumer queue with a lease; re-check before saving; one pending change per file |
+| The profile lost hand edits | Every write re-rendered `user.md` from its bullets, dropping prose, extra sections and multi-line bullets | Writes touch only the bullet lines they change |
+| Secrets could slip in | The check compared the whole file before and after, so a file that already looked like it had a secret let a new one through | The check runs on the added text |
+| Undo was coarse | Undo refused when the file changed at all, and per-file learning ids made "undo this learning" revert whatever was last | Line-level revert among later edits; undo per changeset (batch) |
+| Three memory-dir resolvers | Curator, knowledge index and reviewer inventory computed the project's memory directory differently; a worktree got its own | One resolver, as documented by Claude Code (repository, worktrees shared, `autoMemoryDirectory`) |
+| Ancestor CLAUDE.md unseen | The screen did not see CLAUDE.md files above the working directory, which Claude Code loads | They are indexed |
+| Long sessions lost their middle | A tail over 80k characters kept its start and end only | Reviewed in parts |
+| Budget checked once | Only before the reviewer call; screening, editing and consolidation could run past it | Checked before every call; cost recorded per call |
+| Notices crossed projects | A notice from project A was injected into the next session of any project | Delivered to the same project (maintenance notices anywhere) |
+| Merges could vanish | A proposal merged into one the same pass dropped disappeared with it | A merge follows its chain: it shares the target's drop or fix verdict with the reason, or is kept when the target is not saved |
+
+**Kept as is**, because they hold up: capture through exec-form async hooks with a recursion guard; the per-session cursor (each segment reviewed once); isolated `--safe-mode` model calls; screen, ground, editor and validate as separate stages; changesets per file re-applied to the current text on approval; the ledger; conflicts handed to the user; one rubric for every path.
+
+**Measured, not changed**: Sonnet as the evaluation model scored the same as Haiku on the synthetic suite (12/12, then 15/15 with three cases taken from real mistakes) at about 15 times the cost, so Haiku stays the default and `judge_model` lets a user choose. The suite is close to saturated; new cases should come from real disagreements (`--replay`).
+
+**Open risk**: in real use the plugin has run in few sessions so far, so its value is not yet shown by the correction-rate metric (§9.2). Measuring that is the next step, ahead of new mechanisms.
+
 ## 8. Data model (`events.db`)
 
 ```sql
@@ -340,9 +368,14 @@ candidates (id, review_id, session_id, kind, title, summary, evidence, confidenc
             note, claim, target, changeset_id, triaged_at, decided_at, ...)
           -- outcome: queued | created | patched | duplicate | dropped | merged | suggested
           --          | dismissed | rejected_by_user | over_budget | error
-changesets (id, file, kind, base_hash, edits, corrects, status, note, cost_usd, created_at, decided_at, learning_id)
+changesets (id, file, kind, base_hash, edits, corrects, status, note, cost_usd, created_at, decided_at, learning_id, batch)
+          -- status: pending | applied | rejected | superseded | stale | reverted
+notices   (id, ts, session_id, project, text, delivered_at)   -- project NULL: any session
+meta      (key, value)   -- markers and the evaluation lease (lease:evaluate)
           -- status: pending | applied | rejected | superseded | stale
 ```
+
+Candidate outcomes added in v0.8: `pending` (recorded, not evaluated yet) and `undone` (applied, then undone by the user).
 
 WAL + `busy_timeout` for concurrent sessions. Versioned migrations in `db.mjs`.
 
@@ -396,7 +429,9 @@ Visual system: warm neutrals with one blue accent (primary actions, selection, d
 | Recursion (reviewer fires hooks) | `OUROBOROS_REVIEWER=1` disables everything; separate `cwd`; sessions flagged `is_reviewer` excluded from metrics |
 | Prompt injection teaching the agent | Learn only from user turns and observed outcomes; tool text never becomes a literal learning |
 | Cross-project leakage | Scope-based routing; `excludeProjects` |
-| Sensitive data written | Secret filter (token/key/password patterns) before any write; dashboard bound to `127.0.0.1` only |
+| Sensitive data written | Secret filter (token/key/password patterns) on the text each write adds; dashboard bound to `127.0.0.1` only |
+| Concurrent evaluations | One consumer at a time (database lease); compositions re-checked before saving; writes under the write lock with an expected base text |
+| The user's hand edits lost | Profile writes touch only the bullet lines they change; undo reverts only the lines its write changed |
 | Skill listing budget (~1% of context) | Cap on learned-skill count and description length; metric on the Health screen |
 | Reviewer cost | Haiku, unreviewed tail only, compact digest, monthly cap |
 
@@ -416,6 +451,8 @@ Visual system: warm neutrals with one blue accent (primary actions, selection, d
 | Runtime | Node ≥ 22.13, zero dependencies |
 | Judging learnings | One rubric everywhere; screen + editor must both agree before anything is written |
 | Changes to existing files | One changeset per file, composed with every pending learning; the model writes exact-fragment edits, code validates and applies them; re-applied to the current file on approval |
+| Additions vs corrections | Decided by code, not by the model's label: only a pure insertion is an addition; any rewrite is a correction and waits for the user, on both write paths |
+| Evaluation model | Haiku by default (`judge_model`): on the synthetic suite Sonnet scored the same at about 15 times the cost; revisit when the suite tells them apart |
 
 ## 13. Phases
 
@@ -426,3 +463,4 @@ Visual system: warm neutrals with one blue accent (primary actions, selection, d
 | **3. Self-learning** | Periodic in-loop review, background review of the tail, notices, Value and Cost screens | Correction rate drops vs baseline with cost under the cap |
 | **4. Lifecycle and distribution** | Confidence/decay, automatic consolidation, merge on rediscovery, promotion, autonomy queue, dashboard actions (confirm/undo/archive/approve/reject, token-protected), `excludeProjects`, CI (tests on Ubuntu + Windows, macOS on demand; `validate --strict`), README | Someone else installs it from scratch on Windows and macOS |
 | **v0.7 Evaluation** | Screen → ground → edit → validate; changesets per file with diffs in the dashboard; suggested fixes; skill reference files as owners; `eval.mjs` (synthetic + replay) | The same 60 real proposals give fewer, coherent changes, and the synthetic score holds |
+| **v0.8 Mechanism review** | §7.3: insertion-only additions, one validator for both write paths, single-consumer evaluation queue, surgical profile writes, added-text secret check, line-level undo, one memory-dir resolver, ancestor CLAUDE.md files, long sessions in parts, budget guard on every call, notices per project, merges that must land; harder eval cases | 15/15 on the synthetic suite; every finding has a regression test |
