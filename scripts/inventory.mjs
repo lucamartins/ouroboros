@@ -4,23 +4,216 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { claudeDir, memoryDirFor, ouroborosDir, projectKey } from './paths.mjs';
 
+/**
+ * Reads the YAML frontmatter of a memory or skill file. Not a full YAML parser, but it
+ * covers what Claude Code accepts in practice: nested mappings, block sequences, block
+ * scalars (`|`, `>`, with chomping/indent indicators), plain scalars continued on more
+ * indented lines, and single/double-quoted scalars (escapes, spanning several lines).
+ * Scalars stay strings; flow collections (`[a, b]`) are kept as their raw text.
+ */
 export function parseFrontmatter(text) {
-  const m = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text);
+  const src = String(text ?? '').replace(/^﻿/, '');
+  const m = /^---[ \t]*\r?\n(?:([\s\S]*?)\r?\n)??---[ \t]*(?=\r?\n|$)/.exec(src);
+  if (!m) return { data: {}, body: src };
+  const lines = (m[1] ?? '').split(/\r?\n/).map((l) => l.replace(/^\t+/, (t) => '  '.repeat(t.length)));
+  const { value } = parseMapping(lines, 0, 0);
+  return { data: value, body: src.slice(m[0].length) };
+}
+
+const indentOf = (line) => /^ */.exec(line)[0].length;
+const isBlank = (line) => /^\s*(#.*)?$/.test(line);
+const KEY_RE = /^( *)("(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^\s#'"-][^:]*?|-\S[^:]*?)[ \t]*:(?:[ \t]+(.*))?$/;
+
+function unquoteKey(k) {
+  if (k.startsWith('"')) return parseDoubleQuoted([k], 0).value;
+  if (k.startsWith("'")) return k.slice(1, -1).replace(/''/g, "'");
+  return k;
+}
+
+function nextContent(lines, i) {
+  while (i < lines.length && isBlank(lines[i])) i++;
+  return i;
+}
+
+function parseMapping(lines, start, indent) {
   const data = {};
-  if (!m) return { data, body: text };
-  let parent = null;
-  for (const line of m[1].split(/\r?\n/)) {
-    const kv = /^(\s*)([A-Za-z0-9_-]+):\s*(.*)$/.exec(line);
-    if (!kv) continue;
-    const [, indent, key, rawValue] = kv;
-    const value = rawValue.replace(/^["']|["']$/g, '');
-    if (indent.length === 0) {
-      if (value === '') { data[key] = {}; parent = key; } else { data[key] = value; parent = null; }
-    } else if (parent && typeof data[parent] === 'object') {
-      data[parent][key] = value;
-    }
+  let i = start;
+  while ((i = nextContent(lines, i)) < lines.length) {
+    const line = lines[i];
+    const ind = indentOf(line);
+    if (ind < indent) break;
+    const kv = ind === indent ? KEY_RE.exec(line) : null;
+    if (!kv) { i++; continue; } // stray or malformed line: skip it
+    const key = unquoteKey(kv[2].trim());
+    const r = parseValue(lines, i, indent, (kv[3] ?? '').trim());
+    data[key] = r.value;
+    i = r.next;
   }
-  return { data, body: text.slice(m[0].length) };
+  return { value: data, next: i };
+}
+
+function parseSequence(lines, start, indent) {
+  const out = [];
+  let i = start;
+  while ((i = nextContent(lines, i)) < lines.length) {
+    const line = lines[i];
+    if (indentOf(line) !== indent || !/^ *-(\s|$)/.test(line)) break;
+    const r = parseValue(lines, i, indent, line.slice(indent + 1).trim());
+    out.push(r.value);
+    i = r.next;
+  }
+  return { value: out, next: i };
+}
+
+/** Value of the key or `-` item on line `i` (whose own indent is `indent`); `rest` is what follows it. */
+function parseValue(lines, i, indent, rest) {
+  if (rest === '' || rest.startsWith('#')) {
+    const j = nextContent(lines, i + 1);
+    if (j >= lines.length) return { value: '', next: j };
+    const ind = indentOf(lines[j]);
+    const t = lines[j].trim();
+    // A sequence may sit at the same indent as its key.
+    if (t === '-' || t.startsWith('- ')) {
+      if (ind > indent || (ind === indent && lines[i].trimStart()[0] !== '-')) return parseSequence(lines, j, ind);
+      return { value: '', next: j };
+    }
+    if (ind <= indent) return { value: '', next: j };
+    if (KEY_RE.test(lines[j])) return parseMapping(lines, j, ind);
+    return parsePlain(lines, j, indent, '');
+  }
+  if (/^[|>]/.test(rest)) return parseBlock(lines, i, indent, rest);
+  if (rest.startsWith('"')) return parseDoubleQuoted(lines, i, rest);
+  if (rest.startsWith("'")) return parseSingleQuoted(lines, i, rest);
+  return parsePlain(lines, i + 1, indent, rest);
+}
+
+/** Joins the lines of a flow scalar: one line break becomes a space, n blank lines become n newlines. */
+function fold(parts) {
+  let out = '';
+  let blanks = 0;
+  parts.forEach((p, k) => {
+    if (k === 0) { out = p; return; }
+    if (p === '') { blanks++; return; }
+    out += blanks ? '\n'.repeat(blanks) : (out === '' ? '' : ' ');
+    out += p;
+    blanks = 0;
+  });
+  return out + '\n'.repeat(blanks);
+}
+
+function parsePlain(lines, j, indent, first) {
+  const parts = [first.replace(/\s+#.*$/, '')];
+  let i = j;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line.trim() === '') { parts.push(''); i++; continue; }
+    if (indentOf(line) <= indent || /^\s*#/.test(line)) break;
+    parts.push(line.trim().replace(/\s+#.*$/, ''));
+    i++;
+  }
+  while (parts.length > 1 && parts[parts.length - 1] === '') { parts.pop(); }
+  const value = fold(parts[0] === '' ? parts.slice(1) : parts).trim();
+  return { value, next: i };
+}
+
+function parseBlock(lines, i, indent, header) {
+  const h = /^([|>])([1-9+-]*)/.exec(header);
+  const literal = h[1] === '|';
+  const chomp = h[2].includes('-') ? 'strip' : h[2].includes('+') ? 'keep' : 'clip';
+  const explicit = Number(h[2].replace(/[+-]/g, '')) || 0;
+  let j = i + 1;
+  let blockIndent = explicit ? indent + explicit : 0;
+  const raw = [];
+  while (j < lines.length) {
+    const line = lines[j];
+    if (line.trim() === '') { raw.push(''); j++; continue; }
+    const ind = indentOf(line);
+    if (!blockIndent) blockIndent = ind;
+    if (ind < blockIndent || ind <= indent) break;
+    raw.push(line.slice(blockIndent));
+    j++;
+  }
+  let trailing = 0;
+  while (raw.length && raw[raw.length - 1] === '') { raw.pop(); trailing++; }
+  let body;
+  if (literal) {
+    body = raw.join('\n');
+  } else {
+    // Folded: lines at the block indent join with a space; more indented lines keep their breaks.
+    body = '';
+    let blanks = 0;
+    let prevMore = false;
+    raw.forEach((l, k) => {
+      if (l === '') { blanks++; return; }
+      const more = /^\s/.test(l);
+      if (k > 0 && body !== '') body += blanks ? '\n'.repeat(blanks + (more || prevMore ? 1 : 0)) : (more || prevMore ? '\n' : ' ');
+      body += l;
+      blanks = 0;
+      prevMore = more;
+    });
+  }
+  if (body === '') return { value: '', next: j };
+  if (chomp === 'clip') body += '\n';
+  else if (chomp === 'keep') body += '\n'.repeat(trailing + 1);
+  return { value: body, next: j };
+}
+
+const ESCAPES = { 0: '\0', a: '\x07', b: '\b', t: '\t', '\t': '\t', n: '\n', v: '\v', f: '\f', r: '\r', e: '\x1b', ' ': ' ', '"': '"', '/': '/', '\\': '\\', N: '\x85', _: '\xa0', L: ' ', P: ' ' };
+
+function parseDoubleQuoted(lines, i, first = lines[i]) {
+  const parts = [];
+  let cur = '';
+  let src = first.slice(1);
+  let j = i;
+  for (;;) {
+    let k = 0;
+    let closed = false;
+    while (k < src.length) {
+      const c = src[k];
+      if (c === '"') { closed = true; break; }
+      if (c === '\\') {
+        const e = src[k + 1];
+        if (e === undefined) { cur += '\u0000JOIN'; k++; break; } // escaped line break
+        const hex = { x: 2, u: 4, U: 8 }[e];
+        if (hex) { cur += String.fromCodePoint(parseInt(src.slice(k + 2, k + 2 + hex), 16) || 0xfffd); k += 2 + hex; continue; }
+        cur += ESCAPES[e] ?? e;
+        k += 2;
+        continue;
+      }
+      cur += c;
+      k++;
+    }
+    if (closed || j + 1 >= lines.length) { parts.push(parts.length ? cur.trimStart() : cur); break; }
+    parts.push(parts.length ? cur.trim() : cur.trimEnd());
+    cur = '';
+    src = lines[++j];
+  }
+  // A trailing backslash joins the next line with no space.
+  const joined = [];
+  for (const p of parts) {
+    const prev = joined.length - 1;
+    if (prev >= 0 && joined[prev].endsWith('\u0000JOIN')) joined[prev] = joined[prev].slice(0, -5) + p;
+    else joined.push(p);
+  }
+  return { value: fold(joined), next: j + 1 };
+}
+
+function parseSingleQuoted(lines, i, first) {
+  const parts = [];
+  let src = first.slice(1);
+  let j = i;
+  for (;;) {
+    const end = /^((?:[^']|'')*)'(?!')/.exec(src);
+    if (end || j + 1 >= lines.length) {
+      const piece = (end ? end[1] : src).replace(/''/g, "'");
+      parts.push(parts.length ? piece.trimStart() : piece);
+      break;
+    }
+    const piece = src.replace(/''/g, "'");
+    parts.push(parts.length ? piece.trim() : piece.trimEnd());
+    src = lines[++j];
+  }
+  return { value: fold(parts), next: j + 1 };
 }
 
 function safeStat(p) {

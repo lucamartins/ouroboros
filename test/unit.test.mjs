@@ -61,3 +61,18 @@ test('parseFrontmatter reads nested metadata', () => {
   assert.equal(data.description, 'b c');
   assert.equal(data.metadata.type, 'feedback');
 });
+
+test('parseFrontmatter reads multi-line descriptions', () => {
+  const desc = (fm) => parseFrontmatter(`---\n${fm}\nname: x\n---\nbody`).data.description;
+  assert.equal(desc('description: >\n  Use when the user\n  asks for X.'), 'Use when the user asks for X.\n');
+  assert.equal(desc('description: >-\n  one\n  two\n\n  three'), 'one two\nthree');
+  assert.equal(desc('description: |\n  line 1\n  line 2'), 'line 1\nline 2\n');
+  assert.equal(desc('description: Use when the user\n  asks for X, Y\n  and Z.'), 'Use when the user asks for X, Y and Z.');
+  assert.equal(desc('description:\n  Text on\n  the next lines'), 'Text on the next lines');
+  assert.equal(desc('description: "Say \\"hi\\" and\n  go: on"'), 'Say "hi" and go: on');
+  assert.equal(desc("description: 'It''s\n  multi'"), "It's multi");
+  assert.equal(desc('description: Use when: X happens # comment'), 'Use when: X happens');
+  assert.equal(parseFrontmatter('---\r\ndescription: >\r\n  a\r\n  b\r\nname: x\r\n---\r\n').data.description, 'a b\n');
+  assert.equal(parseFrontmatter('﻿---\ndescription: hi\n---\n').data.description, 'hi');
+  assert.deepEqual(parseFrontmatter('---\npaths:\n  - a/**\n  - b\n---\n').data.paths, ['a/**', 'b']);
+});

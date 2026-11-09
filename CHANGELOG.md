@@ -5,6 +5,7 @@ All notable changes to Ouroboros. Versions follow [semantic versioning](https://
 ## 0.14.0 — 2026-11-08
 
 - Knowledge graph legible by default: reference files fold into their skill and open on selection, each project is a region, "similar" and project lines are off until asked for, unconnected items wait in the side panel, overlapping names wait for zoom, and the view survives redraws.
+- 0.14.1: multi-line skill and memory descriptions (`>`, `|`, continued or quoted over several lines) are read in full, so previews show them; patching such a description replaces the whole value.
 
 ## 0.13.0 — 2026-11-08
 
