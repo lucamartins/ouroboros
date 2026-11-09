@@ -2,6 +2,8 @@
 
 Self-learning for Claude Code. Ouroboros reviews your sessions, turns what is worth keeping into memories and skills, and shows on a local dashboard what it learned, how much that is used, and what it costs — in the spirit of Nous Research's Hermes Agent.
 
+**Website:** https://lucamartins.github.io/ouroboros/
+
 ![Ouroboros dashboard: corrections per 100 turns before and after learning turned on](docs/screenshots/overview.png)
 
 ## How it works
