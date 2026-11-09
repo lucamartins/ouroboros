@@ -230,8 +230,19 @@ export function indexEntriesIn(dir) {
   return countIndexEntries(readOrNull(path.join(dir, 'MEMORY.md')));
 }
 
+/** Replaces the top-level `description:` value, including any continuation lines (block or folded scalars). */
 function setDescription(text, description) {
-  return text.replace(/^(---\r?\n[\s\S]*?^description:).*$/m, `$1 ${yamlStr(description)}`);
+  const fm = /^(﻿?---[ \t]*\r?\n)([\s\S]*?\r?\n)(---[ \t]*(?:\r?\n|$))/.exec(text);
+  if (!fm) return text;
+  const lines = fm[2].split(/(?<=\n)/);
+  const at = lines.findIndex((l) => /^description[ \t]*:/.test(l));
+  if (at < 0) return text;
+  let end = at + 1;
+  while (end < lines.length && (/^[ \t]/.test(lines[end]) || !lines[end].trim())) end++;
+  while (end > at + 1 && !lines[end - 1].trim()) end--; // keep blank lines that follow the value
+  const eol = /\r\n$/.test(lines[at]) ? '\r\n' : '\n';
+  lines.splice(at, end - at, `description: ${yamlStr(description)}${eol}`);
+  return fm[1] + lines.join('') + fm[3] + text.slice(fm[0].length);
 }
 
 // ---------- apply ----------

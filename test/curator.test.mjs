@@ -167,6 +167,16 @@ test('patching a native skill is allowed and does not count as a learned skill',
   assert.match(inv, /native-one/);
 });
 
+test('patching the description of a skill with a multi-line description replaces the whole value', () => {
+  const dir = path.join(tmp, 'claude', 'skills', 'folded-one');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, 'SKILL.md');
+  fs.writeFileSync(file, '---\nname: folded-one\ndescription: >\n  Old text that\n  spans lines.\nallowed-tools: Read\n---\n\nStep A\n');
+  const [r] = apply([{ op: 'patch', kind: 'skill', target: 'folded-one', description: 'New text. Use when testing.' }]);
+  assert.equal(r.status, 'patched', r.reason);
+  assert.equal(read(file), '---\nname: folded-one\ndescription: New text. Use when testing.\nallowed-tools: Read\n---\n\nStep A\n');
+});
+
 test('patch targets outside memories, skills, rules and CLAUDE.md files are refused', () => {
   const [r] = apply([{ op: 'patch', target: path.join(cwd, 'package.json'), old: 'a', new: 'b' }]);
   assert.equal(r.status, 'rejected');
