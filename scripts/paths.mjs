@@ -90,7 +90,8 @@ export function repoRoot(dir) {
  * anywhere in that repository.
  */
 export function projectIdFor(dir) {
-  return projectKey(dir ? repoRoot(dir) || path.resolve(dir) : '');
+  // The folder as given when it is not in a repository: the same input `memoryDirFor` keys.
+  return projectKey(dir ? repoRoot(dir) || dir : '');
 }
 
 /**

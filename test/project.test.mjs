@@ -55,6 +55,11 @@ test('a worktree and a subfolder have their repository\'s key and stand in for i
   assert.equal(paths.projectIdFor(path.join(tmp, 'elsewhere')), paths.projectKey(path.join(tmp, 'elsewhere')));
   assert.equal(paths.stableDir(path.join(wt, 'src')), path.join(main, 'src'));
   assert.equal(paths.stableDir(main), main);
+  // Outside git the folder is keyed as given, exactly like its memory directory: resolving
+  // it first would add a drive letter on Windows to a path Claude Code keyed without one.
+  // (On Windows this is what failed: '/tmp/not-a-repo' became 'D--tmp-not-a-repo'.)
+  assert.equal(paths.projectIdFor('/tmp/not-a-repo'), paths.projectKey('/tmp/not-a-repo'));
+  assert.equal(paths.projectIdFor('/tmp/not-a-repo'), path.basename(path.dirname(paths.memoryDirFor({ cwd: '/tmp/not-a-repo' }))));
 });
 
 test('a notice from a session in a worktree reaches the next session in the repository', () => {
