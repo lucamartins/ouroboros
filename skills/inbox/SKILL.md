@@ -75,7 +75,7 @@ If the user answers with a comment or question, discuss it — that is the point
 | Fix it now (suggestion) | do the fix as normal work (the project's own rules for commits and pushes apply), then `done <sg:key>` |
 | Already fixed / Dismiss | `done <sg:key>` / `dismiss <sg:key> --reason "…"` |
 
-**Editing.** Write the user's version, run `preview <key>` with it on stdin, show the resulting diff **in your message** and confirm, then run `edit <key>` with the same JSON. Pass JSON on stdin with a quoted heredoc (or `--file <temp path>`):
+**Editing.** Write the user's version, run `preview <key>` with it on stdin, show the resulting diff **in your message** and confirm, then run `edit <key>` with the same JSON. Prefer writing the JSON to a file in your scratchpad or temp directory and passing `--file <path>` (braces and quotes in a shell command trip Claude Code's command check); a quoted heredoc on stdin also works:
 
 ```bash
 node --no-warnings "${CLAUDE_PLUGIN_ROOT}/scripts/inbox.mjs" edit cs:22 --data "${CLAUDE_PLUGIN_DATA}" <<'JSON'

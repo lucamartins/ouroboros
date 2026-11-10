@@ -3,7 +3,7 @@
 // that backs it: the owners a topic already has, and the home of a preference that is
 // valid on every project but only matters for one topic or one kind of file.
 import path from 'node:path';
-import { buildIndex, tokenize } from './knowledge.mjs';
+import { buildIndex, ownersMap, tokenize } from './knowledge.mjs';
 import { claudeDir } from './paths.mjs';
 
 /**
@@ -23,32 +23,59 @@ export function destinationsText() {
 }
 
 const OWNER_KINDS = ['skill', 'rules', 'instructions'];
-const MIN_SCORE = 4;
 const MIN_SHARED_TERMS = 3;
 
+/** Singular form of a word, roughly: enough to see "commits" and "commit" as one topic. */
+function stem(t) {
+  return t.length > 3 ? t.replace(/(?:ies)$/, 'y').replace(/(?:es|s)$/, '') : t;
+}
+
 /**
- * Files Claude already reads that speak about what `text` says: candidates to own it.
- * A hit must share several distinct terms with the text, not just rank first, so an
- * unrelated file never blocks a new item. Returns [{ file, kind, heading, excerpt, shared }].
+ * Skills and rule files whose NAME is the topic ("commits" → skill `commit`, "code
+ * review" → `code-review`): they own it even when the new item shares no word with
+ * what they say today.
  */
-export function findOwners(text, cwd, { exclude = [], limit = 3 } = {}) {
-  const terms = [...new Set(tokenize(text))];
-  if (terms.length < MIN_SHARED_TERMS) return [];
-  const need = Math.max(MIN_SHARED_TERMS, Math.ceil(terms.length * 0.34));
+function ownersByTopic(topic, cwd, skip) {
+  const want = [...new Set(tokenize(String(topic || '').replace(/[-_/]+/g, ' ')).map(stem))];
+  if (!want.length) return [];
+  return ownersMap(cwd)
+    .filter((o) => !skip.has(path.resolve(o.file).toLowerCase()))
+    .filter((o) => {
+      const name = new Set(tokenize(String(o.name).replace(/[-_/:]+/g, ' ')).map(stem));
+      return want.every((t) => name.has(t));
+    })
+    .map((o) => ({ file: path.resolve(o.file), kind: o.kind, heading: '', excerpt: `${o.name}: ${o.description}`.slice(0, 240), shared: want, byTopic: true }));
+}
+
+/**
+ * Files Claude already reads that own what `text` says: by topic (the name of a skill
+ * or rule file is the item's `topic`), or by content (a passage shares at least half of
+ * the item's distinct terms, three at least). The search engine only ranks: its score
+ * depends on how much knowledge there is, so it is not a threshold (with three files
+ * every score is low, and an owner was never found). Returns [{ file, kind, heading, excerpt, shared }].
+ */
+export function findOwners(text, cwd, { exclude = [], limit = 3, topic = '' } = {}) {
   const skip = new Set(exclude.filter(Boolean).map((f) => path.resolve(f).toLowerCase()));
   const seen = new Set();
   const out = [];
+  for (const o of ownersByTopic(topic, cwd, skip)) {
+    if (seen.has(o.file)) continue;
+    seen.add(o.file);
+    out.push(o);
+  }
+  const terms = [...new Set(tokenize(text))];
+  if (terms.length < MIN_SHARED_TERMS) return out.slice(0, limit);
+  const need = Math.max(MIN_SHARED_TERMS, Math.ceil(terms.length * 0.5));
   for (const hit of buildIndex(cwd).search(text, 12, { kinds: OWNER_KINDS })) {
     const file = path.resolve(hit.file);
-    if (hit.score < MIN_SCORE || skip.has(file.toLowerCase()) || seen.has(file)) continue;
+    if (out.length >= limit || skip.has(file.toLowerCase()) || seen.has(file)) continue;
     const have = new Set(tokenize(`${hit.heading} ${hit.text}`));
     const shared = terms.filter((t) => have.has(t));
     if (shared.length < need) continue;
     seen.add(file);
     out.push({ file, kind: hit.kind, heading: hit.heading || '', excerpt: hit.text.replace(/\s+/g, ' ').trim().slice(0, 240), shared });
-    if (out.length >= limit) break;
   }
-  return out;
+  return out.slice(0, limit);
 }
 
 export function userRulesDir() {

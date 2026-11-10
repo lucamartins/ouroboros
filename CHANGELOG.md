@@ -8,6 +8,7 @@ All notable changes to Ouroboros. Versions follow [semantic versioning](https://
 - An end-of-session learning must point at something real: a turn of yours that was reviewed, or a recorded failure-then-success. One that points at nothing waits for your approval instead of being written, whatever the autonomy.
 - Robustness: a long knowledge check keeps its lock while it runs; on Windows the reviewer also works when Claude Code was installed with npm; capture events older than 400 days are deleted (use counts and the undo ledger are kept).
 - `npm test` runs the suite (a bare `node --test` hangs on the fixtures).
+- 0.20.1: found by running against the real model. The check that tells Claude "a file already covers this" found nothing on small setups and let a duplicate preference skill through; it now also recognizes a skill or rule file named after the topic. The `learn` and `inbox` skills pass their JSON as a file, which no longer trips Claude Code's command check.
 
 ## 0.19.0 — 2026-11-10
 

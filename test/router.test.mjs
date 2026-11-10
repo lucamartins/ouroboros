@@ -133,3 +133,27 @@ test('the reviewer, the screen and the learn skill carry the same destinations',
   assert.ok(worker.LEARN_SCHEMA.properties.items.items.properties.kind.enum.includes('preference'));
   assert.ok(triage.TRIAGE_SCHEMA.properties.verdicts.items.properties.rewrite.properties.kind.enum.includes('preference'));
 });
+
+test('an owner is found whatever the size of the knowledge, and by topic when no word is shared', async () => {
+  // Three files in all: the search score is low everywhere, and used to hide every owner.
+  const small = path.join(tmp, 'small');
+  const prev = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = path.join(small, 'claude');
+  try {
+    fs.mkdirSync(path.join(small, 'claude', 'skills', 'commit'), { recursive: true });
+    fs.mkdirSync(path.join(small, 'proj', '.git'), { recursive: true });
+    fs.writeFileSync(path.join(small, 'claude', 'CLAUDE.md'), '# Global instructions\n\n- Be concise.\n');
+    const skill = path.join(small, 'claude', 'skills', 'commit', 'SKILL.md');
+    fs.writeFileSync(skill, '---\nname: commit\ndescription: Write git commits for this user. Use when committing changes.\n---\n\n# Commit\n\n## Message format\n\n- Use the conventional commits format with a scope.\n- Keep the subject line under 50 characters.\n');
+    const cwd = path.join(small, 'proj');
+    assert.deepEqual(router.findOwners('Keep the commit subject line under 50 characters.', cwd).map((o) => o.file), [skill], 'by content');
+    const byTopic = router.findOwners('Sign every one with the GPG key', cwd, { topic: 'Commits' });
+    assert.deepEqual(byTopic.map((o) => [o.file, o.byTopic]), [[skill, true]], 'by topic: the skill is named after it');
+    assert.deepEqual(router.findOwners('Sign every one with the GPG key', cwd, { topic: 'code review' }), []);
+    const [held] = curator.apply(db, { cwd, items: [{ kind: 'preference', topic: 'commits', text: 'Sign every one with the GPG key', confidence: 0.8 }] }, { actor: 'inloop', autonomy: 'auto', ownerCheck: true });
+    assert.equal(held.status, 'has_owner');
+    assert.ok(!fs.existsSync(path.join(small, 'claude', 'skills', 'learned-prefs-commits')));
+  } finally {
+    process.env.CLAUDE_CONFIG_DIR = prev;
+  }
+});

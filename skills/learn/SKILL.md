@@ -17,7 +17,7 @@ node --no-warnings "${CLAUDE_PLUGIN_ROOT}/scripts/curator.mjs" inventory --data 
 
 When the session already has reviews behind it, the output ends with **This session so far**: what they saved, queued or did not save, and what they left open. Do not save those again; when the conversation since then refines, extends or contradicts one of them, patch that file instead of creating a new item.
 
-The inventory lists names and descriptions only. Before saving anything, **search the full text** of what the project already documents — CLAUDE.md files, `.claude/rules/`, skill bodies and memories — for the key terms of each item (tool names, commands, identifiers), e.g. `grep -ril "<term>" CLAUDE.md */CLAUDE.md */.claude/rules ~/.claude/skills/*/SKILL.md`. Most lessons from a project end up in its rules or skills; if it is already there, do not save it again, and if the skill that owns the procedure lacks a detail, **patch that skill** instead of creating a memory.
+The inventory lists names and descriptions only. Before saving anything, **search the full text** of what the project already documents — its CLAUDE.md files, `.claude/rules/` and project skills — for the key terms of each item (tool names, commands, identifiers), e.g. `grep -ril "<term>" CLAUDE.md */CLAUDE.md .claude/rules .claude/skills`. Files outside the project (your global CLAUDE.md, personal skills and rules) may not be searchable from here: the apply step checks them for you and answers `has_owner` with the file and the passage. Most lessons from a project end up in its rules or skills; if it is already there, do not save it again, and if the skill that owns the procedure lacks a detail, **patch that skill** instead of creating a memory.
 
 ## 2. Decide what is worth keeping
 
@@ -57,10 +57,15 @@ A reusable **procedure** (a multi-step workflow, the working path after errors, 
 
 ## 4. Apply
 
-Pass the proposals as JSON on stdin with a quoted heredoc (or write them to a temp file and use `--file <path>`):
+Write the proposals as JSON to a file in your scratchpad or temp directory (Write tool), then pass it with `--file`. Do not pipe the JSON through a heredoc: braces and quotes in a shell command trip Claude Code's command check and cost a permission prompt or a retry.
 
 ```bash
-node --no-warnings "${CLAUDE_PLUGIN_ROOT}/scripts/curator.mjs" apply --data "${CLAUDE_PLUGIN_DATA}" <<'JSON'
+node --no-warnings "${CLAUDE_PLUGIN_ROOT}/scripts/curator.mjs" apply --data "${CLAUDE_PLUGIN_DATA}" --file "<path of the JSON file>"
+```
+
+The file:
+
+```json
 {
   "cwd": "<current working directory>",
   "memory_dir": "<your auto-memory directory, if known>",
@@ -84,7 +89,6 @@ node --no-warnings "${CLAUDE_PLUGIN_ROOT}/scripts/curator.mjs" apply --data "${C
     { "op": "patch", "target": "<absolute path of a rule file or memory>", "old": "<exact outdated text>", "new": "<corrected text>", "corrects": true }
   ]
 }
-JSON
 ```
 
 Fields: `topic` (preferences: one or two words naming what it is about; preferences on the same topic share one file), `paths` (preferences: globs, only when it matters just for those files), `title` (short; for a patch, what the patch teaches, not the file's name), `why` (one line: what happened in the session that taught it — the user shows it in the dashboard next to the change), `description` (one line; ≤ 250 chars for skills — say *when to use it*), `body` (memories: the fact plus **Why** / **How to apply**; skills: steps and pitfalls), `confidence` 0.3 tentative … 0.9 near-certain, `project_dir` (the repo the item is about; defaults to `cwd`). Write learnings in the language your Ouroboros session context asks for (English by default), with short human-readable titles.

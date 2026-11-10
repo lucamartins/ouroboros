@@ -778,7 +778,9 @@ export function apply(db, payload, { actor = 'manual', autonomy = 'auto', ownerC
     // curator looks: when one speaks about the same thing, Claude reads it and patches it
     // (or says it checked). The end-of-session path has the screen for this.
     if (ownerCheck && !raw.owner_checked && item.kind !== 'skill' && (item.op === 'create' || item.globalFact || item.prefText)) {
-      const owners = findOwners([item.title, item.prefText || item.globalFact || item.description, item.body].filter(Boolean).join(' '), item.projectDir, { exclude: [item.target, item.prefFile] });
+      // The statement itself, without the body: a long body would ask for more shared words than any passage has.
+      const said = [...new Set([item.title, item.prefText || item.globalFact || item.description].filter(Boolean))].join(' ');
+      const owners = findOwners(said, item.projectDir, { exclude: [item.target, item.prefFile], topic: item.kind === 'preference' || item.prefText ? item.topic : '' });
       if (owners.length) {
         results.push({
           status: 'has_owner', title: item.title, owners: owners.map((o) => ({ file: o.file, kind: o.kind, heading: o.heading, excerpt: o.excerpt })),
