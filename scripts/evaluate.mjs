@@ -15,7 +15,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { options } from './config.mjs';
-import { apply as curatorApply, DUPLICATE_THRESHOLD, similarity } from './curator.mjs';
+import { apply as curatorApply, DUPLICATE_THRESHOLD, interimOf, learnMeanwhile, retireInterim, similarity } from './curator.mjs';
 import { applyChangeset, applyEdits, changesetNeedsApproval, claimsOf, fileDisplayName, getChangeset, pendingChangeset, saveChangeset } from './changesets.mjs';
 import { acquireLease, assertBudget, BudgetError, logError, releaseLease, renewLease } from './db.mjs';
 import { buildIndex, groundIdentifiers, identifiersIn, knowledgeFiles, knowledgeKind, PATCHABLE, resolveOwner, tokenize } from './knowledge.mjs';
@@ -159,16 +159,17 @@ const ELSEWHERE_MAX = 8;
  * What OTHER knowledge files say about the claims (the assistant reads those too): a
  * claim another file already covers must not be copied into this one.
  */
-export function elsewhereFor(file, claims, cwd) {
+export function elsewhereFor(file, claims, cwd, exclude = []) {
   const index = buildIndex(cwd);
   const self = path.resolve(file).toLowerCase();
+  const skip = new Set(exclude.map((f) => path.resolve(f).toLowerCase()));
   const seen = new Set();
   const out = [];
   for (const c of claims) {
     let taken = 0;
     for (const hit of index.search(c.claim, ELSEWHERE_PER_CLAIM + 3)) {
       if (taken >= ELSEWHERE_PER_CLAIM) break;
-      if (path.resolve(hit.file).toLowerCase() === self || hit.score < 3) continue;
+      if (path.resolve(hit.file).toLowerCase() === self || skip.has(path.resolve(hit.file).toLowerCase()) || hit.score < 3) continue;
       const key = `${hit.file}#${hit.heading}#${hit.text.slice(0, 40)}`;
       if (seen.has(key)) continue;
       seen.add(key);
@@ -184,13 +185,13 @@ export function elsewhereFor(file, claims, cwd) {
  * Stage 3+4 for one file: the editor judges every claim and writes edits; code keeps
  * the safe ones. Returns { status: Map(id -> {status, reason}), applied, rejected, base, cost }.
  */
-export async function composeFile({ file, claims, cwd, model }) {
+export async function composeFile({ file, claims, cwd, model, exclude = [] }) {
   const base = fs.readFileSync(file, 'utf8');
   const kind = knowledgeKind(file);
   const all = claims.map((c) => c.claim).join('\n');
   const grounding = groundIdentifiers(identifiersIn(all), cwd);
   const view = fileView(base, all);
-  const elsewhere = elsewhereFor(file, claims, cwd);
+  const elsewhere = elsewhereFor(file, claims, cwd, exclude);
   const result = await runModel({ prompt: editorPrompt({ file, kind, view, claims, grounding, elsewhere }), schema: EDITOR_SCHEMA, model });
   const out = result.structured_output;
   const status = new Map();
@@ -282,7 +283,10 @@ export async function composeRoutes(db, routes, ctx) {
     try {
       assertBudget(db, options().monthlyBudgetUsd);
       ctx.tick?.();
-      composed = await composeFile({ file, claims, cwd: ctx.cwd, model: ctx.model });
+      // The memories standing in for these claims are not "another file that already says
+      // it": they exist only until this change is decided.
+      const standIns = claims.map((c) => interimOf(db, c.id)?.path).filter(Boolean);
+      composed = await composeFile({ file, claims, cwd: ctx.cwd, model: ctx.model, exclude: standIns });
     } catch (err) {
       if (!(err instanceof BudgetError)) logError(db, 'evaluate:editor', err);
       // Leave them waiting: the next queue check tries again.
@@ -315,6 +319,7 @@ export async function composeRoutes(db, routes, ctx) {
       } else if (s.status === 'contradicted') {
         report.contradicted++;
         setOutcome(db, c.id, 'dropped', `unverified [editor]: ${s.reason}`, { target: file, changeset_id: null });
+        retireInterim(db, c.id); // the project says otherwise: its stand-in memory goes too
       } else if (s.status === 'conflict') {
         report.conflicts++;
         report.results.push({ status: 'conflict', title: c.title });
@@ -347,8 +352,23 @@ export async function composeRoutes(db, routes, ctx) {
       }
     }
     report.queued++;
-    const titles = claims.filter((c) => inChangeset.includes(c.id)).map((c) => c.title).filter(Boolean);
-    report.results.push({ status: 'queued', title: `${titles.slice(0, 2).join('; ')}${titles.length > 2 ? ` (+${titles.length - 2})` : ''} → ${fileDisplayName(file)}`, changesetId: csId });
+    // Learn now, promote on approval: pure additions to a project's CLAUDE.md or rule
+    // file are saved as project memories while the change waits.
+    // The notice reports what THIS evaluation did: a learning saved meanwhile is learned
+    // (said once, when it is saved); only what is new and merely waiting is "waiting".
+    const waitingTitles = [];
+    for (const c of claims.filter((x) => inChangeset.includes(x.id))) {
+      const isFresh = fresh.some((f) => f.id === c.id);
+      if (interimOf(db, c.id)) continue;
+      const s = composed.status.get(c.id);
+      const rewrites = composed.applied.some((e) => (e.corrects || e.rewrites) && e.claims.includes(c.id));
+      const row = db.prepare('SELECT session_id FROM candidates WHERE id = ?').get(c.id);
+      const saved = s?.status === 'adds' && !rewrites
+        && learnMeanwhile(db, { candidateId: c.id, file, title: c.title, claim: c.claim, evidence: c.evidence, cwd: ctx.cwd, confidence: c.confidence, sessionId: row?.session_id, actor: ctx.actor, autonomy: ctx.autonomy });
+      if (saved) report.results.push({ status: 'created', title: `${c.title} (a project memory for now; proposed for ${fileDisplayName(file)})`, candidateId: c.id });
+      else if (isFresh && c.title) waitingTitles.push(c.title);
+    }
+    if (waitingTitles.length) report.results.push({ status: 'queued', title: `${waitingTitles.slice(0, 2).join('; ')}${waitingTitles.length > 2 ? ` (+${waitingTitles.length - 2})` : ''} → ${fileDisplayName(file)}`, changesetId: csId });
   }
   return report;
 }

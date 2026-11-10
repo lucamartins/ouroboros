@@ -636,6 +636,8 @@ function commitText(db, batch, t, after, item) {
       batch.write(indexFile, withIndexLine(indexText, indexLine(title, fileName, item.description), fileName), { learningId: id, op: 'patch' });
     }
   }
+  // A stand-in memory that was just refined: the change waiting for the real file follows it.
+  if (t.kind === 'memory' && existing) syncInterim(db, id, t.file);
   const { data } = parseFrontmatter(after);
   upsertLearning(db, {
     id, kind: t.kind, scope: existing?.scope || (t.kind === 'memory' ? 'project' : 'global'), memory_type: data.metadata?.type,
@@ -776,13 +778,14 @@ function enqueue(db, rawItem, payload, actor) {
 }
 
 /** Apply a batch of proposals. Each item succeeds or fails on its own. */
-export function apply(db, payload, { actor = 'manual', autonomy = 'auto', ownerCheck = false } = {}) {
+export function apply(db, payload, { actor = 'manual', autonomy = 'auto', ownerCheck = false, promote = true } = {}) {
   ensureSettingsFile();
   const settings = loadSettings();
   const items = Array.isArray(payload?.items) ? payload.items : [];
   const results = [];
   for (const raw of items) {
-    const item = promoteToGlobal(normalizeItem(raw, payload || {}), payload || {});
+    const normalized = normalizeItem(raw, payload || {});
+    const item = promote ? promoteToGlobal(normalized, payload || {}) : normalized;
     if (containsSecret(item.title, item.description, item.body, item.text, item.new)) {
       results.push({ status: 'rejected', title: item.title, reason: 'looks like it contains a secret (token, key or password); never store secrets' });
       continue;
@@ -832,9 +835,17 @@ export function apply(db, payload, { actor = 'manual', autonomy = 'auto', ownerC
         }
         // A change to an existing file joins that file's pending changeset.
         const q = queueEdit(db, item, payload || {}, actor);
+        // Learn now, promote on approval: an addition to a project's CLAUDE.md or rule
+        // file is active at once as a project memory while the change waits.
+        const added = item.corrects ? '' : item.append !== undefined ? String(item.append) : isInsertion(String(item.old ?? ''), String(item.new ?? '')) ? String(item.new).replace(String(item.old).trimEnd(), '') : '';
+        const meanwhile = added.trim() ? learnMeanwhile(db, {
+          candidateId: q.id, file: item.target, title: item.title, claim: added, evidence: item.why || item.evidence,
+          cwd: item.projectDir, confidence: item.confidence, sessionId: payload?.session_id, actor, autonomy,
+        }) : null;
         results.push({
           status: 'queued', title: item.title || path.basename(item.target), candidateId: q.id, changesetId: q.changesetId, recompose: q.recompose || undefined,
-          reason: q.recompose ? 'waiting for approval; composed together with the change already waiting for this file' : waitReason(item, actor, autonomy),
+          reason: `${q.recompose ? 'waiting for approval; composed together with the change already waiting for this file' : waitReason(item, actor, autonomy)}${meanwhile ? '. Active now as a project memory until you decide' : ''}`,
+          ...(meanwhile ? { meanwhile: meanwhile.path } : {}),
         });
         continue;
       }
@@ -849,6 +860,85 @@ export function apply(db, payload, { actor = 'manual', autonomy = 'auto', ownerC
   }
   if (results.some((r) => r.status === 'created' || r.status === 'patched')) setMetaOnce(db, 'learning_enabled_at', Date.now());
   return results;
+}
+
+// ---------- learn now, promote on approval ----------
+
+function candidatePayload(db, id) {
+  try { return JSON.parse(db.prepare('SELECT payload FROM candidates WHERE id = ?').get(id)?.payload || '{}'); } catch { return {}; }
+}
+
+/** The project memory standing in for a candidate that waits to enter a CLAUDE.md or rule file, if any. */
+export function interimOf(db, candidateId) {
+  const id = candidatePayload(db, candidateId).interim;
+  return id ? db.prepare("SELECT * FROM learnings WHERE id = ? AND status = 'active'").get(id) || null : null;
+}
+
+/**
+ * A rule about one project usually belongs in that project's CLAUDE.md or a rule file,
+ * and additions to those always wait for the user (people wrote them, the team shares
+ * them). Waiting used to mean Claude did not know the rule until someone opened the
+ * inbox: the user repeated corrections that were sitting there. So the rule is saved at
+ * once as a project memory (the same autonomy rules as any new memory), and the waiting
+ * change becomes a question about where it lives: approving writes the line and
+ * retires the memory; rejecting keeps the memory. Only for additions to a project's
+ * file: corrections change what a file says, and the global CLAUDE.md has no project
+ * memory to stand in for it.
+ */
+export function learnMeanwhile(db, { candidateId, file, title, claim, evidence, cwd, confidence = 0.6, sessionId, actor = 'background', autonomy = 'auto' }) {
+  const target = path.resolve(String(file || ''));
+  if (!cwd || !['rules', 'instructions'].includes(knowledgeKind(target))) return null;
+  if (normalize(target).startsWith(`${normalize(path.resolve(claudeDir()))}/`)) return null; // the user's global files
+  if (interimOf(db, candidateId)) return null;
+  const conf = Math.min(0.9, Math.max(0.3, Number(confidence) || 0.6));
+  if (needsApproval({ op: 'create', kind: 'memory', confidence: conf }, actor === 'manual' ? 'inloop' : actor, autonomy)) return null;
+  const text = String(claim || '').replace(/^\s*[-*]\s+/, '').trim();
+  if (text.length < 8) return null;
+  const one = text.replace(/\s+/g, ' ');
+  const [r] = apply(db, { cwd, session_id: sessionId, trigger: 'session_end', items: [{
+    op: 'create', kind: 'memory', scope: 'project', memory_type: 'feedback', project_dir: cwd,
+    title: String(title || one).slice(0, 120), description: one.length > 200 ? `${one.slice(0, 197)}…` : one,
+    body: `${text}\n\n**Why:** ${String(evidence || 'stated in a session').replace(/\s+/g, ' ').slice(0, 300)}\n**How to apply:** follow it in this project. It is also proposed as a line for ${path.basename(target)}; this note is retired when that change is approved.`,
+    confidence: conf, why: evidence,
+  }] }, { actor: actor === 'manual' ? 'inloop' : actor, autonomy, promote: false });
+  if (r?.status !== 'created') return null;
+  db.prepare('UPDATE candidates SET payload = ? WHERE id = ?').run(JSON.stringify({ ...candidatePayload(db, candidateId), interim: r.id }), candidateId);
+  return { id: r.id, path: r.path };
+}
+
+/** What a stand-in memory says now: its body up to the "Why" line (it may have been refined since). */
+export function interimText(file) {
+  const text = readOrNull(file);
+  if (text === null) return null;
+  const body = parseFrontmatter(text).body.split(/\n\s*\*\*Why:\*\*/)[0].trim();
+  return body || null;
+}
+
+/**
+ * A write landed on a memory that stands in for a waiting change (it was refined: an
+ * exception, a correction). The waiting claim takes the memory's current text, and its
+ * change is composed again, so approving it later never writes the older wording.
+ */
+export function syncInterim(db, learningId, file) {
+  if (!learningId) return 0;
+  const said = interimText(file);
+  if (!said) return 0;
+  let n = 0;
+  for (const c of db.prepare("SELECT id, changeset_id, claim, payload FROM candidates WHERE outcome = 'queued' AND payload LIKE ?").all(`%"interim":"${learningId}"%`)) {
+    if (String(c.claim || '').trim() === said) continue;
+    db.prepare('UPDATE candidates SET claim = ?, summary = ? WHERE id = ?').run(said.slice(0, 2000), said.slice(0, 1500), c.id);
+    if (c.changeset_id) db.prepare("UPDATE changesets SET status = 'stale', note = ? WHERE id = ? AND status = 'pending'").run('the memory standing in for one of its learnings was refined; composing again', c.changeset_id);
+    n++;
+  }
+  return n;
+}
+
+/** Retire the stand-in memory of a candidate (its line was written, or the claim turned out wrong). */
+export function retireInterim(db, candidateId) {
+  const l = interimOf(db, candidateId);
+  if (!l) return null;
+  const r = forget(db, { match: l.id });
+  return r.status === 'archived' ? l.id : null;
 }
 
 // ---------- approval queue and confirmation ----------

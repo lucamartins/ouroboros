@@ -6,7 +6,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { appendToSection, containsSecret, createdByOuroboros, needsApproval, ownUntouched, setDescription, writeText } from './curator.mjs';
+import { appendToSection, containsSecret, createdByOuroboros, interimOf, needsApproval, ownUntouched, retireInterim, setDescription, writeText } from './curator.mjs';
 import { parseFrontmatter } from './inventory.mjs';
 import { knowledgeKind } from './knowledge.mjs';
 import { projectIdFor } from './paths.mjs';
@@ -212,6 +212,8 @@ export function applyChangeset(db, id, { actor = 'manual' } = {}) {
   db.prepare("UPDATE changesets SET status = 'applied', decided_at = ?, learning_id = ?, batch = ?, note = COALESCE(?, note) WHERE id = ?")
     .run(now, r.id, r.batch, rebased ? 'applied on top of a newer version of the file' : null, id);
   db.prepare("UPDATE candidates SET outcome = 'patched', learning_id = ?, decided_at = ? WHERE changeset_id = ? AND outcome = 'queued'").run(r.id, now, id);
+  // The line is in the file now: the memories that stood in for it meanwhile are retired.
+  for (const c of claims) retireInterim(db, c.id);
   return { ...r, status: 'patched', title: r.title || path.basename(cs.file), claims: claims.length, rebased };
 }
 
@@ -273,6 +275,6 @@ export function changesetView(db, cs) {
     status: cs.status, created_at: cs.created_at, changed: current === null || hashText(current) !== cs.base_hash,
     session_started_at: claims.reduce((m, c) => Math.min(m, c.session_started_at || c.ts), Infinity),
     edits: JSON.parse(cs.edits),
-    claims: claims.map((c) => ({ id: c.id, title: c.title, claim: c.claim || c.summary, evidence: c.evidence, note: c.note, confidence: c.confidence, session_started_at: c.session_started_at })),
+    claims: claims.map((c) => ({ id: c.id, title: c.title, claim: c.claim || c.summary, evidence: c.evidence, note: c.note, confidence: c.confidence, session_started_at: c.session_started_at, meanwhile: interimOf(db, c.id)?.path || null })),
   };
 }

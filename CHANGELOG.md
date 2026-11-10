@@ -2,6 +2,13 @@
 
 All notable changes to Ouroboros. Versions follow [semantic versioning](https://semver.org/) (pre-1.0: a minor version may change behavior). The reasoning behind each change is in [DESIGN.md](DESIGN.md).
 
+## 0.22.0 — 2026-11-10
+
+- Learn now, promote on approval. A rule about a project that belongs in its CLAUDE.md or a rule file still waits for your approval before that file changes, but Claude knows it from the next session: it is saved at once as a project memory. Approving writes the line and retires the memory; rejecting keeps the memory. Until now such rules did nothing until you opened the inbox, and you could find yourself repeating a correction that was waiting there.
+- If that memory is refined before you decide (an exception, a correction), the change waiting for the file is updated too.
+- The session-start notice says what was learned once, and no longer repeats everything that is waiting after each review.
+- Not for corrections of what a file says, the global CLAUDE.md, or the `queue` setting: those wait as before.
+
 ## 0.21.0 — 2026-11-10
 
 - In `auto`, Ouroboros refines a memory it wrote itself without asking, as long as you never edited that file: a later turn or session that extends or corrects it updates it directly (undoable). A file you touched by hand, anything you wrote, and every CLAUDE.md or rule file of yours still wait for approval; `hybrid` and `queue` are unchanged.

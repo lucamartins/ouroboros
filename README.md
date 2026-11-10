@@ -54,7 +54,7 @@ Everything else is automatic: capture hooks record turns, tool calls, error → 
 
 | Learning | Destination |
 |---|---|
-| Something a skill, rule file or CLAUDE.md already covers | an addition to that file (a correction, or a change to a CLAUDE.md or a rule file you wrote, waits for your approval) |
+| Something a skill, rule file or CLAUDE.md already covers | an addition to that file (a correction, or a change to a CLAUDE.md or a rule file you wrote, waits for your approval; a rule waiting for a project file is active meanwhile as a project memory) |
 | A preference valid everywhere that matters for one topic (commits, code review, a tool) | `~/.claude/skills/learned-prefs-<topic>/`, a personal skill loaded when the topic comes up |
 | A preference valid everywhere that matters for certain files (a language, a file type) | `~/.claude/rules/learned-<topic>.md`, a rule loaded with those files |
 | Who you are and how you work, relevant in every session (language, OS, shell) | an addition to your global `~/.claude/CLAUDE.md`, under the section it belongs to, after your approval |

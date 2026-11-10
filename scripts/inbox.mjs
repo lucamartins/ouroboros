@@ -11,7 +11,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDb } from './db.mjs';
 import { applyChangeset, applyEdits, claimsOf, fileDisplayName, getChangeset, hashText, rejectChangeset } from './changesets.mjs';
-import { containsSecret, decideQueued, writeText } from './curator.mjs';
+import { containsSecret, decideQueued, interimOf, writeText } from './curator.mjs';
 import { options } from './config.mjs';
 import { knowledgeKind } from './knowledge.mjs';
 import { dataDir, memoryDirFor, projectIdFor } from './paths.mjs';
@@ -308,6 +308,7 @@ export function showEntry(db, key, { project } = {}) {
       `File: ${shortPath(cs.file)}`,
       `What it is: ${describeFile(cs.file)}`,
       `Waited because: ${waitedBecause({ corrects: cs.corrects, file: cs.file, kind: cs.kind, confidence, autonomy, backfill })}`,
+      claims.some((c) => interimOf(db, c.id)) ? `Meanwhile: already active as a project memory (${claims.map((c) => interimOf(db, c.id)).filter(Boolean).map((l) => shortPath(l.path)).join(', ')}). Approving writes the line here and retires the memory; rejecting keeps the memory.` : null,
       cs.note && cs.status === 'stale' ? `Note: ${oneLine(cs.note, 300)}` : null,
       '',
       `What it teaches (${claims.length} learning${claims.length > 1 ? 's' : ''}):`,

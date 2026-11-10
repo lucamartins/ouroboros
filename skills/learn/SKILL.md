@@ -98,7 +98,7 @@ Fields: `topic` (preferences: one or two words naming what it is about; preferen
 The first lines are a human summary; the last line is JSON.
 
 - `created` / `patched` → tell the user one line per item: `📝 learned: <title>` (or `📝 updated: …`).
-- `queued` → the user's autonomy setting holds it for approval: say `⏳ waiting for approval: <title>` (decide with `/ouroboros:inbox` or in `/ouroboros:dashboard`).
+- `queued` → it waits for approval (decide with `/ouroboros:inbox` or in `/ouroboros:dashboard`). When the result says it is *active now as a project memory* (an addition to the project's CLAUDE.md or a rule file), say `📝 learned: <title> (as a project memory; also proposed for <file>)`: it already applies, and approving only moves it into the file. Otherwise say `⏳ waiting for approval: <title>`.
 - `has_owner` → a file Claude already reads speaks about this topic (the result names it, with the excerpt). Read that file: if it already says it, drop the item; if it lacks the detail, re-submit as a `patch` to it; only if the topic really belongs elsewhere, re-submit the same item with `"owner_checked": true`.
 - `duplicate` → read the existing item it names and, if the new information adds something, re-submit as a `patch` to that target.
 - `over_budget` → consolidate first: merge or shorten items with patches, or archive a stale one with `/ouroboros:forget`, then retry.
