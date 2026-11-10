@@ -82,6 +82,32 @@ export function repoRoot(dir) {
   }
 }
 
+/**
+ * The key of the project a directory belongs to: its repository's main checkout (so
+ * worktrees and subfolders are one project, as for auto memory and the dashboard) or,
+ * outside git, the directory itself. Sessions, proposals, changes and notices are all
+ * keyed with this, so a notice from a session in a worktree reaches the next session
+ * anywhere in that repository.
+ */
+export function projectIdFor(dir) {
+  return projectKey(dir ? repoRoot(dir) || path.resolve(dir) : '');
+}
+
+/**
+ * The same directory in the repository's main checkout. A linked worktree is a
+ * temporary copy: knowledge read from it or written into it (a project skill, a change
+ * to its CLAUDE.md) would be lost with it, so the main checkout stands in for it.
+ */
+export function stableDir(dir) {
+  if (!dir) return dir;
+  const here = path.resolve(dir);
+  const root = gitRoot(here);
+  const main = repoRoot(here);
+  if (!root || !main || path.resolve(root) === path.resolve(main)) return here;
+  const mapped = path.join(main, path.relative(root, here));
+  return fs.existsSync(mapped) ? mapped : main;
+}
+
 function settingsValue(file, key) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8'))[key] ?? null; } catch { return null; }
 }

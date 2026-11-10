@@ -16,7 +16,7 @@ import { applyChangeset, applyEdits, claimsOf, pendingChangeset, queueEdit, reje
 import { getMeta, logError, openDb, setMetaOnce } from './db.mjs';
 import { listMemories, listMemoriesIn, listSkills, parseFrontmatter } from './inventory.mjs';
 import { knowledgeKind, PATCHABLE } from './knowledge.mjs';
-import { claudeDir, classifyPath, ensureGlobalInstructions, gitRoot, memoryDirFor, normalize, ouroborosDir, projectKey } from './paths.mjs';
+import { claudeDir, classifyPath, ensureGlobalInstructions, gitRoot, memoryDirFor, normalize, ouroborosDir, projectIdFor, repoRoot } from './paths.mjs';
 import { cleanPaths, findOwners, preferenceHome } from './router.mjs';
 import { addObservations, closeObservations, sessionStateText } from './session-state.mjs';
 import { ensureSettingsFile, expandHome, loadSettings, routeFor } from './settings.mjs';
@@ -327,8 +327,13 @@ function promoteToGlobal(item, payload) {
   return { ...globalFact({ ...item, kind: 'global', text: description }), promoted: elsewhere.project };
 }
 
+/** Where a project's own skills live: the repository's main checkout (a worktree is temporary), else the folder. */
+function projectRootOf(dir) {
+  return repoRoot(dir) || gitRoot(dir) || dir;
+}
+
 function skillsInScope(item, settings) {
-  const cwds = [item.projectDir];
+  const cwds = [projectRootOf(item.projectDir)];
   const out = listSkills(cwds);
   const route = routeFor(settings, item.projectDir);
   if (route) {
@@ -429,7 +434,7 @@ function createSkill(db, batch, item, settings) {
     dir = path.join(path.resolve(expandHome(route.skillsDir)), base);
     if (route.linkInto) link = path.join(path.resolve(expandHome(route.linkInto)), base);
   } else {
-    dir = path.join(gitRoot(item.projectDir) || item.projectDir, '.claude', 'skills', base);
+    dir = path.join(projectRootOf(item.projectDir), '.claude', 'skills', base);
   }
   const file = path.join(dir, 'SKILL.md');
   if (fs.existsSync(file) || (link && fs.existsSync(link))) return { status: 'duplicate', target: file, reason: `a skill named "${base}" already exists; patch it instead` };
@@ -439,7 +444,7 @@ function createSkill(db, batch, item, settings) {
   const id = newId();
   batch.write(file, renderSkill({ name: base, description, title, id, confidence: item.confidence, trigger: item.trigger, body: item.body }), { learningId: id, op: 'create' });
   if (link) batch.write(link, { link: dir }, { learningId: id, op: 'create' });
-  upsertLearning(db, { id, kind: 'skill', scope: item.scope, project: item.scope === 'project' ? projectKey(item.projectDir) : null, name: base, title, path: file, confidence: item.confidence, trigger: item.trigger });
+  upsertLearning(db, { id, kind: 'skill', scope: item.scope, project: item.scope === 'project' ? projectIdFor(item.projectDir) : null, name: base, title, path: file, confidence: item.confidence, trigger: item.trigger });
   return { status: 'created', id, kind: 'skill', path: file, title, warning: budgetWarning(active + 1, settings.limits.learnedSkills, settings, 'learned skills') };
 }
 
@@ -747,7 +752,7 @@ function enqueue(db, rawItem, payload, actor) {
   const r = db.prepare(`
     INSERT INTO candidates (review_id, session_id, project, kind, scope, memory_type, title, summary, evidence, confidence, outcome, payload, cwd, ts)
     VALUES (0, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
-  `).run(payload.session_id || actor, projectKey(item.projectDir), item.kind, item.scope, item.memory_type ?? null,
+  `).run(payload.session_id || actor, projectIdFor(item.projectDir), item.kind, item.scope, item.memory_type ?? null,
     String(item.title || item.text || item.target || '').slice(0, 200), String(item.text || item.body || item.new || item.description || '').slice(0, 1500),
     String(item.evidence || '').slice(0, 800), item.confidence, stored, payload.cwd || null, Date.now());
   return { id: Number(r.lastInsertRowid), replaced: false };

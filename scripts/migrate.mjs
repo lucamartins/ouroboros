@@ -9,7 +9,7 @@
 // file moves to ~/.ouroboros/archive/.
 import fs from 'node:fs';
 import path from 'node:path';
-import { ouroborosDir } from './paths.mjs';
+import { ouroborosDir, projectIdFor } from './paths.mjs';
 
 const ID_RE = /\s*<!--\s*lrn_[A-Za-z0-9]+\s*-->\s*$/;
 
@@ -59,4 +59,29 @@ export function retireProfile(db, now = Date.now()) {
     throw err;
   }
   return facts.length;
+}
+
+/**
+ * v0.18: projects are keyed by repository, not by folder. Rows written before are
+ * re-keyed once from the folder they recorded (a folder that is gone keeps its key).
+ */
+export function rekeyProjects(db) {
+  const done = db.prepare("SELECT 1 FROM meta WHERE key = 'project_keys'").get();
+  if (done) return 0;
+  let changed = 0;
+  const keyOf = new Map();
+  const key = (cwd) => {
+    if (!keyOf.has(cwd)) keyOf.set(cwd, fs.existsSync(cwd) ? projectIdFor(cwd) : null);
+    return keyOf.get(cwd);
+  };
+  for (const table of ['sessions', 'candidates', 'changesets']) {
+    for (const r of db.prepare(`SELECT DISTINCT cwd, project FROM ${table} WHERE cwd IS NOT NULL AND project IS NOT NULL`).all()) {
+      const next = key(r.cwd);
+      if (next && next !== r.project) changed += db.prepare(`UPDATE ${table} SET project = ? WHERE cwd = ? AND project = ?`).run(next, r.cwd, r.project).changes;
+    }
+  }
+  changed += db.prepare(`UPDATE notices SET project = (SELECT s.project FROM sessions s WHERE s.id = notices.session_id)
+    WHERE project IS NOT NULL AND delivered_at IS NULL AND EXISTS (SELECT 1 FROM sessions s WHERE s.id = notices.session_id)`).run().changes;
+  db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('project_keys', ?)").run(String(Date.now()));
+  return changed;
 }

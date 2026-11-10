@@ -14,7 +14,7 @@ import { applyChangeset, applyEdits, claimsOf, fileDisplayName, getChangeset, ha
 import { containsSecret, decideQueued, writeText } from './curator.mjs';
 import { options } from './config.mjs';
 import { knowledgeKind } from './knowledge.mjs';
-import { dataDir, memoryDirFor, projectKey } from './paths.mjs';
+import { dataDir, memoryDirFor, projectIdFor } from './paths.mjs';
 import { citedTurns, quotesFor, readTranscript, userTurnsOfReview } from './transcript.mjs';
 import { lineDiff, wordDiff } from './textdiff.mjs';
 
@@ -49,7 +49,7 @@ export function parseKey(key) {
  * global ones.
  */
 export function inboxEntries(db, { project } = {}) {
-  const key = project ? projectKey(project) : null;
+  const key = project ? projectIdFor(project) : null;
   const mine = (row) => !key || !row.project || row.project === key;
   const started = (row) => row.session_started_at || row.ts || row.created_at || 0;
   const conflicts = db.prepare(`

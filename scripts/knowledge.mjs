@@ -7,7 +7,7 @@
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { classifyPath, claudeDir, gitRoot, home, memoryDirFor } from './paths.mjs';
+import { classifyPath, claudeDir, gitRoot, home, memoryDirFor, stableDir } from './paths.mjs';
 
 export { gitRoot };
 import { parseFrontmatter } from './inventory.mjs';
@@ -48,6 +48,7 @@ function originUrl(dir) {
  */
 export function projectRoots(cwd) {
   if (!cwd) return [];
+  cwd = stableDir(cwd);
   const root = gitRoot(cwd) || path.resolve(cwd);
   const roots = [root];
   const byOrigin = new Map();
@@ -113,6 +114,8 @@ function skillFileName(file, data) {
 export const PATCHABLE = new Set(['memory', 'skill', 'rules', 'instructions']);
 
 export function knowledgeFiles(cwd) {
+  // A session in a worktree reads the main checkout's knowledge files: changes land where they last.
+  if (cwd) cwd = stableDir(cwd);
   const files = [];
   const add = (file) => { if (isFile(file) && !files.includes(file)) files.push(file); };
   add(path.join(claudeDir(), 'CLAUDE.md'));

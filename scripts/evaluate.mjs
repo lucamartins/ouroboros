@@ -250,6 +250,17 @@ function claimFrom(row, overrides = {}) {
 export async function composeRoutes(db, routes, ctx) {
   const report = { changesets: 0, applied: 0, queued: 0, covered: 0, contradicted: 0, conflicts: 0, unwritten: 0, cost: 0, calls: 0, results: [] };
   for (const [file, fresh] of routes) {
+    if (!fs.existsSync(file)) {
+      // The file is gone (a removed worktree, a deleted skill): nothing to compose, and
+      // retrying forever helps nobody. The learnings stay visible, with the reason.
+      const now = Date.now();
+      const gone = db.prepare("SELECT id FROM changesets WHERE status IN ('pending', 'stale') AND lower(file) = lower(?)").all(file).map((r) => r.id);
+      const ids = [...gone.flatMap((id) => claimsOf(db, id).map((c) => c.id)), ...fresh.map((c) => c.id)];
+      for (const id of new Set(ids)) setOutcome(db, id, 'dropped', `not written: ${file} no longer exists`, { target: file, changeset_id: null });
+      for (const id of gone) db.prepare("UPDATE changesets SET status = 'rejected', note = 'the file no longer exists', decided_at = ? WHERE id = ?").run(now, id);
+      report.unwritten += new Set(ids).size;
+      continue;
+    }
     const pending = pendingChangeset(db, file);
     const stale = db.prepare("SELECT id FROM changesets WHERE status = 'stale' AND lower(file) = lower(?)").all(file).map((r) => r.id);
     const previous = [pending?.id, ...stale].filter(Boolean);

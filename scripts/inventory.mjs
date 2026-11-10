@@ -2,7 +2,7 @@
 // Used by the reviewer (to spot repeats) and by the dashboard.
 import fs from 'node:fs';
 import path from 'node:path';
-import { claudeDir, memoryDirFor, ouroborosDir, projectKey } from './paths.mjs';
+import { claudeDir, memoryDirFor, ouroborosDir, projectKey, repoRoot } from './paths.mjs';
 
 /**
  * Reads the YAML frontmatter of a memory or skill file. Not a full YAML parser, but it
@@ -382,7 +382,7 @@ export function inventoryForPrompt(cwd) {
     lines.push('Project memories:');
     for (const m of mems.slice(0, 80)) lines.push(`- ${m.name}: ${m.description.slice(0, 160)}`);
   }
-  const skills = listSkills(cwd ? [cwd] : []);
+  const skills = listSkills(cwd ? [repoRoot(cwd) || cwd] : []);
   if (skills.length) {
     lines.push('Skills:');
     for (const s of skills.slice(0, 80)) lines.push(`- ${s.name}: ${s.description.slice(0, 160)}`);

@@ -6,8 +6,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { options } from './config.mjs';
-import { classifyPath, dataDir, projectKey, skillNameFromPath } from './paths.mjs';
-import { retireProfile } from './migrate.mjs';
+import { classifyPath, dataDir, projectIdFor, skillNameFromPath } from './paths.mjs';
+import { rekeyProjects, retireProfile } from './migrate.mjs';
 import { RUBRIC_SHORT } from './rubric.mjs';
 import { sessionStateText } from './session-state.mjs';
 import { globMatch, loadSettings } from './settings.mjs';
@@ -60,7 +60,7 @@ function ensureSession(db, input, now) {
     ON CONFLICT(id) DO UPDATE SET
       transcript_path = COALESCE(excluded.transcript_path, sessions.transcript_path),
       last_event_at = excluded.last_event_at
-  `).run(input.session_id, projectKey(input.cwd), input.cwd || null, input.transcript_path || null, now, now);
+  `).run(input.session_id, projectIdFor(input.cwd), input.cwd || null, input.transcript_path || null, now, now);
 }
 
 function addEvent(db, input, now, kind, target = null, payload = null) {
@@ -218,6 +218,8 @@ export function inboxCount(db, project) {
 
 const handlers = {
   SessionStart(db, input, now) {
+    // v0.18: one key per repository (before: per folder, so worktrees were strangers).
+    try { rekeyProjects(db); } catch (err) { dbApi.logError(db, 'migrate:projects', err); }
     ensureSession(db, input, now);
     addEvent(db, input, now, 'session_start', input.source || null);
     // The dashboard runs outside hooks and can't see plugin options; leave a snapshot.
@@ -227,14 +229,14 @@ const handlers = {
       // project (a notice from another project waits for a session there); maintenance
       // notices have no project and go to the next session anywhere.
       const notices = db.prepare('SELECT id, text FROM notices WHERE delivered_at IS NULL AND (project IS NULL OR project = ?) ORDER BY id')
-        .all(projectKey(input.cwd));
+        .all(projectIdFor(input.cwd));
       if (notices.length) {
         db.prepare(`UPDATE notices SET delivered_at = ? WHERE id IN (${notices.map(() => '?').join(',')})`).run(now, ...notices.map((n) => n.id));
       }
       const learnedText = notices.map((n) => n.text).join('\n');
       // What waits for the user's decision (this project's and global entries): said with
       // the notices, otherwise at most once a day.
-      const waiting = inboxCount(db, projectKey(input.cwd));
+      const waiting = inboxCount(db, projectIdFor(input.cwd));
       const remind = waiting && (learnedText || now - (Number(dbApi.getMeta(db, 'inbox_hint_at')) || 0) > 20 * 60 * 60 * 1000);
       if (remind) dbApi.setMeta(db, 'inbox_hint_at', now);
       const inboxLine = remind ? `${waiting} waiting for your decision: /ouroboros:inbox (or the dashboard)` : '';

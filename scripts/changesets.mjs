@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { appendToSection, containsSecret, createdByOuroboros, needsApproval, writeText } from './curator.mjs';
 import { knowledgeKind } from './knowledge.mjs';
-import { projectKey } from './paths.mjs';
+import { projectIdFor } from './paths.mjs';
 import { addedText, isInsertion } from './textdiff.mjs';
 
 /** A changeset may grow a file by at most this many characters. */
@@ -142,7 +142,7 @@ export function saveChangeset(db, { file, cwd, base, edits, note = null, cost = 
   const r = db.prepare(`
     INSERT INTO changesets (file, kind, cwd, project, base_hash, edits, corrects, status, note, cost_usd, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`).run(
-    target, knowledgeKind(target), cwd || null, cwd ? projectKey(cwd) : null, hashText(base), JSON.stringify(edits),
+    target, knowledgeKind(target), cwd || null, cwd ? projectIdFor(cwd) : null, hashText(base), JSON.stringify(edits),
     edits.some((e) => e.corrects) ? 1 : 0, note, cost, now);
   const id = Number(r.lastInsertRowid);
   const attach = db.prepare("UPDATE candidates SET changeset_id = ?, target = ?, outcome = 'queued', decided_at = NULL WHERE id = ?");
@@ -222,7 +222,7 @@ export function queueEdit(db, item, payload, actor) {
   const r = db.prepare(`
     INSERT INTO candidates (review_id, session_id, project, kind, scope, memory_type, title, summary, evidence, confidence, outcome, payload, cwd, claim, target, triaged_at, ts)
     VALUES (0, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)`).run(
-    payload.session_id || actor, projectKey(item.projectDir || payload.cwd || ''), item.kind, item.scope || 'project', item.memory_type ?? null,
+    payload.session_id || actor, projectIdFor(item.projectDir || payload.cwd || ''), item.kind, item.scope || 'project', item.memory_type ?? null,
     String(item.title || path.basename(file)).slice(0, 200), String(item.append ?? item.new ?? '').slice(0, 1500), String(item.evidence || '').slice(0, 800),
     item.confidence, JSON.stringify({ item: { ...item, projectDir: undefined, project_dir: item.projectDir }, cwd: payload.cwd, trigger: payload.trigger, actor }),
     payload.cwd || null, String(item.append ?? item.new ?? '').slice(0, 1500), file, now, now);

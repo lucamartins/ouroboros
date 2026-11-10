@@ -17,7 +17,7 @@ import { rubricText } from './rubric.mjs';
 import { isExcluded } from './hook.mjs';
 import { logError, monthSpend, openDb } from './db.mjs';
 import { inventoryForPrompt } from './inventory.mjs';
-import { claudeDir, dataDir, projectKey } from './paths.mjs';
+import { claudeDir, dataDir, projectIdFor } from './paths.mjs';
 import { closeObservations, openObservations, sessionStateText } from './session-state.mjs';
 import { buildDigest, isHumanPrompt, quotesFor, readTranscript } from './transcript.mjs';
 
@@ -577,7 +577,7 @@ async function backfill(db, { days, limit, dryRun, learn, autonomy }) {
       INSERT INTO sessions (id, project, cwd, transcript_path, started_at, ended_at, turns, queue_state, last_event_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)
       ON CONFLICT(id) DO UPDATE SET queue_state = 'queued', transcript_path = excluded.transcript_path
-    `).run(s.id, projectKey(s.cwd), s.cwd, s.file, s.startedAt, s.mtime, s.humanTurns, Date.now());
+    `).run(s.id, projectIdFor(s.cwd), s.cwd, s.file, s.startedAt, s.mtime, s.humanTurns, Date.now());
     const status = await reviewSession(db, s.id, trigger, { autonomy });
     done++;
     console.log(`[${done}/${list.length}] ${s.id} ${status}`);
