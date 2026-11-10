@@ -1,7 +1,7 @@
 {
   "name": "ouroboros",
   "displayName": "Ouroboros",
-  "version": "0.18.0",
+  "version": "0.19.0",
   "description": "Self-learning for Claude Code: reviews your sessions, turns what is worth keeping into memories and skills, and shows usage, value and cost on a local dashboard.",
   "author": {
     "name": "Luca Martins",
@@ -74,7 +74,7 @@
     "monthly_budget_usd": {
       "type": "number",
       "title": "Monthly budget (USD)",
-      "description": "Every Ouroboros model call (reviews, knowledge check, consolidation) stops for the rest of the month once this is spent.",
+      "description": "Every Ouroboros model call (reviews, knowledge check, correction count) stops for the rest of the month once this is spent.",
       "default": 5,
       "min": 0
     }

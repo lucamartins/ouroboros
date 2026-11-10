@@ -2,6 +2,12 @@
 
 All notable changes to Ouroboros. Versions follow [semantic versioning](https://semver.org/) (pre-1.0: a minor version may change behavior). The reasoning behind each change is in [DESIGN.md](DESIGN.md).
 
+## 0.19.0 — 2026-11-10
+
+- Rules saved as memories (how you want Claude to work) are no longer archived for "not being used". Claude follows them from their line in the memory index without opening the file, so they looked unused exactly when they worked. Facts and pointers looked up on demand, and skills, still decay when nothing reads or invokes them.
+- When you have to repeat something that is already saved, that is counted on the learning (shown in Knowledge › Learned), and from the second time one suggestion in the inbox asks to reword it. It never makes the learning more likely to be archived.
+- "Sessions using a learning" is now "Sessions opening a learning", with what it can and cannot see.
+
 ## 0.18.0 — 2026-11-10
 
 - A repository is one project everywhere. What a session in a worktree or a subfolder learned (the notice at the next session start, the inbox hint) now reaches every session of that repository; before, it waited for a session in that exact folder.

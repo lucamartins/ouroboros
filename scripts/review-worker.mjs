@@ -305,6 +305,34 @@ function finish(db, sessionId, state, cursor) {
   `).run(state, Date.now(), cursor ?? null, Date.now(), sessionId);
 }
 
+const MISSES_BEFORE_SUGGESTION = 2;
+
+/**
+ * The user had to repeat something already saved (the reviewer names the saved item in
+ * "repeats"). That is not a reason to trust it less or archive it: the user cares about
+ * it. It means the saved text did not work, usually because it does not say clearly when
+ * it applies. Count it, and from the second time on ask once, in the inbox, to reword it.
+ */
+export function recordMiss(db, session, name, reviewId = 0, now = Date.now()) {
+  const n = String(name || '').trim();
+  if (!n) return null;
+  const bare = n.replace(/\.md$/i, '');
+  const l = db.prepare(`
+    SELECT * FROM learnings WHERE status = 'active' AND (name = ? OR name = ? OR name = ? OR lower(title) = lower(?))
+      AND (project IS NULL OR project = ? OR scope = 'global') ORDER BY updated_at DESC`).get(n, bare, `learned-${bare}`, n, session.project);
+  if (!l) return null;
+  db.prepare('UPDATE learnings SET misses = misses + 1, last_missed_at = ? WHERE id = ?').run(now, l.id);
+  if (l.misses + 1 >= MISSES_BEFORE_SUGGESTION && !l.miss_flagged_at) {
+    db.prepare(`INSERT INTO candidates (review_id, session_id, project, kind, scope, title, summary, confidence, outcome, cwd, target, note, triaged_at, ts)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 0.7, 'suggested', ?, ?, ?, ?, ?)`).run(
+      reviewId || 0, session.id, session.project, l.kind === 'skill' ? 'skill' : 'memory', l.scope, `Saved but repeated: ${l.title}`.slice(0, 200),
+      `You told Claude this again ${l.misses + 1} times although it is saved in ${l.path}.`, session.cwd || null, l.path,
+      `fix in the project: reword what is saved. You repeated this ${l.misses + 1} times although it is saved. Reword its description (and its MEMORY.md line) so it says when it applies, or move it to the skill or rule that owns the topic`, now, now);
+    db.prepare('UPDATE learnings SET miss_flagged_at = ? WHERE id = ?').run(now, l.id);
+  }
+  return l.id;
+}
+
 /**
  * Record learn-mode proposals and hand them to the evaluation queue (evaluate.mjs):
  * screen, ground, compose per file, validate, write or queue. The queue has a single
@@ -324,6 +352,7 @@ async function applyLearnings(db, session, reviewId, items, opts, { notify = tru
       JSON.stringify({ item, cwd: session.cwd, trigger: 'session_end', actor: 'background', autonomy: opts.autonomy, notify }), session.cwd,
       JSON.stringify(quotesFor(item.evidence, userTurns)), ts);
   }
+  for (const raw of items) if (raw.repeats) recordMiss(db, session, raw.repeats, reviewId);
   if (!items.length) return null;
   const { drainQueue } = await import('./evaluate.mjs');
   try {

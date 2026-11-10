@@ -2,7 +2,7 @@
 
 > A Claude Code plugin that learns from your sessions on its own: it saves memories and creates/refines skills without being asked, in the spirit of Nous Research's Hermes Agent, and shows on a local dashboard what it learned, how much that is being used and what it costs.
 
-Status: v0.18.0 — every phase implemented (§13), plus the learning evaluation (§7.2), the v0.8 mechanism review (§7.4), the inbox reviewed in the conversation (§9.3), a dashboard that scales (§9.1: server-side paging and filters, the inbox grouped by project and file, page state in the URL, one project filter), a knowledge graph (§9.4, read-only, drawn with a vendored D3 subset since v0.13) and a session learning state shared by every review of a session (§6.5, v0.15) and one order of destinations for every path, with a home for preferences that matter for one topic or one kind of file (§7.5, v0.16), one instrument for the correction rate (§9.2, v0.17) and one project per repository in every table (§9.1, v0.18). Next: read that rate on real use (§7.4) before adding mechanisms. Design decisions are summarized in [§12](#12-decisions).
+Status: v0.19.0 — every phase implemented (§13), plus the learning evaluation (§7.2), the v0.8 mechanism review (§7.4), the inbox reviewed in the conversation (§9.3), a dashboard that scales (§9.1: server-side paging and filters, the inbox grouped by project and file, page state in the URL, one project filter), a knowledge graph (§9.4, read-only, drawn with a vendored D3 subset since v0.13) and a session learning state shared by every review of a session (§6.5, v0.15) and one order of destinations for every path, with a home for preferences that matter for one topic or one kind of file (§7.5, v0.16), one instrument for the correction rate (§9.2, v0.17) and one project per repository in every table (§9.1, v0.18). Next: read that rate on real use (§7.4) before adding mechanisms. Design decisions are summarized in [§12](#12-decisions).
 
 ---
 
@@ -111,7 +111,7 @@ ouroboros/
 │   ├── changesets.mjs         # one pending change per file; edit validation
 │   ├── textdiff.mjs           # added text, insertion check, line-level revert
 │   ├── curator.mjs            # dedupe, routing, limits, writing, ledger, undo
-│   ├── maintenance.mjs        # daily decay and consolidation
+│   ├── maintenance.mjs        # daily decay and budget trimming
 │   ├── inventory.mjs          # scan of memories, skills and CLAUDE.md files
 │   ├── inbox.mjs              # what waits for the user and the decisions on it (dashboard + inbox skill)
 │   ├── graph.mjs              # knowledge graph derived from the files and usage (dashboard)
@@ -146,7 +146,7 @@ No `bin/` folder (it blocks installation through claude.ai/Cowork). Every file i
 | `review_every_turns` | number | `10` | User turns between in-loop reviews |
 | `early_review_failures` | number | `2` | Failures on the same command or file, before it worked, that trigger an early in-session review (at most one every 5 turns) |
 | `judge_model` | string | `haiku` | Model of the learning evaluation (screen and editor, §7.2); follows `reviewer_model` when unset |
-| `monthly_budget_usd` | number | `5` | Cap on every model call Ouroboros makes (reviewer, evaluation, consolidation), checked before each call; when reached, the work waits until next month |
+| `monthly_budget_usd` | number | `5` | Cap on every model call Ouroboros makes (reviewer, evaluation, correction count), checked before each call; when reached, the work waits until next month |
 
 ### 4.2 `~/.ouroboros/config.json`
 
@@ -277,7 +277,7 @@ Curator steps (`curator.mjs`, deterministic):
 1. **Validate** schema and size.
 2. **Dedupe**: lexical similarity (trigrams, Jaccard ≥ 0.6) against the scope's inventory → turns `create` into `patch` or drops it.
 3. **Route**: `global` scope → the global CLAUDE.md or `~/.claude/skills/learned-*`; `project` → the project's native memory or `routing[].skillsDir`; no rule → the repo's `.claude/skills/`.
-4. **Limits**: a write that takes a budget past 80% is flagged, and the daily maintenance (`maintenance.mjs`, §7.3) consolidates it: merges similar items, shortens, archives the lowest `confidence × uses`. A write past 100% is refused as `over_budget` until something is consolidated.
+4. **Limits**: a write that takes a budget past 80% is flagged, and the daily maintenance (`maintenance.mjs`, §7.3) trims it: it archives the weakest items (merging and shortening were planned and never built; they wait for the correction rate to show the loop's value). A write past 100% is refused as `over_budget` until something is consolidated.
 5. **Write** atomically (temp file + rename) and record it in `writes` with the diff.
 6. **Notice** queued for the next session.
 
@@ -345,8 +345,9 @@ How each transition happens (phase 4):
 - **Merge on rediscovery**: when the background reviewer's item is a `duplicate` of a memory or skill file, it becomes a claim for that file and the editor (§7.2) folds in only what is new (usually nothing: `covered`).
 - **Promotion**: a `feedback`/`user` memory similar to one already saved in *another* project becomes a proposed addition to the global CLAUDE.md instead of a copy.
 - **Daily maintenance** (`review-worker.mjs --maintain`, started by `SessionStart` at most every 20 h, results shown as notices):
-  - *decay* — archive Ouroboros memories/skills unused for `archiveAfterDaysUnused` days whose confidence is below 0.7 (native items, CLAUDE.md files included, are never touched);
-  - *trim* — memory indexes and learned skills past `consolidateAt` archive their weakest items (`confidence × log2(1 + uses)`) down to 70%.
+  - *decay* — archive Ouroboros memories/skills unused for `archiveAfterDaysUnused` days whose confidence is below 0.7 (native items, CLAUDE.md files included, are never touched). "Unused" means never read (a memory file) or invoked (a skill), which is a real signal only for what is looked up on demand. A `feedback` or `user` memory states a rule, and its line in `MEMORY.md`, loaded in every session of the project, already says it: Claude follows it without opening the file. Until v0.18 those rules, saved at the default confidence of 0.6, were archived after 60 days precisely when they worked. Since v0.19 they are exempt from decay (`maintenance.actsThroughIndex`) and count as used when a budget is trimmed;
+  - *trim* — memory indexes and learned skills past `consolidateAt` archive their weakest items (`confidence × (1 + log2(1 + uses))`) down to 70%. Nothing is merged or shortened: consolidation is archiving, by code, with no model call.
+- **Misses** (v0.19): when the end-of-session reviewer reports that the user had to repeat something already saved (`repeats`), the learning's `misses` goes up. It never lowers confidence (the user cares about it; what failed is the text). From the second miss on, one suggestion goes to the inbox to reword it so it says when it applies, or to move it to the file that owns the topic.
 - **Autonomy** (`auto` | `hybrid` | `queue`): proposals from Claude (`actor: inloop`) or the reviewer (`background`) that need approval are stored as `queued` candidates with their full payload; A request Claude labels as the user's (`actor: requested`; the `learn` skill's `"actor": "manual"`) skips the autonomy setting only: corrections and changes to rule files or a CLAUDE.md still wait, because the label is Claude's own and must not be what lets them through (v0.14.2). Only a decision the user makes on an entry (inbox, dashboard: `actor: manual`, set in-process, never from a payload) is always written. `hybrid` writes facts with confidence ≥ 0.7 and queues skills and tentative items. Changes to existing files wait as changesets (§7.2), shown as diffs. Approve/Reject in the dashboard runs the stored proposal through the curator, or applies/rejects the changeset.
 - **Exclusions**: hooks do nothing at all in projects matching `excludeProjects`.
 
@@ -455,9 +456,9 @@ Visual system: warm neutrals with one blue accent (primary actions, selection, d
 | Metric | Definition |
 |---|---|
 | Correction rate | Σ `reviews.corrections` ÷ Σ `reviews.turns_reviewed` over the reviews of **one instrument** (`reviews.instrument = 'corrections'`), 7-day moving average. Until v0.16 "before" was the small model reading whole sessions with one prompt, and "after" mixed Claude reporting on itself in the periodic review with the small model reading only tails with another prompt: not comparable. Now every figure comes from the same reading: one definition of a correction (`CORRECTIONS_RULES`), the reviewer model, the whole session. Measure-mode reviews (learning off, measure backfills) use that definition in their single call and are the baseline; with learning on, a corrections-only call runs at session end (`mode = 'corrections'`, about the cost of one review). What the learning reviews count themselves is shown apart (`selfReported`). **Primary value indicator**: should drop vs the phase 1 baseline. The Overview shows each side's sample (n = turns) and keeps the before/after delta neutral below 200 reviewed turns after learning turned on (`MIN_SAMPLE_TURNS`) |
-| Misses | Proposals with `duplicates_learning`, counted in the selected period — the user had to repeat something already learned (memory failed: not loaded, poor description, or ignored) |
+| Misses | Proposals with `repeats`, counted in the selected period — the user had to repeat something already learned (memory failed: not loaded, poor description, or ignored). Each one is also counted on the learning it names (`learnings.misses`, §7.3) |
 | Utilization rate | Active learnings with ≥ 1 use in the last 30 days ÷ active |
-| Hits | Sessions with ≥ 1 `skill_used`/`memory_read` of a learned item |
+| Hits | Sessions with ≥ 1 `skill_used`/`memory_read` of a learned item ("Sessions opening a learning" in the UI). A lower bound on use: a rule followed from the memory index, a path-scoped rule and a line in a CLAUDE.md leave no event |
 | Review cost | Σ `reviews.cost_usd` (background) + Σ in-loop review tokens (on a subscription this is quota-equivalent, not an extra charge) |
 | Fixed overhead | (chars of the protocol + `MEMORY.md` lines + learned skill descriptions) ÷ 4 × sessions |
 | Cost per hit | (reviews + overhead) ÷ hits |
@@ -575,6 +576,7 @@ Phase 1 is read-only on purpose. Later, the same graph could drive behavior: wri
 | **v0.16 Routing** | §7.5: `DESTINATIONS` shared by the skill, the reviewer and the screen; kind `preference` (topical skill or path-scoped user rule, written without approval); `has_owner` for items saved in session; user rules indexed | "Remember that I prefer X" about a topic lands in that topic's file, or in its owner, not in the global CLAUDE.md |
 | **v0.17 One instrument** | §9.2: `CORRECTIONS_RULES`, the corrections-only pass at session end, `reviews.instrument`, `sessions.measure_cursor`; the dashboard's rate, series and per-session counts read only instrument rows | Before and after are counted by the same reading, with a regression test |
 | **v0.18 One project per repository** | `projectIdFor` in hooks, proposals, changes and notices, with a one-time re-key; project skills and knowledge files in the main checkout; changes to vanished files closed | A notice from a worktree session shows up in the next session of the repository, with a regression test |
+| **v0.19 Use and decay** | Rules that act through the memory index are exempt from decay and count as used in trims; misses counted per learning, with one rewording suggestion from the second; honest labels for what "use" measures | A feedback memory never read is still there after 90 days, with a regression test |
 | **v0.11 Knowledge graph** | Knowledge › Graph (§9.4): nodes and edges derived from the files and usage, broken links and unconnected items, filters and selection in the URL, an accessible side panel; read-only | The graph of a real setup's knowledge is legible at a glance and every relation it draws can be traced to a file or an event |
 | **v0.12 One global file** | §3.2: global facts go to `~/.claude/CLAUDE.md` through the editor and the inbox; `user.md`, its injection, budgets and consolidation removed; one-time migration of its bullets | Global facts land in the global CLAUDE.md after approval; a fact it already states is not proposed again |
 | **v0.13 Graph drawing** | Knowledge › Graph drawn with a vendored D3 subset: the layout unfolds on screen, drag pulls neighbors along, animated camera on select and Fit, curved colored edges with flow on focus, halos and a pulse on what Ouroboros changed; reduced motion respected | The graph feels alive while staying legible, with the same CSP, offline use and no install step |

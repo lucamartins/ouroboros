@@ -251,6 +251,12 @@ const MIGRATIONS = [
   UPDATE reviews SET instrument = 'corrections' WHERE mode = 'measure' AND status = 'ok';
   UPDATE sessions SET measure_cursor = review_cursor WHERE id IN (SELECT session_id FROM reviews WHERE mode = 'measure' AND status = 'ok');
   `,
+  // 12 — v0.19: a learning the user had to repeat (saved, yet it did not work)
+  `
+  ALTER TABLE learnings ADD COLUMN misses INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE learnings ADD COLUMN last_missed_at INTEGER;
+  ALTER TABLE learnings ADD COLUMN miss_flagged_at INTEGER;   -- a suggestion to reword it was sent to the inbox
+  `,
 ];
 
 export function openDb(explicitDir) {

@@ -899,7 +899,7 @@ async function renderOverview() {
         h('p', { class: 'small faint' }, `Counted the same way before and after: one corrections-only reading of each whole session.${v.selfReported?.turns ? ` Not included: what the learning reviews counted themselves (${fmt.rate(v.selfReported.rate)} per 100 on ${fmt.int(v.selfReported.turns)} turns).` : ''}`)),
       h('div', { class: 'stats' },
         stat('Learned', fmt.int(learnedTotal), `${o.learned.memory || 0} memories · ${o.learned.skill || 0} skills${o.learned.patchedNative ? ` · ${o.learned.patchedNative} refined` : ''}`),
-        stat('Sessions using a learning', v.sessions ? fmt.pct((v.hits / v.sessions) * 100) : '—', `${fmt.int(v.hits)} of ${fmt.plural(v.sessions, 'session')}`),
+        stat('Sessions opening a learning', v.sessions ? fmt.pct((v.hits / v.sessions) * 100) : '—', `${fmt.int(v.hits)} of ${fmt.plural(v.sessions, 'session')}: a learned skill used or memory file read (rules followed from the memory index leave no trace)`),
         stat('Misses', fmt.int(o.misses), `times you repeated something already saved, in the last ${o.days} days`),
         h('div', { class: 'stat' },
           h('div', { class: 'k' }, 'Reviewer cost this month'),
@@ -913,7 +913,7 @@ async function renderOverview() {
   const charts = h('div', { class: 'charts' },
     barChart({ title: 'Corrections per 100 turns', sub: 'by the day the session started; lower is better', data: o.series, value: rate, format: (x) => x.toFixed(x > 0 && x < 10 ? 1 : 0), marker, wide: true, height: 200,
       tip: (d) => [fmt.day(d.day), `${d.corrections} corrections · ${d.reviewedTurns} turns reviewed`], emptyText: 'No reviewed sessions in this period' }),
-    failed(v) ? sectionError(v, 'this chart') : barChart({ title: 'Sessions using a learning', data: v.series, value: (d) => d.hits, format: (x) => fmt.int(x), marker,
+    failed(v) ? sectionError(v, 'this chart') : barChart({ title: 'Sessions opening a learning', data: v.series, value: (d) => d.hits, format: (x) => fmt.int(x), marker,
       tip: (d) => [fmt.day(d.day), `${d.hits} of ${d.sessions} sessions`] }),
     barChart({ title: 'User turns', data: o.series, value: (d) => d.turns, format: (x) => fmt.compact(x),
       tip: (d) => [fmt.day(d.day), fmt.plural(d.sessions, 'session')] }));
@@ -967,6 +967,7 @@ const ORIGIN = { inloop: 'in session', background: 'end-of-session review', manu
 function lifecycleNote(c) {
   const lc = c.lifecycle;
   if (!lc) return null;
+  if (lc.state === 'index') return h('span', { title: 'A rule Claude follows from its line in the memory index, without opening the file: not being read does not mean it is unused, so it is not archived for that' }, 'Applies from the index');
   if (lc.state === 'kept') return h('span', { title: 'Never archived automatically' }, 'Kept');
   if (lc.state === 'confident') return h('span', { title: 'Confident learnings are not archived when unused' }, 'Not archived when unused');
   return h('span', { title: 'Unused, low-confidence learnings are archived to ~/.ouroboros/archive (restorable). Keep it to stop that.' },
@@ -992,6 +993,7 @@ function learnedRow(c) {
         h('span', { title: fmt.datetime(c.ts) }, fmt.when(c.ts)),
         h('span', {}, c.project_name ? `${origin} · ${c.project_name}` : origin),
         used ? h('span', {}, used) : null,
+        c.misses ? h('span', { class: 'warn', title: 'You had to tell Claude this again although it was saved: it may not say clearly when it applies' }, `Repeated ${fmt.plural(c.misses, 'time')}`) : null,
         lifecycleNote(c)),
       c.why ? h('div', { class: 'item-reason' }, clampText(c.why, 'div')) : null,
       wrote.length ? keyed(disclose(c.op === 'create' ? 'What it saved' : 'What it changed', h('div', { class: 'diffs' }, wrote)), `wrote:${c.batch}`) : null),

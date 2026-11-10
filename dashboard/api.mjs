@@ -9,6 +9,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { changesetView, fileDisplayName, getChangeset } from '../scripts/changesets.mjs';
 import { getMeta, monthSpend, monthStart } from '../scripts/db.mjs';
+import { actsThroughIndex } from '../scripts/maintenance.mjs';
 import { loadSettings } from '../scripts/settings.mjs';
 import { listInstructionFiles, listMemories, listPluginSkills, listSkills } from '../scripts/inventory.mjs';
 import { claudeDir, dataDir, home, normalize, ouroborosDir, projectKey, repoRoot } from '../scripts/paths.mjs';
@@ -294,6 +295,7 @@ export function createApi(db) {
     let lifecycle = null;
     if (l && own && l.status === 'active' && ['memory', 'skill'].includes(l.kind) && b.op === 'create') {
       if (l.pinned) lifecycle = { state: 'kept' };
+      else if (actsThroughIndex(l)) lifecycle = { state: 'index' };
       else if ((l.confidence ?? 0.5) >= KEEP_CONFIDENCE) lifecycle = { state: 'confident' };
       else lifecycle = { state: 'decays', at: Math.max(l.created_at || 0, l.last_used_at || 0) + days * DAY };
     }
@@ -313,6 +315,7 @@ export function createApi(db) {
       } : null,
       canArchive: !!(l && own && l.status === 'active' && b.op === 'create' && !b.reverted_at),
       lifecycle,
+      misses: l?.misses || 0,
     };
   }
 

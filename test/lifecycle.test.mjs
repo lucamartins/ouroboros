@@ -96,6 +96,13 @@ test('maintenance archives unused learnings', async () => {
   assert.equal(db.prepare("SELECT status FROM learnings WHERE id = ?").get(old.id).status, 'archived');
   assert.match(db.prepare('SELECT text FROM notices ORDER BY id DESC').get().text, /🧹/);
 
+  // A feedback rule works from its line in the memory index: never being read is not disuse.
+  const [rule] = curator.apply(db, { cwd: cwdA, items: [{ kind: 'memory', memory_type: 'feedback', title: 'Ask before force pushing', description: 'Always ask before a force push', confidence: 0.4, owner_checked: true }] });
+  assert.equal(rule.status, 'created', rule.reason);
+  db.prepare('UPDATE learnings SET created_at = ? WHERE id = ?').run(Date.now() - 90 * 86_400_000, rule.id);
+  assert.deepEqual((await maintain(db, { force: true })).decayed, []);
+  assert.equal(db.prepare('SELECT status FROM learnings WHERE id = ?').get(rule.id).status, 'active');
+
 });
 
 test('learned skills past the budget are trimmed, weakest first', async () => {
@@ -260,4 +267,21 @@ test('a proposal the screen gives no verdict for is never written unscreened', a
   assert.match(row().note, /no verdict/);
   assert.equal(db.prepare("SELECT COUNT(*) n FROM learnings WHERE title = 'Unscreened fact'").get().n, 0);
   assert.equal((await tidyQueue(db, { autonomy: 'auto' })).total, 0);
+});
+
+test('a saved learning the user had to repeat is counted, and from the second time a rewording is suggested once', async () => {
+  const { recordMiss } = await import('../scripts/review-worker.mjs');
+  const l = db.prepare("SELECT * FROM learnings WHERE title = 'Ask before force pushing'").get();
+  const session = { id: 'miss-1', project: l.project, cwd: cwdA };
+  assert.equal(recordMiss(db, session, 'no-such-item'), null);
+  assert.equal(recordMiss(db, session, `${l.name}.md`), l.id);
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM candidates WHERE outcome = 'suggested' AND target = ?").get(l.path).n, 0);
+  recordMiss(db, session, l.name);
+  recordMiss(db, session, l.title);
+  const after = db.prepare('SELECT misses, confidence FROM learnings WHERE id = ?').get(l.id);
+  assert.deepEqual([after.misses, after.confidence], [3, l.confidence], 'a miss never lowers confidence');
+  const sug = db.prepare("SELECT title, note FROM candidates WHERE outcome = 'suggested' AND target = ?").all(l.path);
+  assert.equal(sug.length, 1);
+  assert.match(sug[0].title, /^Saved but repeated: Ask before force pushing/);
+  assert.match(sug[0].note, /^fix in the project: reword what is saved/);
 });
