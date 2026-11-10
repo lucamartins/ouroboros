@@ -58,6 +58,17 @@ function trimToTarget(db, rows, target) {
   return archived;
 }
 
+/** Capture events are kept this long (longer than any range the dashboard shows). */
+const EVENT_RETENTION_DAYS = 400;
+/** Never pruned: the all-time use counts of skills and memories are read from them. */
+const KEPT_EVENT_KINDS = ['skill_used', 'memory_read'];
+
+/** Delete old capture events (turns, failures, recoveries, writes observed), which otherwise grow forever. */
+export function pruneEvents(db, now = Date.now(), days = EVENT_RETENTION_DAYS) {
+  return db.prepare(`DELETE FROM events WHERE ts < ? AND kind NOT IN (${KEPT_EVENT_KINDS.map(() => '?').join(',')})`)
+    .run(now - days * DAY, ...KEPT_EVENT_KINDS).changes;
+}
+
 export async function consolidate(db, settings, opts) {
   const report = { archived: [], cost: 0 };
   const limits = settings.limits;
@@ -106,6 +117,7 @@ export async function maintain(db, { force = false, now = Date.now() } = {}) {
     }
   }
   const cons = await consolidate(db, settings, opts);
+  const pruned = pruneEvents(db, now);
   const archived = [...decayed, ...cons.archived];
   db.prepare('INSERT INTO maintenance (ts, kind, detail, archived, merged, cost_usd) VALUES (?, ?, ?, ?, ?, ?)')
     .run(now, 'daily', JSON.stringify({ decayed, trimmed: cons.archived }), archived.length, 0, cons.cost);
@@ -114,5 +126,5 @@ export async function maintain(db, { force = false, now = Date.now() } = {}) {
     ...(cons.archived.length ? [`🧹 archived ${cons.archived.length} to stay within budget: ${cons.archived.slice(0, 5).join('; ')}`] : []),
   ];
   if (lines.length) db.prepare('INSERT INTO notices (ts, session_id, text) VALUES (?, ?, ?)').run(now, 'maintenance', lines.join('\n'));
-  return { status: 'ok', decayed, trimmed: cons.archived, tidied, cost: cons.cost + (tidied?.cost || 0) };
+  return { status: 'ok', decayed, trimmed: cons.archived, pruned, tidied, cost: cons.cost + (tidied?.cost || 0) };
 }

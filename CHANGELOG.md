@@ -2,6 +2,13 @@
 
 All notable changes to Ouroboros. Versions follow [semantic versioning](https://semver.org/) (pre-1.0: a minor version may change behavior). The reasoning behind each change is in [DESIGN.md](DESIGN.md).
 
+## 0.20.0 — 2026-11-10
+
+- Fewer needless early reviews: a "recovery" is now a command that failed and then worked within the same turn, and retrying an edit until it applies no longer triggers one.
+- An end-of-session learning must point at something real: a turn of yours that was reviewed, or a recorded failure-then-success. One that points at nothing waits for your approval instead of being written, whatever the autonomy.
+- Robustness: a long knowledge check keeps its lock while it runs; on Windows the reviewer also works when Claude Code was installed with npm; capture events older than 400 days are deleted (use counts and the undo ledger are kept).
+- `npm test` runs the suite (a bare `node --test` hangs on the fixtures).
+
 ## 0.19.0 — 2026-11-10
 
 - Rules saved as memories (how you want Claude to work) are no longer archived for "not being used". Claude follows them from their line in the memory index without opening the file, so they looked unused exactly when they worked. Facts and pointers looked up on demand, and skills, still decay when nothing reads or invokes them.

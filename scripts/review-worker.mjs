@@ -208,6 +208,23 @@ function claudeCommand() {
     const custom = JSON.parse(process.env.OUROBOROS_CLAUDE_CMD || 'null');
     if (Array.isArray(custom) && custom.length) return custom;
   } catch { /* fall through */ }
+  return resolveClaude();
+}
+
+/**
+ * The command that runs Claude Code. On Windows an npm install puts `claude.cmd` on the
+ * PATH, a shim Node refuses to spawn without a shell (and a shell would mangle the JSON
+ * schema and the system prompt). So: a real `claude.exe` when there is one (the native
+ * install), else the CLI script the shim points to, run with this Node.
+ */
+export function resolveClaude({ platform = process.platform, pathEnv = process.env.PATH || process.env.Path || '', exists = fs.existsSync } = {}) {
+  if (platform !== 'win32') return ['claude'];
+  const dirs = pathEnv.split(';').map((d) => d.trim()).filter(Boolean);
+  for (const d of dirs) if (exists(path.win32.join(d, 'claude.exe'))) return [path.win32.join(d, 'claude.exe')];
+  for (const d of dirs) {
+    const cli = path.win32.join(d, 'node_modules', '@anthropic-ai', 'claude-code', 'cli.js');
+    if (exists(path.win32.join(d, 'claude.cmd')) && exists(cli)) return [process.execPath, cli];
+  }
   return ['claude'];
 }
 
@@ -305,6 +322,12 @@ function finish(db, sessionId, state, cursor) {
   `).run(state, Date.now(), cursor ?? null, Date.now(), sessionId);
 }
 
+/** Whether an item's evidence points at something real: a user turn that was reviewed, or a recorded recovery. */
+export function isAnchored(evidence, userTurns, signals = false) {
+  if (quotesFor(evidence, userTurns).length) return true;
+  return !!signals && !/USER\s*#/i.test(String(evidence || '')) && String(evidence || '').trim().length > 0;
+}
+
 const MISSES_BEFORE_SUGGESTION = 2;
 
 /**
@@ -339,17 +362,24 @@ export function recordMiss(db, session, name, reviewId = 0, now = Date.now()) {
  * consumer; if another process is evaluating, it picks these up before it stops. The
  * notice for the session is written when they are evaluated.
  */
-async function applyLearnings(db, session, reviewId, items, opts, { notify = true, userTurns = [] } = {}) {
+async function applyLearnings(db, session, reviewId, items, opts, { notify = true, userTurns = [], signals = false } = {}) {
   const ts = Date.now();
   const insert = db.prepare(`
     INSERT INTO candidates (review_id, session_id, project, kind, scope, memory_type, title, summary, evidence, confidence, repeats, outcome, payload, cwd, quotes, ts)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`);
   for (const raw of items) {
     const item = { op: 'create', ...raw, scope: raw.kind === 'global' ? 'global' : raw.scope || 'project' };
+    // Learn only from trusted sources, checked by code: the evidence must cite a user
+    // turn that exists in what was reviewed (or, with recorded recoveries, an observed
+    // outcome instead of a turn). An item anchored on nothing is never written on its
+    // own: it waits for the user, whatever the autonomy.
+    const anchored = isAnchored(item.evidence, userTurns, signals);
+    if (!anchored) item.evidence = `${String(item.evidence || '').trim()} [cites no user turn of the session: held for you]`.trim();
+    const autonomy = anchored ? opts.autonomy : 'queue';
     insert.run(reviewId, session.id, session.project, item.kind, item.scope, item.memory_type ?? null,
       String(item.title || item.text || '').slice(0, 200), String(item.text || item.body || item.description || '').slice(0, 1500),
       String(item.evidence || '').slice(0, 800), item.confidence ?? null, item.repeats || null,
-      JSON.stringify({ item, cwd: session.cwd, trigger: 'session_end', actor: 'background', autonomy: opts.autonomy, notify }), session.cwd,
+      JSON.stringify({ item, cwd: session.cwd, trigger: 'session_end', actor: 'background', autonomy, notify }), session.cwd,
       JSON.stringify(quotesFor(item.evidence, userTurns)), ts);
   }
   for (const raw of items) if (raw.repeats) recordMiss(db, session, raw.repeats, reviewId);
@@ -521,7 +551,7 @@ export async function reviewSession(db, sessionId, trigger, overrides = {}) {
         .run(reviewId, sessionId, String(c.quote).slice(0, 500), c.kind, ts);
     }
     if (mode === 'background') {
-      await applyLearnings(db, session, reviewId, out.items, opts, { notify: !learnBackfill, userTurns: digest.userTurns });
+      await applyLearnings(db, session, reviewId, out.items, opts, { notify: !learnBackfill, userTurns: digest.userTurns, signals: recoveries.length > 0 });
       // The session's last review saw every open observation: settled ones came back as items.
       if (!learnBackfill) closeObservations(db, sessionId);
       finish(db, sessionId, 'done', digest.nextLine);

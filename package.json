@@ -1,0 +1,9 @@
+{
+  "name": "ouroboros",
+  "private": true,
+  "description": "Claude Code plugin. No dependencies and no build step: this file only names the test command.",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "test": "node --no-warnings --test \"test/*.test.mjs\""
+  }
+}

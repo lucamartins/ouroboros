@@ -129,11 +129,20 @@ export function reviewRequest({ from, to, trigger, recoveries = [], state = '' }
  * use 15+ tool calls, and most have nothing new to learn.
  */
 export function recoveredThisTurn(db, sessionId, minFailures) {
-  const turnStart = db.prepare("SELECT MAX(ts) t FROM events WHERE session_id = ? AND kind = 'turn'").get(sessionId).t || 0;
-  return db.prepare("SELECT payload FROM events WHERE session_id = ? AND kind = 'recovery' AND ts >= ?").all(sessionId, turnStart)
+  return db.prepare("SELECT target, payload FROM events WHERE session_id = ? AND kind = 'recovery' AND ts >= ?").all(sessionId, turnStartOf(db, sessionId))
+    // Retrying an edit or a read of the same file until it applies is mechanics, not a
+    // working path worth an early review (it is still recorded and reaches the reviews).
+    .filter((r) => !FILE_TOOL_RE.test(String(r.target || '')))
     .some((r) => {
       try { return (JSON.parse(r.payload || '{}').failures || 0) >= minFailures; } catch { return false; }
     });
+}
+
+const FILE_TOOL_RE = /^(Edit|MultiEdit|Write|Read|NotebookEdit):/;
+
+/** When the session's current user turn started (0 before the first one). */
+function turnStartOf(db, sessionId) {
+  return db.prepare("SELECT MAX(ts) t FROM events WHERE session_id = ? AND kind = 'turn'").get(sessionId).t || 0;
 }
 
 /** At most one early review every EARLY_REVIEW_MIN_TURNS user turns (after any review request). */
@@ -323,8 +332,10 @@ const handlers = {
     // "found the working path after errors", the strongest procedural signal.
     const target = targetOf(tool, ti);
     const streak = db.prepare('SELECT * FROM fail_streaks WHERE session_id = ? AND target = ?').get(input.session_id, target);
-    if (streak) {
-      db.prepare('DELETE FROM fail_streaks WHERE session_id = ? AND target = ?').run(input.session_id, target);
+    if (streak) db.prepare('DELETE FROM fail_streaks WHERE session_id = ? AND target = ?').run(input.session_id, target);
+    // Only within one turn: a failure three turns ago and a success now are two events,
+    // not Claude working its way through an error.
+    if (streak && streak.started_at >= turnStartOf(db, input.session_id)) {
       addEvent(db, input, now, 'recovery', target, {
         failures: streak.count,
         first_error: streak.first_error,
@@ -340,6 +351,8 @@ const handlers = {
       .run(input.session_id);
     const target = targetOf(input.tool_name || '', input.tool_input || {});
     const error = String(input.error || '').slice(0, 400);
+    // A streak left open by an earlier turn starts over.
+    db.prepare('DELETE FROM fail_streaks WHERE session_id = ? AND target = ? AND started_at < ?').run(input.session_id, target, turnStartOf(db, input.session_id));
     db.prepare(`
       INSERT INTO fail_streaks (session_id, target, agent_id, count, first_error, started_at)
       VALUES (?, ?, ?, 1, ?, ?)

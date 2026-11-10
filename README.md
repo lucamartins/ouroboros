@@ -107,7 +107,7 @@ Set when enabling the plugin, or later in `/config`:
 ## Development
 
 ```
-node --test "test/*.test.mjs"      # zero dependencies
+npm test                           # node --no-warnings --test "test/*.test.mjs"; zero dependencies (a bare `node --test` also picks up the fixtures and hangs)
 claude plugin validate --strict .
 claude --plugin-dir .              # try it without installing
 node scripts/eval.mjs --synthetic  # score the knowledge check with the real model (~US$ 0.01)

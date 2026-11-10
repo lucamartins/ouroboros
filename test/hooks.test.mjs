@@ -232,6 +232,34 @@ test('early review: after a turn that worked through repeated failures, not afte
   d.close();
 });
 
+test('a recovery is one turn working through an error; retrying a file edit asks for no early review', () => {
+  const sid = { session_id: 's10' };
+  const fail = (tool, input) => hook('PostToolUseFailure', { ...sid, tool_name: tool, tool_input: input, error: 'failed' });
+  const ok = (tool, input) => hook('PostToolUse', { ...sid, tool_name: tool, tool_input: input, tool_response: {} });
+  const recoveries = () => { const d = db(); const n = d.prepare("SELECT COUNT(*) n FROM events WHERE session_id = 's10' AND kind = 'recovery'").get().n; d.close(); return n; };
+  // Two failures in one turn, the success in a later one: not a recovery, and the streak is gone.
+  hook('UserPromptSubmit', sid);
+  fail('Bash', { command: 'pnpm build' });
+  fail('Bash', { command: 'pnpm build' });
+  hook('UserPromptSubmit', sid);
+  ok('Bash', { command: 'pnpm build' });
+  assert.equal(recoveries(), 0);
+  // A failure left open by an earlier turn does not add to this turn's streak.
+  fail('Bash', { command: 'pnpm lint' });
+  hook('UserPromptSubmit', sid);
+  fail('Bash', { command: 'pnpm lint' });
+  ok('Bash', { command: 'pnpm lint' });
+  const d = db();
+  assert.equal(JSON.parse(d.prepare("SELECT payload FROM events WHERE session_id = 's10' AND kind = 'recovery'").get().payload).failures, 1);
+  d.close();
+  // An edit that needed three tries is recorded, but it is mechanics: no early review.
+  hook('UserPromptSubmit', sid);
+  for (let i = 0; i < 3; i++) fail('Edit', { file_path: '/tmp/proj/a.ts' });
+  ok('Edit', { file_path: '/tmp/proj/a.ts' });
+  assert.equal(recoveries(), 2);
+  assert.equal(hook('Stop', { ...sid, stop_hook_active: false }), '');
+});
+
 test('learning can be turned off; reads of learned items count as uses', () => {
   const off = spawnSync(process.execPath, ['--no-warnings', path.join(root, 'scripts', 'hook.mjs'), 'SessionStart'], {
     input: JSON.stringify({ session_id: 's2', cwd: '/tmp/proj', hook_event_name: 'SessionStart', source: 'startup' }),

@@ -17,7 +17,7 @@ import path from 'node:path';
 import { options } from './config.mjs';
 import { apply as curatorApply, DUPLICATE_THRESHOLD, similarity } from './curator.mjs';
 import { applyChangeset, applyEdits, changesetNeedsApproval, claimsOf, getChangeset, pendingChangeset, saveChangeset } from './changesets.mjs';
-import { acquireLease, assertBudget, BudgetError, logError, releaseLease } from './db.mjs';
+import { acquireLease, assertBudget, BudgetError, logError, releaseLease, renewLease } from './db.mjs';
 import { buildIndex, groundIdentifiers, identifiersIn, knowledgeFiles, knowledgeKind, PATCHABLE, resolveOwner, tokenize } from './knowledge.mjs';
 import { ensureGlobalInstructions } from './paths.mjs';
 import { refFile } from './session-state.mjs';
@@ -270,6 +270,7 @@ export async function composeRoutes(db, routes, ctx) {
     let composed;
     try {
       assertBudget(db, options().monthlyBudgetUsd);
+      ctx.tick?.();
       composed = await composeFile({ file, claims, cwd: ctx.cwd, model: ctx.model });
     } catch (err) {
       if (!(err instanceof BudgetError)) logError(db, 'evaluate:editor', err);
@@ -360,7 +361,8 @@ export async function evaluate(db, rows, ctx) {
   const proposals = rows.map((r) => ({ id: r.id, ...items.get(r.id), claim: r.claim || undefined, target: r.target || undefined, evidence: r.evidence, when: when(r) }));
   // Each screening call is recorded as it happens, so the budget check before the next
   // call (and the month's spend) always counts it.
-  const record = (usage) => insertReview(db, { sessionId: ctx.sessionId || 'maintenance', mode: ctx.sessionId ? 'background' : 'maintenance', trigger: 'triage', model: ctx.model, status: 'ok', usage, sessionStartedAt: ctx.sessionStartedAt });
+  const record = (usage) => { ctx.tick?.(); return recordUsage(usage); };
+  const recordUsage = (usage) => insertReview(db, { sessionId: ctx.sessionId || 'maintenance', mode: ctx.sessionId ? 'background' : 'maintenance', trigger: 'triage', model: ctx.model, status: 'ok', usage, sessionStartedAt: ctx.sessionStartedAt });
   const screen = await triage(proposals, { cwd: ctx.cwd, db, lang: ctx.lang, model: ctx.model, exclude: rows.map((r) => r.id), record });
   report.cost += screen.cost;
   report.calls += screen.calls;
@@ -530,7 +532,7 @@ export function noticeLines(results) {
  * so its notice can say what happened. Call through `drainQueue`, which makes sure only
  * one process evaluates at a time.
  */
-export async function tidyQueue(db, { force = false, autonomy = 'queue' } = {}) {
+export async function tidyQueue(db, { force = false, autonomy = 'queue', tick = null } = {}) {
   const opts = options();
   if (force) {
     db.prepare("UPDATE changesets SET status = 'superseded', decided_at = ? WHERE status IN ('pending', 'stale')").run(Date.now());
@@ -564,7 +566,9 @@ export async function tidyQueue(db, { force = false, autonomy = 'queue' } = {}) 
 
   for (const g of groups.values()) {
     assertBudget(db, opts.monthlyBudgetUsd);
+    tick?.();
     const ctx = {
+      tick,
       cwd: g.cwd || undefined, actor: 'background', autonomy: g.autonomy, lang: opts.learningLanguage, model: opts.judgeModel,
       sessionId: g.sessionId || undefined, sessionStartedAt: g.sessionStartedAt, payload: { trigger: g.trigger || 'session_end' },
     };
@@ -613,11 +617,13 @@ export async function drainQueue(db, { force = false, autonomy = 'queue' } = {})
   const total = { status: 'done', rounds: 0, cost: 0, reports: [] };
   let first = true;
   for (;;) {
-    const token = acquireLease(db, LEASE);
+    let token = acquireLease(db, LEASE);
+    // Renewed before each model call: a long drain never loses the lease while it runs.
+    const tick = () => { token = renewLease(db, LEASE, token) || token; };
     if (!token) return first ? { status: 'busy', reason: 'another process is evaluating the queue; it will pick this up' } : total;
     try {
       while (total.rounds < MAX_ROUNDS && ((first && force) || queueHasWork(db))) {
-        const r = await tidyQueue(db, { force: first && force, autonomy });
+        const r = await tidyQueue(db, { force: first && force, autonomy, tick });
         first = false;
         total.rounds++;
         total.cost += r.cost || 0;

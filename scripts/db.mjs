@@ -320,6 +320,18 @@ export function acquireLease(db, name, ttlMs = 30 * 60 * 1000) {
   return r.changes ? token : null;
 }
 
+/**
+ * Push a held lease's expiry forward; returns the new token, or null when the lease is
+ * no longer ours (it expired and someone took it). A long evaluation renews before each
+ * model call, so its lease never runs out while it is alive.
+ */
+export function renewLease(db, name, token, ttlMs = 30 * 60 * 1000) {
+  if (!token) return null;
+  const next = `${Date.now() + ttlMs}|${token.split('|').slice(1).join('|')}`;
+  const r = db.prepare('UPDATE meta SET value = ? WHERE key = ? AND value = ?').run(next, `lease:${name}`, token);
+  return r.changes ? next : null;
+}
+
 export function releaseLease(db, name, token) {
   if (token) db.prepare('DELETE FROM meta WHERE key = ? AND value = ?').run(`lease:${name}`, token);
 }
