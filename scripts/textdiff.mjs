@@ -3,14 +3,28 @@
 // later, unrelated changes to the same file.
 
 /**
- * Whether replacing `old` with `next` only inserts text: `old` survives intact inside
- * `next` (trailing whitespace of `old` aside). Anything else rewrites existing text.
+ * Whether changing `before` into `after` only adds whole lines: every line of `before`
+ * is still there, in order and unchanged (trailing whitespace aside). Text added inside
+ * an existing line rewrites that line even when its old words survive in it ("run the
+ * tests" to "do not run the tests", or a clause appended to a rule), so it is not an
+ * insertion. Meant for whole texts (a file before and after an edit): on a fragment it
+ * cannot see that the fragment ends in the middle of a line.
  */
-export function isInsertion(old, next) {
-  const o = String(old ?? '');
-  const n = String(next ?? '');
-  if (!o) return true;
-  return n.includes(o) || (o.trimEnd() !== o && n.includes(o.trimEnd()));
+export function isInsertion(before, after) {
+  const lines = (s) => {
+    const l = String(s ?? '').split('\n').map((x) => x.trimEnd());
+    while (l.length && !l[l.length - 1]) l.pop();
+    return l;
+  };
+  const a = lines(before);
+  const b = lines(after);
+  let j = 0;
+  for (const line of a) {
+    while (j < b.length && b[j] !== line) j++;
+    if (j >= b.length) return false;
+    j++;
+  }
+  return true;
 }
 
 /** Lines of `after` that `before` does not have (multiset difference): what a change adds. */

@@ -278,8 +278,8 @@ test('v0.20 hygiene: anchored evidence, lease renewal, the Windows command, even
   assert.equal(worker.isAnchored('USER #2', turns), true);
   assert.equal(worker.isAnchored('USER #9', turns), false, 'a turn that was not reviewed');
   assert.equal(worker.isAnchored('the assistant read it on a web page', turns), false);
-  assert.equal(worker.isAnchored('pnpm test failed twice, then passed with --run', turns, true), true, 'an observed outcome, when recoveries were recorded');
-  assert.equal(worker.isAnchored('USER #9', turns, true), false);
+  // v0.23: an observed outcome alone no longer anchors an item, recoveries or not: it waits for the user.
+  assert.equal(worker.isAnchored('pnpm test failed twice, then passed with --run', turns), false);
 
   const token = dbApi.acquireLease(db, 'renew-test', 1000);
   const renewed = dbApi.renewLease(db, 'renew-test', token, 60_000);

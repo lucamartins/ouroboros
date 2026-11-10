@@ -1,7 +1,8 @@
 ---
 name: dashboard
 description: Open the Ouroboros dashboard (local web page with what was learned, usage, value and cost). Use when the user asks to see the Ouroboros dashboard, learning stats, review cost or what Claude has been learning.
-allowed-tools: Bash(node:*)
+allowed-tools:
+  - Bash(node --no-warnings *dashboard/server.mjs* *)
 ---
 
 # Open the Ouroboros dashboard

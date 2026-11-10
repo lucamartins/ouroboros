@@ -15,6 +15,7 @@ const DEFAULTS = {
   reviewer_model: 'haiku',
   judge_model: 'haiku',
   monthly_budget_usd: 5,
+  inloop_review_max_context: 150000,
 };
 
 function raw(key) {
@@ -54,6 +55,8 @@ function fromEnv() {
     // Screen and editor of the learning evaluation; follows the reviewer unless set.
     judgeModel: raw('judge_model') || raw('reviewer_model') || DEFAULTS.judge_model,
     monthlyBudgetUsd: asNumber(raw('monthly_budget_usd'), DEFAULTS.monthly_budget_usd),
+    // In-session reviews are skipped above this context size (tokens); 0 = no limit.
+    inloopReviewMaxContext: Math.max(0, asNumber(raw('inloop_review_max_context'), DEFAULTS.inloop_review_max_context)),
   };
 }
 

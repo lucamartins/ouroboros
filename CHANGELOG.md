@@ -2,6 +2,21 @@
 
 All notable changes to Ouroboros. Versions follow [semantic versioning](https://semver.org/) (pre-1.0: a minor version may change behavior). The reasoning behind each change is in [DESIGN.md](DESIGN.md).
 
+## 0.23.0 — 2026-11-10
+
+A review of the mechanisms, each problem reproduced before it was fixed (DESIGN.md §7.6).
+
+- The daily maintenance runs. It never did: archiving what goes unused, trimming full budgets and retrying what could not be evaluated only happened in the tests.
+- A change to a CLAUDE.md always waits for you, also when its path is written with `~` (it was written directly).
+- An addition is whole lines added to a file. Words put inside an existing line ("do not" in front of a rule, a clause after it) now count as a correction and wait for you, as does any change to a description.
+- If you delete a memory or skill Ouroboros learned (or Claude Code removes it while tidying its memory), Ouroboros notices at the next session start: it is shown as *File gone*, leaves every count and budget, its leftover line in `MEMORY.md` is removed, and it is not saved again unless you ask or something new comes up. Put the file back and it is active again (a project skill missing only because you switched branch comes back the same way, without being treated as thrown out).
+- A long session whose review stops halfway (a failed call, the budget) is finished later from where it stopped, instead of being marked as reviewed. A review that failed, or that the month's budget could not pay for, is tried again too.
+- Fewer in-session reviews you did not need: tests that fail until the code is fixed, or a flaky command retried, no longer ask for one; the count of turns ignores prompts you did not type (scheduled tasks, subagents reporting back); and above 150k tokens of context (`inloop_review_max_context`) the stretch is left to the end-of-session review. The monthly budget's description now says what it covers: in-session reviews are not in it.
+- A new skill proposed by the end-of-session review waits for your approval in every autonomy mode, as does anything that review cannot tie to a turn of yours. Skills Claude saves in session still follow the autonomy setting.
+- Skills no longer pre-approve every `node` command, only their own script, and approving is no longer something the learning review's script can do.
+- The secret check also catches passwords inside URLs, bearer tokens, more token formats and "the password is …"; it no longer refuses a reference such as `$TOKEN` or `process.env.X`.
+- The correction rate is read by the same model call with learning on or off. Sessions measured before this version keep their counts (same rules, a slightly different prompt). Measuring a session with learning off now takes two small calls instead of one.
+
 ## 0.22.0 — 2026-11-10
 
 - Learn now, promote on approval. A rule about a project that belongs in its CLAUDE.md or a rule file still waits for your approval before that file changes, but Claude knows it from the next session: it is saved at once as a project memory. Approving writes the line and retires the memory; rejecting keeps the memory. Until now such rules did nothing until you opened the inbox, and you could find yourself repeating a correction that was waiting there.

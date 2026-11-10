@@ -8,9 +8,11 @@
 //   route  belongs to an existing owner file: the editor composes the change there
 //   fix    a workaround for a fixable defect: suggested to the user, not learned
 // Screening never writes text into existing files; it only sees excerpts of them.
+import path from 'node:path';
 import { options } from './config.mjs';
 import { buildIndex, ownersMap } from './knowledge.mjs';
 import { assertBudget } from './db.mjs';
+import { gitRoot } from './paths.mjs';
 import { runModel, usageOf } from './review-worker.mjs';
 import { destinationsText } from './router.mjs';
 import { languageRule, rubricText } from './rubric.mjs';
@@ -173,7 +175,12 @@ export function rejectionDocs(db, { exclude = [] } = {}) {
     .map((r) => ({ file: '(rejected proposal)', kind: 'rejected', heading: r.title, text: `${r.title}\n${r.claim || r.summary || ''}` }));
   const undone = db.prepare("SELECT title, path FROM learnings WHERE status = 'reverted' AND updated_at >= ?").all(since)
     .map((r) => ({ file: '(undone learning)', kind: 'rejected', heading: r.title, text: `${r.title} (was saved to ${r.path} and undone by the user)` }));
-  return [...rejected, ...undone];
+  // A learning whose file was deleted outside Ouroboros (by the user, or by Claude Code tidying its memory).
+  // (not a file in a git working tree: there it may only be on another branch)
+  const removed = db.prepare("SELECT title, path FROM learnings WHERE status = 'removed' AND origin_session IS NOT 'native' AND updated_at >= ?").all(since)
+    .filter((r) => !gitRoot(path.dirname(r.path)))
+    .map((r) => ({ file: '(deleted learning)', kind: 'rejected', heading: r.title, text: `${r.title} (was saved to ${r.path}; the file was deleted afterwards, outside Ouroboros)` }));
+  return [...rejected, ...undone, ...removed];
 }
 
 /**

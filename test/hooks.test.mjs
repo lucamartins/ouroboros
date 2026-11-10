@@ -59,7 +59,7 @@ test('capture: turns, skills, memory writes, recovery and long turns', () => {
   hook('UserPromptSubmit', { prompt: 'install the deps' });
   hook('PostToolUseFailure', { tool_name: 'Bash', tool_input: { command: 'npm install' }, error: 'Exit code 1' });
   hook('PostToolUseFailure', { tool_name: 'Bash', tool_input: { command: 'cd x && npm install --force' }, error: 'Exit code 1' });
-  hook('PostToolUse', { tool_name: 'Bash', tool_input: { command: 'npm install' }, tool_response: {} });
+  hook('PostToolUse', { tool_name: 'Bash', tool_input: { command: 'npm install --legacy-peer-deps' }, tool_response: {} });
   hook('PostToolUse', { tool_name: 'Skill', tool_input: { skill: 'deploy' } });
   hook('UserPromptExpansion', { expansion_type: 'slash_command', command_name: 'review', command_source: 'plugin' });
   hook('PostToolUse', {
@@ -81,6 +81,7 @@ test('capture: turns, skills, memory writes, recovery and long turns', () => {
   const recovery = kinds.find((k) => k.kind === 'recovery');
   assert.equal(recovery.target, 'Bash:npm install');
   assert.equal(JSON.parse(recovery.payload).failures, 2);
+  assert.equal(JSON.parse(recovery.payload).changed, true, 'the command that worked is not the one that failed first');
   assert.deepEqual(kinds.filter((k) => k.kind === 'skill_used').map((k) => k.target), ['deploy', 'review']);
   const write = kinds.find((k) => k.kind === 'memory_write');
   assert.equal(write.agent_id, 'sub-1');
@@ -149,10 +150,16 @@ test('with learning off the end-of-session review only measures', async () => {
   hook('SessionEnd', { session_id: 's4', reason: 'other' }, off);
   const d = db();
   const review = await waitFor(() => d.prepare("SELECT * FROM reviews WHERE session_id = 's4'").get());
-  assert.equal(review.mode, 'measure', review.detail);
-  assert.equal(review.status, 'ok', review.detail);
-  assert.equal(review.instrument, 'corrections', 'a measure-mode review is the instrument: one call, no second pass');
-  assert.equal(d.prepare("SELECT COUNT(*) n FROM reviews WHERE session_id = 's4'").get().n, 1);
+  // The correction rate is read by the instrument, the same call as with learning on
+  // (v0.23); the measure review itself only lists what would have been learned.
+  assert.equal(review.mode, 'corrections', review.detail);
+  assert.equal(review.instrument, 'corrections');
+  assert.equal(review.corrections, 1);
+  const measure = await waitFor(() => d.prepare("SELECT * FROM reviews WHERE session_id = 's4' AND mode = 'measure'").get());
+  assert.equal(measure.status, 'ok', measure.detail);
+  assert.equal(measure.instrument, null);
+  assert.equal(measure.corrections, 0);
+  assert.equal(d.prepare("SELECT COUNT(*) n FROM reviews WHERE session_id = 's4'").get().n, 2);
   const c = await waitFor(() => d.prepare("SELECT * FROM candidates WHERE session_id = 's4'").get());
   assert.equal(c.outcome, null);
   d.close();
@@ -205,7 +212,8 @@ test('early review: after a turn that worked through repeated failures, not afte
     hook('UserPromptSubmit', sid);
     for (let i = 0; i < calls; i++) hook('PostToolUse', { ...sid, tool_name: 'Read', tool_input: { file_path: `/f${i}` }, tool_response: {} });
     for (let i = 0; i < failures; i++) hook('PostToolUseFailure', { ...sid, tool_name: 'Bash', tool_input: { command: 'npm test' }, error: 'Exit code 1' });
-    if (failures) hook('PostToolUse', { ...sid, tool_name: 'Bash', tool_input: { command: 'npm test' }, tool_response: {} });
+    // The command that works is not the one that failed: a flag was the working path.
+    if (failures) hook('PostToolUse', { ...sid, tool_name: 'Bash', tool_input: { command: 'npm test -- --run' }, tool_response: {} });
     return requested(hook('Stop', { ...sid, stop_hook_active: false }));
   };
   // A long turn (20 tool calls) with nothing failing: no review.

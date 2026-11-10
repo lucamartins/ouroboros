@@ -2,7 +2,8 @@
 name: undo
 description: Revert an Ouroboros learning write (the last one, or a given learning id). Use when the user asks to undo, revert or discard something Ouroboros just learned or updated.
 argument-hint: "[learning id, or empty for the last write]"
-allowed-tools: Bash(node:*)
+allowed-tools:
+  - Bash(node --no-warnings *scripts/curator.mjs* *)
 ---
 
 # Undo an Ouroboros write

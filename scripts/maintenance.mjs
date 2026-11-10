@@ -3,12 +3,14 @@
 // `consolidateAt`. Everything goes through the curator, so it is undoable.
 import path from 'node:path';
 import { options } from './config.mjs';
-import { forget, indexEntriesIn } from './curator.mjs';
-import { getMeta, logError, monthSpend, setMeta } from './db.mjs';
+import { forget, indexEntriesIn, reconcile } from './curator.mjs';
+import { logError, monthSpend, setMeta } from './db.mjs';
 import { loadSettings } from './settings.mjs';
 
 const DAY = 86_400_000;
-const MIN_INTERVAL = 20 * 60 * 60 * 1000;
+// A little under the hook's own threshold (hook.MAINTENANCE_EVERY_MS, 20 h): a session that
+// starts right at it must not find the previous run a few seconds too recent.
+const MIN_INTERVAL = 19 * 60 * 60 * 1000;
 const KEEP_CONFIDENCE = 0.7; // unused learnings at or above this are kept
 const TARGET_RATIO = 0.7; // consolidate down to 70% of a budget
 
@@ -98,12 +100,23 @@ export async function consolidate(db, settings, opts) {
   return report;
 }
 
+/** Take the run if none started in the last MIN_INTERVAL (atomic: a single statement). */
+function claimRun(db, now) {
+  return db.prepare(`
+    INSERT INTO meta (key, value) VALUES ('maintenance_at', ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE CAST(meta.value AS INTEGER) <= ?`).run(String(now), now - MIN_INTERVAL).changes > 0;
+}
+
 export async function maintain(db, { force = false, now = Date.now() } = {}) {
-  const last = Number(getMeta(db, 'maintenance_at')) || 0;
-  if (!force && now - last < MIN_INTERVAL) return { status: 'skipped', reason: 'ran recently' };
-  setMeta(db, 'maintenance_at', now);
+  // One claim, made here and nowhere else: of the workers started by sessions that
+  // begin together, the one whose write lands takes the day's run.
+  if (force) setMeta(db, 'maintenance_at', now);
+  else if (!claimRun(db, now)) return { status: 'skipped', reason: 'ran recently' };
   const settings = loadSettings();
   const opts = options();
+  // Before anything is archived or counted: records whose file is gone.
+  let reconciled = { removed: [], restored: [] };
+  try { reconciled = reconcile(db, now); } catch (err) { logError(db, 'maintenance:reconcile', err); }
   const decayed = decay(db, settings, now);
   let tidied = null;
   const waiting = db.prepare("SELECT COUNT(*) n FROM candidates WHERE outcome IN ('pending', 'queued') AND triaged_at IS NULL AND changeset_id IS NULL").get().n
@@ -126,5 +139,5 @@ export async function maintain(db, { force = false, now = Date.now() } = {}) {
     ...(cons.archived.length ? [`🧹 archived ${cons.archived.length} to stay within budget: ${cons.archived.slice(0, 5).join('; ')}`] : []),
   ];
   if (lines.length) db.prepare('INSERT INTO notices (ts, session_id, text) VALUES (?, ?, ?)').run(now, 'maintenance', lines.join('\n'));
-  return { status: 'ok', decayed, trimmed: cons.archived, pruned, tidied, cost: cons.cost + (tidied?.cost || 0) };
+  return { status: 'ok', decayed, trimmed: cons.archived, removed: reconciled.removed.map((l) => l.title), restored: reconciled.restored.map((l) => l.title), pruned, tidied, cost: cons.cost + (tidied?.cost || 0) };
 }

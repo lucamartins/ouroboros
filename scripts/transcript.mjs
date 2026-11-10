@@ -82,16 +82,16 @@ export function buildDigest(entries, { fromLine = 0, maxChars = 80_000, maxParts
       lastAssistant = -1;
       humanTurns++;
       userTurns.push({ n: humanTurns, text: clip(textOf(e.message.content), QUOTE_CHARS), ts: e.timestamp || null });
-      lines.push({ kind: 'user', text: `[USER #${humanTurns}] ${clip(textOf(e.message.content), 2000)}` });
+      lines.push({ kind: 'user', at: i, text: `[USER #${humanTurns}] ${clip(textOf(e.message.content), 2000)}` });
       continue;
     }
     if (e.type === 'assistant' && Array.isArray(e.message?.content)) {
       for (const c of e.message.content) {
         if (c.type === 'text' && c.text?.trim()) {
-          lines.push({ kind: 'assistant', raw: c.text, text: `[ASSISTANT] ${clip(c.text, 600)}` });
+          lines.push({ kind: 'assistant', at: i, raw: c.text, text: `[ASSISTANT] ${clip(c.text, 600)}` });
           lastAssistant = lines.length - 1;
         }
-        else if (c.type === 'tool_use') lines.push({ kind: 'tool', text: `[TOOL] ${describeToolUse(c)}` });
+        else if (c.type === 'tool_use') lines.push({ kind: 'tool', at: i, text: `[TOOL] ${describeToolUse(c)}` });
       }
       continue;
     }
@@ -99,7 +99,7 @@ export function buildDigest(entries, { fromLine = 0, maxChars = 80_000, maxParts
       for (const c of e.message.content) {
         if (c?.type === 'tool_result' && c.is_error) {
           const t = typeof c.content === 'string' ? c.content : textOf(c.content);
-          lines.push({ kind: 'error', text: `[ERROR] ${clip(t, 300)}` });
+          lines.push({ kind: 'error', at: i, text: `[ERROR] ${clip(t, 300)}` });
         }
       }
     }
@@ -132,7 +132,12 @@ export function buildDigest(entries, { fromLine = 0, maxChars = 80_000, maxParts
     parts.splice(1, omitted);
   }
   const chunks = parts.map((p) => render(p));
-  return { text: chunks[0], chunks, omitted, humanTurns, userTurns, nextLine: entries.length };
+  // `partStarts[k]` is the transcript line part k starts at
+  // (where a review that stopped before it resumes), `partTurns[k]` its user turns.
+  const partStarts = parts.map((p, k) => (k === 0 ? fromLine : p.find((l) => l.at !== undefined)?.at ?? null));
+  for (let k = partStarts.length - 1; k > 0; k--) if (partStarts[k] === null) partStarts[k] = partStarts[k + 1] ?? entries.length;
+  const partTurns = parts.map((p) => p.filter((l) => l.kind === 'user').length);
+  return { text: chunks[0], chunks, omitted, humanTurns, userTurns, nextLine: entries.length, partStarts, partTurns };
 }
 
 const EARLIER_CHARS = 5000;
@@ -206,6 +211,20 @@ export function countLines(file) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Size of the conversation's context, in tokens, as the last model call of the main
+ * conversation saw it (what it read fresh, from the cache and wrote to the cache).
+ * An in-session review reads all of it again, at least twice.
+ */
+export function contextTokens(entries) {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i];
+    const u = e && e.type === 'assistant' && !e.isSidechain ? e.message?.usage : null;
+    if (u) return (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+  }
+  return 0;
 }
 
 /** Token usage of the assistant messages from `fromLine` on. */

@@ -2,7 +2,8 @@
 name: learn
 description: Save what was learned in this session as memories, skills or additions to CLAUDE.md files, through Ouroboros (deduplicated, routed, undoable). Use when the user asks you to remember something, after the user corrects your approach, after you find the working path following errors, or when asked to review or learn from the session.
 argument-hint: "[what to learn, or empty to review the session]"
-allowed-tools: Bash(node:*)
+allowed-tools:
+  - Bash(node --no-warnings *scripts/curator.mjs* *)
 ---
 
 # Learn (Ouroboros)
@@ -100,6 +101,7 @@ The first lines are a human summary; the last line is JSON.
 - `created` / `patched` → tell the user one line per item: `📝 learned: <title>` (or `📝 updated: …`).
 - `queued` → it waits for approval (decide with `/ouroboros:inbox` or in `/ouroboros:dashboard`). When the result says it is *active now as a project memory* (an addition to the project's CLAUDE.md or a rule file), say `📝 learned: <title> (as a project memory; also proposed for <file>)`: it already applies, and approving only moves it into the file. Otherwise say `⏳ waiting for approval: <title>`.
 - `has_owner` → a file Claude already reads speaks about this topic (the result names it, with the excerpt). Read that file: if it already says it, drop the item; if it lacks the detail, re-submit as a `patch` to it; only if the topic really belongs elsewhere, re-submit the same item with `"owner_checked": true`.
+- `was_removed` → this was saved before and its file was deleted afterwards, by the user or by Claude Code itself (the result names it). Do not save it again on your own: only if the user asks for it now, or the item says something the deleted one did not, re-submit the same item with `"removed_checked": true`.
 - `duplicate` → read the existing item it names and, if the new information adds something, re-submit as a `patch` to that target.
 - `over_budget` → consolidate first: merge or shorten items with patches, or archive a stale one with `/ouroboros:forget`, then retry.
 - `rejected` → fix the cause it states, or drop the item.

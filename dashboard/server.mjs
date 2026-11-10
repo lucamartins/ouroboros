@@ -7,7 +7,8 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { openDb } from '../scripts/db.mjs';
+import { reconcile } from '../scripts/curator.mjs';
+import { logError, openDb } from '../scripts/db.mjs';
 import { dataDir } from '../scripts/paths.mjs';
 import { createApi } from './api.mjs';
 import { runAction } from './actions.mjs';
@@ -167,6 +168,13 @@ async function serve(args) {
   }
   let lastRequest = Date.now();
   let lastVersionCheck = 0;
+  let lastReconcile = 0;
+  /** Files deleted outside Ouroboros while the dashboard is open: the page never shows them as learned. */
+  const inStep = () => {
+    if (Date.now() - lastReconcile < 15_000) return;
+    lastReconcile = Date.now();
+    try { reconcile(db); } catch (err) { logError(db, 'dashboard:reconcile', err); }
+  };
   let port;
 
   /** True once the code on disk differs from what this process loaded. */
@@ -212,6 +220,7 @@ async function serve(args) {
         return;
       }
       try {
+        inStep();
         const body = api(url.pathname.slice(5), url.searchParams);
         if (body === undefined) { res.writeHead(404).end(); return; }
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });

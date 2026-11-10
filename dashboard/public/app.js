@@ -980,16 +980,18 @@ function learnedRow(c) {
   const main = c.files[0];
   const f = main ? fileLabel(main.file) : null;
   const archived = l && l.status === 'archived' && c.op === 'create';
+  // The file is gone, and Ouroboros did not remove it: the user deleted it, Claude Code tidied its memory, or it is on another branch.
+  const removed = l && l.status === 'removed';
   const used = l && l.uses ? `used ${fmt.plural(l.uses, 'time')}${l.last_used_at ? `, last ${fmt.when(l.last_used_at)}` : ''}` : null;
   const wrote = c.files.flatMap((x) => (x.created ? [h('pre', { class: 'diff' }, h('ins', { class: 'line' }, x.text || '(empty)'))]
     : x.removed ? [h('div', { class: 'small muted' }, `Removed ${tilde(x.file)}`)]
       : x.hunks.map(hunkDiff)));
   const origin = ORIGIN[c.actor] || c.actor;
-  return h('li', { class: `learned${c.undone || archived ? ' faded' : ''}`, 'data-entry': `b:${c.batch}` },
+  return h('li', { class: `learned${c.undone || archived || removed ? ' faded' : ''}`, 'data-entry': `b:${c.batch}` },
     h('div', { class: 'row-main' },
       h('div', { class: 'row-title', tabindex: '-1', 'data-row-focus': '' }, c.title),
       h('div', { class: 'item-meta' },
-        c.undone ? pill('Undone', 'bad', 'bad') : archived ? pill('Archived', '') : pill(changeKind(c), c.op === 'patch' && /^Correction/.test(changeKind(c)) ? 'warn' : ''),
+        c.undone ? pill('Undone', 'bad', 'bad') : removed ? h('span', { class: 'pill warn', title: 'Its file is no longer there: deleted outside Ouroboros (by you, or by Claude Code tidying its memory), or, in a repository, on another branch. It is out of every count, and active again if the file returns.' }, 'File gone') : archived ? pill('Archived', '') : pill(changeKind(c), c.op === 'patch' && /^Correction/.test(changeKind(c)) ? 'warn' : ''),
         f ? h('span', { class: 'mono', title: tilde(main.file) }, `${f.dir}${f.name}`) : null,
         h('span', { title: fmt.datetime(c.ts) }, fmt.when(c.ts)),
         h('span', {}, c.project_name ? `${origin} · ${c.project_name}` : origin),
@@ -1754,7 +1756,7 @@ function outcomePill(o) {
   return pill(label, '', tone || null);
 }
 function reviewState(st) {
-  const map = { done: ['good', 'reviewed'], ok: ['good', 'done'], queued: ['warn', 'queued'], running: ['info', 'running'], skipped: ['', 'skipped'], failed: ['bad', 'failed'] };
+  const map = { done: ['good', 'reviewed'], ok: ['good', 'done'], queued: ['warn', 'queued'], running: ['info', 'running'], skipped: ['', 'skipped'], failed: ['bad', 'failed'], waiting: ['warn', 'to finish later'] };
   const [tone, label] = map[st] || ['', 'not reviewed'];
   return pill(label, '', tone || null);
 }
