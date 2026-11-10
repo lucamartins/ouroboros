@@ -14,7 +14,7 @@ import { applyChangeset, applyEdits, claimsOf, fileDisplayName, getChangeset, ha
 import { containsSecret, decideQueued, interimOf, writeText } from './curator.mjs';
 import { options } from './config.mjs';
 import { knowledgeKind } from './knowledge.mjs';
-import { dataDir, memoryDirFor, projectIdFor } from './paths.mjs';
+import { dataDir, memoryDirFor, projectIdFor, readKnowledgeFile } from './paths.mjs';
 import { citedTurns, quotesFor, readTranscript, userTurnsOfReview } from './transcript.mjs';
 import { lineDiff, wordDiff } from './textdiff.mjs';
 
@@ -24,8 +24,9 @@ function payloadOf(row) {
   try { return JSON.parse(row?.payload || '{}'); } catch { return {}; }
 }
 
+/** The file a waiting change targets (a global CLAUDE.md that does not exist yet reads as its title). */
 function readOrNull(file) {
-  try { return fs.readFileSync(file, 'utf8'); } catch { return null; }
+  return readKnowledgeFile(file);
 }
 
 function oneLine(s, max = 160) {

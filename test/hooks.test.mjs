@@ -119,7 +119,7 @@ test('SessionEnd runs a background review that writes learnings and leaves a not
   d.close();
   assert.ok(fs.existsSync(path.join(tmp, 'claude', 'projects', '-tmp-proj', 'memory', 'use-pnpm.md')));
   assert.equal(fs.existsSync(path.join(tmp, 'ouroboros', 'user.md')), false);
-  assert.doesNotMatch(fs.readFileSync(path.join(tmp, 'claude', 'CLAUDE.md'), 'utf8'), /Git Bash/);
+  assert.equal(fs.existsSync(path.join(tmp, 'claude', 'CLAUDE.md')), false, 'a proposal does not create the global CLAUDE.md: approving it does');
 
   const first = JSON.parse(hook('SessionStart', { session_id: 's3', source: 'startup' }));
   assert.match(first.systemMessage, /📝 learned: Use pnpm/);

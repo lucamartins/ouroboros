@@ -41,14 +41,16 @@ test('appendToSection adds under a heading, under a bold topic, or at the end', 
   assert.equal(appendToSection('a\n', 'nowhere', 'b'), 'a\nb\n');
 });
 
-test('corrections and changes to rule files or CLAUDE.md always wait for approval', () => {
+test('corrections and changes to a file a person wrote (rules, CLAUDE.md, their skills) always wait for approval', () => {
   const rule = path.join(root, 'x', '.claude', 'rules', 'billing.md');
   const claudeMd = path.join(root, 'x', 'CLAUDE.md');
   const skill = path.join(root, 'x', '.claude', 'skills', 'a', 'SKILL.md');
   assert.equal(needsApproval({ op: 'patch', target: rule, confidence: 0.9 }, 'background', 'auto'), true);
   assert.equal(needsApproval({ op: 'patch', target: claudeMd, confidence: 0.9 }, 'inloop', 'auto'), true);
   assert.equal(needsApproval({ op: 'patch', target: skill, corrects: true, confidence: 0.9 }, 'background', 'auto'), true);
-  assert.equal(needsApproval({ op: 'patch', target: skill, confidence: 0.9 }, 'background', 'auto'), false);
+  assert.equal(needsApproval({ op: 'patch', target: skill, confidence: 0.9 }, 'background', 'auto'), true, 'a skill a person wrote');
+  assert.equal(needsApproval({ op: 'patch', target: skill, confidence: 0.9 }, 'requested', 'auto'), true, 'whoever Claude says asked');
+  assert.equal(needsApproval({ op: 'patch', target: skill, confidence: 0.9, ownFile: true }, 'background', 'auto'), false, 'a skill Ouroboros created is its own');
   assert.equal(needsApproval({ op: 'patch', target: rule, corrects: true }, 'manual', 'queue'), false, 'explicit requests are written');
 });
 

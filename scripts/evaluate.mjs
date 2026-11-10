@@ -19,7 +19,7 @@ import { apply as curatorApply, DUPLICATE_THRESHOLD, interimOf, learnMeanwhile, 
 import { applyChangeset, applyEdits, changesetNeedsApproval, claimsOf, fileDisplayName, getChangeset, pendingChangeset, saveChangeset } from './changesets.mjs';
 import { acquireLease, assertBudget, BudgetError, logError, releaseLease, renewLease } from './db.mjs';
 import { buildIndex, groundIdentifiers, identifiersIn, knowledgeFiles, knowledgeKind, PATCHABLE, resolveOwner, tokenize } from './knowledge.mjs';
-import { ensureGlobalInstructions } from './paths.mjs';
+import { globalInstructionsFile, readKnowledgeFile } from './paths.mjs';
 import { refFile } from './session-state.mjs';
 import { insertReview, runModel, usageOf } from './review-worker.mjs';
 import { rubricText } from './rubric.mjs';
@@ -186,7 +186,7 @@ export function elsewhereFor(file, claims, cwd, exclude = []) {
  * the safe ones. Returns { status: Map(id -> {status, reason}), applied, rejected, base, cost }.
  */
 export async function composeFile({ file, claims, cwd, model, exclude = [] }) {
-  const base = fs.readFileSync(file, 'utf8');
+  const base = readKnowledgeFile(file);
   const kind = knowledgeKind(file);
   const all = claims.map((c) => c.claim).join('\n');
   const grounding = groundIdentifiers(identifiersIn(all), cwd);
@@ -262,7 +262,7 @@ function claimFrom(row, overrides = {}) {
 export async function composeRoutes(db, routes, ctx) {
   const report = { changesets: 0, applied: 0, queued: 0, covered: 0, contradicted: 0, conflicts: 0, unwritten: 0, cost: 0, calls: 0, results: [] };
   for (const [file, fresh] of routes) {
-    if (!fs.existsSync(file)) {
+    if (readKnowledgeFile(file) === null) {
       // The file is gone (a removed worktree, a deleted skill): nothing to compose, and
       // retrying forever helps nobody. The learnings stay visible, with the reason.
       const now = Date.now();
@@ -477,7 +477,7 @@ export async function evaluate(db, rows, ctx) {
   for (const { row, item, note } of creates) {
     if (isGlobalFact(item)) {
       // A fact valid on every project belongs in the global CLAUDE.md: the editor places it.
-      const file = ensureGlobalInstructions();
+      const file = globalInstructionsFile();
       const claim = [item.text, item.description, item.body].filter(Boolean).join('\n') || item.title;
       // The same fact already waiting for that file (another session proposed it): keep one.
       const pending = pendingChangeset(db, file);

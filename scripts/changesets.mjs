@@ -4,12 +4,11 @@
 // to the same file. Edits are exact fragments the model chose; this module decides
 // whether they are safe to apply, and applies them through the curator's ledger.
 import crypto from 'node:crypto';
-import fs from 'node:fs';
 import path from 'node:path';
 import { appendToSection, containsSecret, createdByOuroboros, interimOf, needsApproval, ownUntouched, retireInterim, setDescription, writeText } from './curator.mjs';
 import { parseFrontmatter } from './inventory.mjs';
 import { knowledgeKind } from './knowledge.mjs';
-import { projectIdFor } from './paths.mjs';
+import { projectIdFor, readKnowledgeFile } from './paths.mjs';
 import { addedText, isInsertion } from './textdiff.mjs';
 
 /** A changeset may grow a file by at most this many characters. */
@@ -173,8 +172,8 @@ export function changesetNeedsApproval(db, cs, actor, autonomy) {
   const claims = claimsOf(db, cs.id);
   const confidence = claims.length ? Math.min(...claims.map((c) => c.confidence ?? 0.6)) : 0.6;
   const kind = knowledgeKind(cs.file);
-  // A learned-preferences rule file is Ouroboros's own: adding to it is not a change to a file a person wrote.
-  const ownFile = kind === 'rules' && createdByOuroboros(db, cs.file);
+  // A rule file or a skill Ouroboros created is its own: adding to it is not a change to a file a person wrote.
+  const ownFile = ['rules', 'skill'].includes(kind) && createdByOuroboros(db, cs.file);
   return needsApproval({ op: 'patch', target: cs.file, kind: kind === 'skill' ? 'skill' : 'memory', corrects: !!cs.corrects, confidence, ownFile, ownUntouched: ownUntouched(db, cs.file) }, actor, autonomy);
 }
 
@@ -186,8 +185,8 @@ export function changesetNeedsApproval(db, cs, actor, autonomy) {
 export function applyChangeset(db, id, { actor = 'manual' } = {}) {
   const cs = getChangeset(db, id);
   if (!cs || cs.status !== 'pending') return { status: 'not_found', reason: 'no pending change with that id' };
-  let current;
-  try { current = fs.readFileSync(cs.file, 'utf8'); } catch {
+  const current = readKnowledgeFile(cs.file);
+  if (current === null) {
     db.prepare("UPDATE changesets SET status = 'stale', note = ? WHERE id = ?").run('the file no longer exists', id);
     return { status: 'stale', reason: 'the file no longer exists' };
   }
@@ -235,7 +234,8 @@ export function rejectChangeset(db, id) {
  */
 export function queueEdit(db, item, payload, actor) {
   const file = path.resolve(String(item.target));
-  const base = fs.readFileSync(file, 'utf8');
+  const base = readKnowledgeFile(file);
+  if (base === null) throw new Error(`file not found: ${file}`);
   const edit = item.append !== undefined
     ? { append: item.append, section: item.section || '', corrects: !!item.corrects }
     : { old: item.old, new: item.new ?? '', corrects: !!item.corrects };
@@ -270,8 +270,7 @@ export function queueEdit(db, item, payload, actor) {
 
 /** A changeset as the dashboard shows it. */
 export function changesetView(db, cs) {
-  let current = null;
-  try { current = fs.readFileSync(cs.file, 'utf8'); } catch { /* gone */ }
+  const current = readKnowledgeFile(cs.file);
   const claims = claimsOf(db, cs.id);
   return {
     key: `cs:${cs.id}`, id: cs.id, type: 'changeset', file: cs.file, kind: cs.kind, corrects: !!cs.corrects, note: cs.note,

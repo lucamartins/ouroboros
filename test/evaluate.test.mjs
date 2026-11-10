@@ -197,13 +197,25 @@ test('corrections replace the wrong text and wait for approval even in auto mode
   assert.match(fs.readFileSync(skill, 'utf8'), /Run the tool with --safe\./);
 });
 
-test('in auto mode an addition to a skill reference file is written at once', async () => {
+test('an addition to a skill a person wrote waits even in auto mode, and is known meanwhile as a project memory', async () => {
+  // Until v0.23 it was written at once: a line added to the user's own skill, unasked.
   await propose(ref, ['| term | the length of a plan |'], { autonomy: 'auto' });
-  assert.equal(pending(ref), undefined);
+  const p = pending(ref);
+  assert.ok(p, 'the change waits');
+  assert.equal(p.corrects, 0);
+  assert.doesNotMatch(fs.readFileSync(ref, 'utf8'), /\| term \|/);
+  const waiting = db.prepare("SELECT id, outcome FROM candidates WHERE claim LIKE '| term |%'").get();
+  assert.equal(waiting.outcome, 'queued');
+  const standIn = curator.interimOf(db, waiting.id);
+  assert.ok(standIn && fs.existsSync(standIn.path), 'Claude knows it now, from a project memory');
+  assert.match(fs.readFileSync(standIn.path, 'utf8'), /proposed as a line for tool\/reference\/glossary\.md/);
+  // Approving writes the line and retires the stand-in.
+  assert.equal(cs.applyChangeset(db, p.id).status, 'patched');
   assert.match(fs.readFileSync(ref, 'utf8'), /\| plan \| a price \|\n\| term \| the length of a plan \|/);
   const row = db.prepare("SELECT outcome, learning_id FROM candidates WHERE claim LIKE '| term |%'").get();
   assert.equal(row.outcome, 'patched');
   assert.ok(row.learning_id);
+  assert.equal(fs.existsSync(standIn.path), false);
 });
 
 test('patches Claude writes in session for one file join a single changeset', () => {

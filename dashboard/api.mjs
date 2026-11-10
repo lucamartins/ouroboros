@@ -530,7 +530,21 @@ export function createApi(db) {
       const split = db.prepare(`
         SELECT CASE WHEN ? IS NOT NULL AND COALESCE(session_started_at, ts) >= ? THEN 'after' ELSE 'before' END phase,
                COUNT(DISTINCT session_id) sessions, COALESCE(SUM(turns_reviewed), 0) turns, COALESCE(SUM(corrections), 0) corrections
-        FROM reviews WHERE status = 'ok' AND instrument = 'corrections' GROUP BY phase`).all(enabledAt, enabledAt ?? 0);
+        FROM reviews WHERE status = 'ok' AND instrument = 'corrections'
+          AND session_id NOT IN (SELECT id FROM sessions WHERE control = 1) GROUP BY phase`).all(enabledAt, enabledAt ?? 0);
+      // The control group (`controlProjects`): projects measured and never learned from,
+      // set against the learning projects over the same days.
+      const arm = (control, from) => {
+        const r = db.prepare(`
+          SELECT COUNT(DISTINCT session_id) sessions, COALESCE(SUM(turns_reviewed), 0) turns, COALESCE(SUM(corrections), 0) corrections
+          FROM reviews WHERE status = 'ok' AND instrument = 'corrections' AND COALESCE(session_started_at, ts) >= ?
+            AND session_id ${control ? '' : 'NOT '}IN (SELECT id FROM sessions WHERE control = 1)`).get(from);
+        return { ...r, rate: r.turns ? (r.corrections / r.turns) * 100 : null };
+      };
+      const controlSince = db.prepare(`
+        SELECT MIN(COALESCE(r.session_started_at, r.ts)) t FROM reviews r JOIN sessions s ON s.id = r.session_id
+        WHERE r.status = 'ok' AND r.instrument = 'corrections' AND s.control = 1`).get().t;
+      const concurrent = controlSince ? { since: controlSince, control: arm(true, controlSince), learning: arm(false, controlSince) } : null;
       // What the learning reviews counted on their own (in session: Claude about itself;
       // end of session: tails only). Shown apart, never mixed into the rate.
       const other = db.prepare(`
@@ -541,7 +555,7 @@ export function createApi(db) {
         return { ...r, rate: r.turns ? (r.corrections / r.turns) * 100 : null };
       };
       const series = emptySeries(since, () => ({ reviewedTurns: 0, corrections: 0, misses: 0, sessions: 0, hits: 0 }));
-      for (const r of db.prepare("SELECT COALESCE(session_started_at, ts) t, turns_reviewed, corrections FROM reviews WHERE status = 'ok' AND instrument = 'corrections' AND COALESCE(session_started_at, ts) >= ?").all(since)) {
+      for (const r of db.prepare("SELECT COALESCE(session_started_at, ts) t, turns_reviewed, corrections FROM reviews WHERE status = 'ok' AND instrument = 'corrections' AND COALESCE(session_started_at, ts) >= ? AND session_id NOT IN (SELECT id FROM sessions WHERE control = 1)").all(since)) {
         const d = series.get(dayKey(r.t));
         if (d) { d.reviewedTurns += r.turns_reviewed; d.corrections += r.corrections; }
       }
@@ -562,7 +576,7 @@ export function createApi(db) {
       const top = db.prepare(`
         SELECT id, kind, title, uses, last_used_at, confidence FROM learnings
         WHERE status = 'active' AND origin_session IS NOT 'native' ORDER BY uses DESC, updated_at DESC LIMIT 10`).all();
-      return { days, enabledAt, before: phase('before'), after: phase('after'), selfReported: { ...other, rate: other.turns ? (other.corrections / other.turns) * 100 : null }, series: [...series.values()], hits: hits.length, sessions, top };
+      return { days, enabledAt, before: phase('before'), after: phase('after'), concurrent, selfReported: { ...other, rate: other.turns ? (other.corrections / other.turns) * 100 : null }, series: [...series.values()], hits: hits.length, sessions, top };
     },
 
     cost(params) {

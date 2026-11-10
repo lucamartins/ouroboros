@@ -501,7 +501,8 @@ export async function reviewSession(db, sessionId, trigger, overrides = {}) {
   // Past sessions are measured by `backfill`; `backfill-learn` learns from them as if
   // Ouroboros had been active, without counting their corrections a second time.
   const learnBackfill = trigger === 'backfill-learn';
-  const mode = learnBackfill || (opts.learning && trigger !== 'backfill') ? 'background' : 'measure';
+  // A control project's sessions are measured and never learned from (hook.isControl).
+  const mode = learnBackfill || (opts.learning && trigger !== 'backfill' && !session.control) ? 'background' : 'measure';
   if (overrides.autonomy) opts.autonomy = overrides.autonomy;
   const base = { sessionId, mode, trigger, model: opts.reviewerModel, sessionStartedAt: session.started_at };
 

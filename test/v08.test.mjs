@@ -80,10 +80,11 @@ test('the retired profile (user.md) becomes proposals for the global CLAUDE.md a
   assert.deepEqual(rows.map((r) => [r.kind, r.outcome]), [['global', 'pending'], ['global', 'pending']]);
   assert.equal(migrate.retireProfile(db), null, 'nothing to do the second time');
 
-  // The evaluation routes them to the global CLAUDE.md (created if missing) for the editor.
+  // The evaluation routes them to the global CLAUDE.md for the editor. The user has none:
+  // it is not created by the proposal (v0.24), only when they approve.
   await ev.drainQueue(db);
   const global = path.join(tmp, 'claude', 'CLAUDE.md');
-  assert.ok(fs.existsSync(global));
+  assert.equal(fs.existsSync(global), false);
   for (const r of rows) assert.equal(path.resolve(db.prepare('SELECT target FROM candidates WHERE id = ?').get(r.id).target || ''), global);
 });
 
@@ -203,7 +204,9 @@ test('a patch Claude writes in session that rewrites text waits for approval eve
   fs.writeFileSync(skill, '---\nname: deploy\ndescription: Deploy\n---\n\n# Deploy\n\nRun migrations on startup.\n');
   const [add] = curator.apply(db, { cwd: proj, items: [{ op: 'patch', kind: 'skill', target: skill, old: 'Run migrations on startup.', new: 'Run migrations on startup.\nThen warm the cache.' }] },
     { actor: 'inloop', autonomy: 'auto' });
-  assert.equal(add.status, 'patched', add.reason);
+  // A line added to a skill a person wrote waits too since v0.24, as an addition.
+  assert.equal(add.status, 'queued', add.reason);
+  assert.equal(cs.pendingChangeset(db, skill).corrects, 0);
   const [flip] = curator.apply(db, { cwd: proj, items: [{ op: 'patch', kind: 'skill', target: skill, old: 'Run migrations on startup.', new: 'Never run migrations on startup.' }] },
     { actor: 'inloop', autonomy: 'auto' });
   assert.equal(flip.status, 'queued');

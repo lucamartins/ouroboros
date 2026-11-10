@@ -265,6 +265,10 @@ const MIGRATIONS = [
   ALTER TABLE fail_streaks ADD COLUMN edits INTEGER NOT NULL DEFAULT 0;   -- files written meanwhile (the code was being fixed)
   ALTER TABLE fail_streaks ADD COLUMN others INTEGER NOT NULL DEFAULT 0;  -- other commands run meanwhile
   `,
+  // 14 — v0.24: sessions of a control project (measured, never learned from)
+  `
+  ALTER TABLE sessions ADD COLUMN control INTEGER NOT NULL DEFAULT 0;
+  `,
 ];
 
 export function openDb(explicitDir) {

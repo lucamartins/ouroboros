@@ -14,19 +14,26 @@ export function globalInstructionsFile() {
   return path.join(claudeDir(), 'CLAUDE.md');
 }
 
+/** What a global CLAUDE.md that does not exist yet (or is empty) reads as: edits anchor on text. */
+export const GLOBAL_INSTRUCTIONS_SEED = '# Global instructions\n';
+
 /**
- * The global CLAUDE.md, created with a title when the user has none (or an empty one):
- * edits to a file are anchored on text it already holds.
+ * The text of a knowledge file, or null when it does not exist. One file is read
+ * differently: the user's global CLAUDE.md, when missing or empty, reads as its title.
+ * A fact valid on every project is proposed as an addition to that file, and a proposal
+ * must not create it: until v0.23 the file was written, outside the ledger, as soon as
+ * such a fact was proposed (even by a dry run). Now a change is composed against the
+ * title and the file comes into being when the user approves, through the ledger (its
+ * "before" is "no file", so undo removes it).
  */
-export function ensureGlobalInstructions() {
-  const file = globalInstructionsFile();
-  let text = null;
-  try { text = fs.readFileSync(file, 'utf8'); } catch { /* missing */ }
-  if (text === null || !text.trim()) {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, '# Global instructions\n');
+export function readKnowledgeFile(file) {
+  const isGlobal = path.resolve(String(file)).toLowerCase() === path.resolve(globalInstructionsFile()).toLowerCase();
+  try {
+    const text = fs.readFileSync(file, 'utf8');
+    return isGlobal && !text.trim() ? GLOBAL_INSTRUCTIONS_SEED : text;
+  } catch {
+    return isGlobal ? GLOBAL_INSTRUCTIONS_SEED : null;
   }
-  return file;
 }
 
 /** User-level Ouroboros directory (config.json, archive). */

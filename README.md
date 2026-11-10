@@ -6,6 +6,8 @@ Self-learning for Claude Code. Ouroboros reviews your sessions, turns what is wo
 
 ![Ouroboros dashboard: corrections per 100 turns before and after learning turned on](docs/screenshots/overview.png)
 
+*The screenshots on this page show demo data, not measured results.*
+
 ## How it works
 
 - **At session start**, Claude gets a short learning protocol: save preferences, corrections, conventions and working paths as you go, without being asked.
@@ -54,10 +56,10 @@ Everything else is automatic: capture hooks record turns, tool calls, error → 
 
 | Learning | Destination |
 |---|---|
-| Something a skill, rule file or CLAUDE.md already covers | an addition to that file (a correction, or a change to a CLAUDE.md or a rule file you wrote, waits for your approval; a rule waiting for a project file is active meanwhile as a project memory) |
+| Something a skill, rule file or CLAUDE.md already covers | an addition to that file. When you wrote the file (a CLAUDE.md, a rule file, one of your skills) the change waits for your approval, and is active meanwhile as a project memory; a file Ouroboros created takes additions directly. Corrections always wait |
 | A preference valid everywhere that matters for one topic (commits, code review, a tool) | `~/.claude/skills/learned-prefs-<topic>/`, a personal skill loaded when the topic comes up |
 | A preference valid everywhere that matters for certain files (a language, a file type) | `~/.claude/rules/learned-<topic>.md`, a rule loaded with those files |
-| Who you are and how you work, relevant in every session (language, OS, shell) | an addition to your global `~/.claude/CLAUDE.md`, under the section it belongs to, after your approval |
+| Who you are and how you work, relevant in every session (language, OS, shell) | an addition to your global `~/.claude/CLAUDE.md`, under the section it belongs to, after your approval (if you have no global `CLAUDE.md`, approving creates it; proposing does not) |
 | Project facts and conventions | the project's auto-memory directory + `MEMORY.md` |
 | Reusable procedures | `~/.claude/skills/learned-*`, or project skills routed by `~/.ouroboros/config.json` |
 
@@ -81,6 +83,16 @@ Everything else is automatic: capture hooks record turns, tool calls, error → 
 
 `~/.ouroboros/config.json` also takes `excludeProjects` (globs, e.g. `["**/client-*"]`): Ouroboros does nothing at all in those directories.
 
+### Is it working? Measure it against a control
+
+"Before and after" compares two periods, and between them your work, the model and your own habits changed too. For a comparison over the same weeks, name one or two projects as the control group:
+
+```json
+{ "controlProjects": ["**/billing-api"] }
+```
+
+In a control project Ouroboros only measures: it injects nothing, reviews nothing in session, and at session end counts your corrections with the same call it uses everywhere, without saving anything. The dashboard's Overview then shows corrections per 100 turns for the learning projects and for the control projects side by side, and says so while there are too few turns to compare (200 on each side). Two things to keep in mind: projects differ, so swap the control after a few weeks; and what was saved for every project (learned skills, your global CLAUDE.md) still loads in a control project, so the difference you see is that of project-level learning.
+
 ## Options
 
 Set when enabling the plugin, or later in `/config`:
@@ -89,7 +101,7 @@ Set when enabling the plugin, or later in `/config`:
 |---|---|---|
 | `learning` | `true` | Learn from sessions (off = measure only) |
 | `learning_language` | `en` | Language of saved learnings (`en`, `pt-BR` or `auto` = the conversation's) |
-| `autonomy` | `auto` | `auto` writes right away, and refines memories Ouroboros wrote itself that you never edited; `hybrid` writes confident facts and queues skills and tentative items; `queue` holds everything for approval. Explicit "remember that…" requests skip this setting. Always waiting for you, whatever the setting: corrections, changes to CLAUDE.md or rule files, a new skill proposed by the end-of-session review, and anything that review cannot tie to a turn of yours |
+| `autonomy` | `auto` | `auto` writes right away, and refines memories Ouroboros wrote itself that you never edited; `hybrid` writes confident facts and queues skills and tentative items; `queue` holds everything for approval. Explicit "remember that…" requests skip this setting. Always waiting for you, whatever the setting: corrections, changes to a file you wrote (a CLAUDE.md, a rule file, one of your skills), a new skill proposed by the end-of-session review, and anything that review cannot tie to a turn of yours |
 | `inloop_review` | `true` | Periodic in-session reviews |
 | `review_every_turns` | `10` | User turns between in-session reviews |
 | `background_review` | `true` | End-of-session review |

@@ -12,11 +12,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { options } from './config.mjs';
-import { applyChangeset, applyEdits, claimsOf, pendingChangeset, queueEdit, rejectChangeset } from './changesets.mjs';
+import { applyChangeset, applyEdits, claimsOf, fileDisplayName, pendingChangeset, queueEdit, rejectChangeset } from './changesets.mjs';
 import { getMeta, logError, openDb, setMetaOnce } from './db.mjs';
 import { listMemories, listMemoriesIn, listSkills, parseFrontmatter } from './inventory.mjs';
 import { knowledgeKind, PATCHABLE } from './knowledge.mjs';
-import { claudeDir, classifyPath, ensureGlobalInstructions, gitRoot, memoryDirFor, normalize, ouroborosDir, projectIdFor, repoRoot } from './paths.mjs';
+import { claudeDir, classifyPath, gitRoot, globalInstructionsFile, memoryDirFor, normalize, ouroborosDir, projectIdFor, readKnowledgeFile, repoRoot } from './paths.mjs';
 import { cleanPaths, findOwners, preferenceHome } from './router.mjs';
 import { addObservations, closeObservations, sessionStateText } from './session-state.mjs';
 import { ensureSettingsFile, expandHome, loadSettings, routeFor } from './settings.mjs';
@@ -329,12 +329,13 @@ function preference(item) {
 /**
  * A fact valid on every project is an addition to the user's global CLAUDE.md, which
  * Claude Code loads in every session: at the end of `section` when given, else at the
- * end of the file. Like any change to a CLAUDE.md it waits for the user, unless the
- * user asked for it.
+ * end of the file. Like any change to a CLAUDE.md it waits for the user. When the user
+ * has no such file it is not created here: it reads as its title (`readKnowledgeFile`)
+ * and is written when the change is approved.
  */
 function globalFact(item) {
   const text = String(item.text || item.append || item.body || item.description || item.title || '').replace(/\s+/g, ' ').trim();
-  const file = ensureGlobalInstructions();
+  const file = globalInstructionsFile();
   return {
     ...item, op: 'patch', kind: 'instructions', scope: 'global', target: file, section: item.section || '',
     append: text && !/^[-*]\s/.test(text) ? `- ${text}` : text, title: item.title || text.slice(0, 120), globalFact: text,
@@ -602,7 +603,7 @@ function patchItem(db, batch, item, settings, payload) {
   const t = resolvePatchTarget(db, item, settings, payload);
   if (!t) return { status: 'rejected', reason: `patch target not found: ${item.target || '(none)'}` };
   if (t.error) return { status: 'rejected', reason: t.error };
-  const before = readOrNull(t.file);
+  const before = readKnowledgeFile(t.file);
   if (before === null) return { status: 'rejected', reason: `file not found: ${t.file}` };
 
   if (item.prefText) {
@@ -649,7 +650,7 @@ function rewritesText(db, item, settings, payload) {
   if (item.op !== 'patch') return false;
   const t = resolvePatchTarget(db, item, settings, payload);
   if (!t || t.error) return false;
-  const before = readOrNull(t.file);
+  const before = readKnowledgeFile(t.file);
   if (before === null) return false;
   if (item.description) {
     // A description is one line: any change to it changes what it says.
@@ -704,8 +705,12 @@ export function needsApproval(item, actor, autonomy) {
   // `auto` only: a memory Ouroboros created and nobody edited since (`ownUntouched`, set
   // by code) may be refined without asking; the ledger undoes it.
   if (item.corrects && !(item.ownUntouched && autonomy === 'auto')) return true;
-  // (a rule file Ouroboros created for learned preferences is its own: `ownFile`)
-  if (!item.ownFile && item.op === 'patch' && item.target && path.isAbsolute(String(item.target)) && ['rules', 'instructions'].includes(knowledgeKind(item.target))) return true;
+  // (a rule file or a skill Ouroboros created is its own: `ownFile`)
+  // Since v0.24 a skill a person wrote is such a file too: until then a line could be
+  // added to it without asking, tracked project skills included. What waits is active
+  // meanwhile as a project memory (`learnMeanwhile`), so approval decides where the
+  // rule lives, not whether Claude knows it.
+  if (!item.ownFile && item.op === 'patch' && item.target && path.isAbsolute(String(item.target)) && PERSON_WRITTEN.includes(knowledgeKind(item.target))) return true;
   // A new procedure written by the end-of-session reviewer: a small model, a digest of
   // the session (which carries tool errors and what the assistant made of tool output)
   // and nobody watching. A skill is instructions later sessions follow, so it gets a look
@@ -719,6 +724,9 @@ export function needsApproval(item, actor, autonomy) {
   return item.kind === 'skill' || item.confidence < 0.7;
 }
 
+/** Kinds of file a person writes: a change to one waits for them, unless Ouroboros created the file. */
+const PERSON_WRITTEN = ['rules', 'instructions', 'skill'];
+
 function backgroundSkill(item, actor) {
   return actor === 'background' && item.op !== 'patch' && item.kind === 'skill';
 }
@@ -727,7 +735,7 @@ function backgroundSkill(item, actor) {
 function waitReason(item, actor, autonomy) {
   if (backgroundSkill(item, actor)) return 'waiting for approval: a skill proposed by the end-of-session review is always confirmed (/ouroboros:inbox or the dashboard)';
   if (item.corrects) return 'waiting for approval: it rewrites existing text (/ouroboros:inbox or the dashboard)';
-  if (needsApproval(item, 'requested', 'auto')) return 'waiting for approval: changes to CLAUDE.md and rule files are always confirmed (/ouroboros:inbox or the dashboard)';
+  if (needsApproval(item, 'requested', 'auto')) return 'waiting for approval: changes to a file you wrote (a CLAUDE.md, a rule file, one of your skills) are always confirmed (/ouroboros:inbox or the dashboard)';
   return `waiting for approval (autonomy: ${autonomy}; /ouroboros:inbox or the dashboard)`;
 }
 
@@ -742,7 +750,7 @@ export function writeText(db, { file, after, title, why = null, confidence = 0.6
   try {
     db.exec('BEGIN IMMEDIATE');
     // Read under the write lock: another writer may have changed the file meanwhile.
-    const before = readOrNull(file);
+    const before = readKnowledgeFile(file);
     const refuse = (status, reason) => { db.exec('ROLLBACK'); return { status, reason }; };
     if (before === null) return refuse('rejected', `file not found: ${file}`);
     if (expectBefore !== undefined && before !== expectBefore) return refuse('stale', 'the file changed while the change was being prepared');
@@ -842,9 +850,15 @@ export function apply(db, payload, { actor = 'manual', autonomy = 'auto', ownerC
       results.push({ status: 'rejected', title: item.title, reason: 'looks like it contains a secret (token, key or password); never store secrets' });
       continue;
     }
-    // Only code says a rule file is Ouroboros's own (one it created for learned preferences).
+    // A patch names its file in one way from here on: a learning id or a skill's name
+    // resolves to the same file as its path, and must meet the same approval rules.
+    if (item.op === 'patch' && item.target && !path.isAbsolute(String(item.target))) {
+      const t = resolvePatchTarget(db, item, settings, payload || {});
+      if (t?.file) item.target = path.resolve(t.file);
+    }
+    // Only code says a rule file or a skill is Ouroboros's own (one it created).
     if (item.op === 'patch' && item.target && path.isAbsolute(String(item.target))) {
-      item.ownFile = knowledgeKind(item.target) === 'rules' && createdByOuroboros(db, item.target);
+      item.ownFile = ['rules', 'skill'].includes(knowledgeKind(item.target)) && createdByOuroboros(db, item.target);
       item.ownUntouched = ownUntouched(db, item.target);
     }
     // In session nothing screens a new item against the files that own its topic, so the
@@ -938,9 +952,9 @@ export function interimOf(db, candidateId) {
 }
 
 /**
- * A rule about one project usually belongs in that project's CLAUDE.md or a rule file,
- * and additions to those always wait for the user (people wrote them, the team shares
- * them). Waiting used to mean Claude did not know the rule until someone opened the
+ * A rule about one project usually belongs in that project's CLAUDE.md, a rule file or
+ * a skill, and additions to those always wait for the user (people wrote them, the team
+ * shares them). Waiting used to mean Claude did not know the rule until someone opened the
  * inbox: the user repeated corrections that were sitting there. So the rule is saved at
  * once as a project memory (the same autonomy rules as any new memory), and the waiting
  * change becomes a question about where it lives: approving writes the line and
@@ -950,8 +964,12 @@ export function interimOf(db, candidateId) {
  */
 export function learnMeanwhile(db, { candidateId, file, title, claim, evidence, cwd, confidence = 0.6, sessionId, actor = 'background', autonomy = 'auto' }) {
   const target = path.resolve(String(file || ''));
-  if (!cwd || !['rules', 'instructions'].includes(knowledgeKind(target))) return null;
-  if (normalize(target).startsWith(`${normalize(path.resolve(claudeDir()))}/`)) return null; // the user's global files
+  const kind = knowledgeKind(target);
+  if (!cwd || !PERSON_WRITTEN.includes(kind)) return null;
+  // The user's global CLAUDE.md and rules hold what is true everywhere: no project's
+  // memory can stand in for them. A personal skill's addition is at least known in the
+  // project where it came up.
+  if (kind !== 'skill' && normalize(target).startsWith(`${normalize(path.resolve(claudeDir()))}/`)) return null;
   // One stand-in per waiting change, ever: if it was archived, or deleted by the user, it is not written again.
   if (candidatePayload(db, candidateId).interim) return null;
   const conf = Math.min(0.9, Math.max(0.3, Number(confidence) || 0.6));
@@ -962,7 +980,7 @@ export function learnMeanwhile(db, { candidateId, file, title, claim, evidence, 
   const [r] = apply(db, { cwd, session_id: sessionId, trigger: 'session_end', items: [{
     op: 'create', kind: 'memory', scope: 'project', memory_type: 'feedback', project_dir: cwd,
     title: String(title || one).slice(0, 120), description: one.length > 200 ? `${one.slice(0, 197)}…` : one,
-    body: `${text}\n\n**Why:** ${String(evidence || 'stated in a session').replace(/\s+/g, ' ').slice(0, 300)}\n**How to apply:** follow it in this project. It is also proposed as a line for ${path.basename(target)}; this note is retired when that change is approved.`,
+    body: `${text}\n\n**Why:** ${String(evidence || 'stated in a session').replace(/\s+/g, ' ').slice(0, 300)}\n**How to apply:** follow it in this project. It is also proposed as a line for ${fileDisplayName(target)}; this note is retired when that change is approved.`,
     confidence: conf, why: evidence,
   }] }, { actor: actor === 'manual' ? 'inloop' : actor, autonomy, promote: false });
   if (r?.status !== 'created') return null;
