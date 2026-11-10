@@ -6,6 +6,7 @@ All notable changes to Ouroboros. Versions follow [semantic versioning](https://
 
 - In `auto`, Ouroboros refines a memory it wrote itself without asking, as long as you never edited that file: a later turn or session that extends or corrects it updates it directly (undoable). A file you touched by hand, anything you wrote, and every CLAUDE.md or rule file of yours still wait for approval; `hybrid` and `queue` are unchanged.
 - When a memory is refined, its one-line description and its line in `MEMORY.md` are updated with it, so the rule Claude actually reads is the current one.
+- 0.21.1: found by simulating real use. An exception you add to a rule in a later session the same day is no longer called a conflict; a working path you confirmed is no longer dropped because a variable it names is not in the repo; a session continued one turn at a time (resume, headless calls) is reviewed instead of skipped forever; the session-start notice says what is waiting and says it once.
 
 ## 0.20.0 — 2026-11-10
 

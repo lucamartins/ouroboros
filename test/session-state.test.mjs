@@ -105,6 +105,12 @@ test('the periodic review request and the end-of-session prompt carry the state 
 test('one last turn after an earlier review is reviewed; a one-turn session with nothing behind it is not', async () => {
   session('alone', [user('what does this repo do?'), assistant('It is a plugin.')]);
   assert.equal(await worker.reviewSession(db, 'alone', 'session_end'), 'short');
+  // Skipped is not reviewed: when the session goes on, the next review reads that turn too.
+  assert.equal(db.prepare("SELECT review_cursor FROM sessions WHERE id = 'alone'").get().review_cursor, 0);
+  fs.appendFileSync(path.join(tmp, 'alone.jsonl'), `${[user('no, I asked about the tests'), assistant('Sorry: it uses node:test.')].join('\n')}\n`);
+  db.prepare("UPDATE sessions SET queue_state = 'queued' WHERE id = 'alone'").run();
+  assert.equal(await worker.reviewSession(db, 'alone', 'session_end'), 'ok');
+  assert.equal(db.prepare("SELECT turns_reviewed FROM reviews WHERE session_id = 'alone' AND mode = 'background' AND status = 'ok'").get().turns_reviewed, 2);
 
   session('tail', [user('deploy it'), assistant('Deploying from main.'), user('ok'), assistant('Done.'), user('no, never deploy from main'), assistant('Understood.')], { cursor: 4 });
   db.prepare("INSERT INTO reviews (session_id, mode, trigger, status, turns_reviewed, ts) VALUES ('tail', 'inloop', 'periodic', 'ok', 2, ?)").run(Date.now() - 1000);

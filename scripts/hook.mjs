@@ -242,7 +242,8 @@ const handlers = {
       if (notices.length) {
         db.prepare(`UPDATE notices SET delivered_at = ? WHERE id IN (${notices.map(() => '?').join(',')})`).run(now, ...notices.map((n) => n.id));
       }
-      const learnedText = notices.map((n) => n.text).join('\n');
+      // Several reviews can report the same thing (a change still waiting): say it once.
+      const learnedText = [...new Set(notices.flatMap((n) => String(n.text).split('\n')))].join('\n');
       // What waits for the user's decision (this project's and global entries): said with
       // the notices, otherwise at most once a day.
       const waiting = inboxCount(db, projectIdFor(input.cwd));

@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { options } from './config.mjs';
 import { apply as curatorApply, DUPLICATE_THRESHOLD, similarity } from './curator.mjs';
-import { applyChangeset, applyEdits, changesetNeedsApproval, claimsOf, getChangeset, pendingChangeset, saveChangeset } from './changesets.mjs';
+import { applyChangeset, applyEdits, changesetNeedsApproval, claimsOf, fileDisplayName, getChangeset, pendingChangeset, saveChangeset } from './changesets.mjs';
 import { acquireLease, assertBudget, BudgetError, logError, releaseLease, renewLease } from './db.mjs';
 import { buildIndex, groundIdentifiers, identifiersIn, knowledgeFiles, knowledgeKind, PATCHABLE, resolveOwner, tokenize } from './knowledge.mjs';
 import { ensureGlobalInstructions } from './paths.mjs';
@@ -120,7 +120,7 @@ STATUS of each claim:
 - "corrects": the file states something wrong or outdated, shown by the project evidence or by the user explicitly changing a standing rule ("from now on", "that changed"). A request made once, for one situation, never overturns a rule the file states: that claim is "conflict". Replace the wrong text.
 - "conflict": it contradicts another claim or the file, and neither the project evidence nor an explicit change of rule settles it (set conflicts_with when it is another claim). No edit; the user will decide.
 A claim marked confirmed_by_user="yes" is the user's explicit decision after seeing the conflict: it is never "conflict"; write it ("corrects" when it replaces what the file says, otherwise "adds").
-When two claims disagree, prefer the one the project evidence confirms, then an explicit change of rule, then the one from the more recent session.
+CLAIMS are listed oldest first, each with the time of its session. When two claims disagree, prefer the one the project evidence confirms, then an explicit change of rule, then the later one. A later claim in which the user states an exception to, or a refinement of, an earlier one is not a conflict with it: it is the current rule ("corrects" when the earlier one is already in the file, otherwise write both as one coherent statement).
 Read the whole file for each claim: text elsewhere in the file that says the opposite must be corrected by the same edits, or the file would contradict itself.
 
 EDITS:
@@ -141,7 +141,7 @@ ${view.text}
 CLAIMS:
 ${claims.map((c) => `<claim id="${c.id}"${c.when ? ` session="${c.when}"` : ''}${c.confidence ? ` confidence="${c.confidence}"` : ''}${c.corrects ? ' reported_stale="yes"' : ''}${c.confirmed ? ' confirmed_by_user="yes"' : ''}>\n${c.claim}${c.evidence ? `\nevidence: ${c.evidence}` : ''}\n</claim>`).join('\n')}
 
-PROJECT EVIDENCE (where the project's tracked code and config mention what the claims name; "not found" means no tracked file mentions it):
+PROJECT EVIDENCE (where the project's tracked code and config mention what the claims name; "not found" means no tracked file mentions it. That refutes a claim only when the claim is about what those files contain: a path, a script, a setting. Environment variables, error messages, external services, branch names and habits are normally not in tracked files, and a claim the user stated or an outcome observed in the session is never "contradicted" by their absence):
 ${grounding.length ? grounding.map((g) => (g.hits.length
     ? `- \`${g.id}\`:\n${g.hits.map((h) => `    ${h.file}:${h.line}: ${h.text}`).join('\n')}`
     : `- \`${g.id}\`: ${g.exists ? 'exists' : 'not found'}`)).join('\n') : '(nothing to look up)'}
@@ -236,7 +236,9 @@ function setOutcome(db, id, outcome, note, extra = {}) {
 }
 
 function when(row) {
-  return row.session_started_at ? new Date(row.session_started_at).toISOString().slice(0, 10) : undefined;
+  // Date and time: two sessions on the same day are common, and "the more recent one"
+  // decides between claims that disagree.
+  return row.session_started_at ? new Date(row.session_started_at).toISOString().slice(0, 16).replace('T', ' ') : undefined;
 }
 
 /** A claim the editor can judge, from a candidate row. */
@@ -340,12 +342,13 @@ export async function composeRoutes(db, routes, ctx) {
       const r = applyChangeset(db, csId, { actor: ctx.actor });
       if (r.status === 'patched') {
         report.applied++;
-        report.results.push({ status: 'patched', title: path.basename(file), claims: inChangeset.length, changesetId: csId });
+        report.results.push({ status: 'patched', title: `${claims.filter((c) => inChangeset.includes(c.id)).map((c) => c.title).filter(Boolean).slice(0, 2).join('; ')} → ${fileDisplayName(file)}`, claims: inChangeset.length, changesetId: csId });
         continue;
       }
     }
     report.queued++;
-    report.results.push({ status: 'queued', title: `${path.basename(file)} (${inChangeset.length} change${inChangeset.length > 1 ? 's' : ''})`, changesetId: csId });
+    const titles = claims.filter((c) => inChangeset.includes(c.id)).map((c) => c.title).filter(Boolean);
+    report.results.push({ status: 'queued', title: `${titles.slice(0, 2).join('; ')}${titles.length > 2 ? ` (+${titles.length - 2})` : ''} → ${fileDisplayName(file)}`, changesetId: csId });
   }
   return report;
 }

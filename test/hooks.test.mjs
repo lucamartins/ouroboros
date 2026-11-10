@@ -122,7 +122,7 @@ test('SessionEnd runs a background review that writes learnings and leaves a not
 
   const first = JSON.parse(hook('SessionStart', { session_id: 's3', source: 'startup' }));
   assert.match(first.systemMessage, /📝 learned: Use pnpm/);
-  assert.match(first.systemMessage, /waiting for approval: CLAUDE\.md/);
+  assert.match(first.systemMessage, /waiting for approval: Shell → CLAUDE\.md/, 'the notice says what waits, not only where');
   assert.doesNotMatch(first.hookSpecificOutput.additionalContext, /Git Bash/);
   const second = JSON.parse(hook('SessionStart', { session_id: 's3b', source: 'startup' }));
   assert.equal(second.systemMessage, undefined);

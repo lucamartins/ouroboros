@@ -489,7 +489,9 @@ export async function reviewSession(db, sessionId, trigger, overrides = {}) {
   const standsAlone = !recoveries.length && !lastReview && !(mode === 'background' && openObservations(db, sessionId).length);
   if (digest.humanTurns < 1 || (digest.humanTurns < MIN_HUMAN_TURNS && standsAlone)) {
     insertReview(db, { ...base, status: 'skipped', detail: `only ${digest.humanTurns} user turn(s)`, turns: digest.humanTurns });
-    finish(db, sessionId, 'skipped', digest.nextLine);
+    // Not reviewed, so the cursor stays: if the session goes on (a resume, one more
+    // headless call), the next review reads these turns together with the new ones.
+    finish(db, sessionId, 'skipped');
     return 'short';
   }
 
