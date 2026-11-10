@@ -96,6 +96,13 @@ test('maintenance archives unused learnings', async () => {
   assert.equal(db.prepare("SELECT status FROM learnings WHERE id = ?").get(old.id).status, 'archived');
   assert.match(db.prepare('SELECT text FROM notices ORDER BY id DESC').get().text, /🧹/);
 
+  // A feedback rule works from its line in the memory index: never being read is not disuse.
+  const [rule] = curator.apply(db, { cwd: cwdA, items: [{ kind: 'memory', memory_type: 'feedback', title: 'Ask before force pushing', description: 'Always ask before a force push', confidence: 0.4, owner_checked: true }] });
+  assert.equal(rule.status, 'created', rule.reason);
+  db.prepare('UPDATE learnings SET created_at = ? WHERE id = ?').run(Date.now() - 90 * 86_400_000, rule.id);
+  assert.deepEqual((await maintain(db, { force: true })).decayed, []);
+  assert.equal(db.prepare('SELECT status FROM learnings WHERE id = ?').get(rule.id).status, 'active');
+
 });
 
 test('learned skills past the budget are trimmed, weakest first', async () => {
@@ -218,4 +225,80 @@ test('a proposal owned by an existing doc becomes a changeset that waits for app
   assert.match(fs.readFileSync(claudeMd, 'utf8'), /Run pnpm test\.\nUse the deploy script\./);
   assert.equal(db.prepare('SELECT status FROM changesets WHERE id = ?').get(cs.id).status, 'applied');
   assert.equal(db.prepare('SELECT outcome FROM candidates WHERE id = ?').get(c.id).outcome, 'patched');
+});
+
+test('a request Claude labels as the user\'s skips the autonomy setting, never the approval rules', () => {
+  const claudeMd = path.join(cwdA, 'CLAUDE.md');
+  const before = fs.readFileSync(claudeMd, 'utf8');
+  const r = curator.apply(db, { cwd: cwdA, items: [
+    { kind: 'memory', memory_type: 'project', title: 'Staging database name', description: 'The staging database is called orders_stg', confidence: 0.4 },
+    { op: 'patch', target: claudeMd, append: 'Never push straight to main.', title: 'No direct pushes' },
+    { op: 'patch', target: claudeMd, old: 'Run pnpm test.', new: 'Run pnpm test:all.', title: 'Test command changed' },
+  ] }, { actor: 'requested', autonomy: 'queue' });
+  assert.deepEqual(r.map((x) => x.status), ['created', 'queued', 'queued']);
+  assert.match(r[1].reason, /CLAUDE\.md and rule files are always confirmed/);
+  assert.match(r[2].reason, /rewrites existing text/);
+  assert.equal(fs.readFileSync(claudeMd, 'utf8'), before);
+
+  // The CLI is what Claude calls from the learn skill: "manual" in its payload is a
+  // request, so a global fact still waits; only the inbox and the dashboard decide.
+  const cli = spawnSync(process.execPath, ['--no-warnings', path.join(root, 'scripts', 'curator.mjs'), 'apply'], {
+    input: JSON.stringify({ cwd: cwdA, actor: 'manual', items: [{ kind: 'global', text: 'Always answers reviews within one working day', confidence: 0.9 }] }),
+    encoding: 'utf8', env: { ...process.env, CLAUDE_PLUGIN_OPTION_AUTONOMY: 'auto' },
+  });
+  assert.equal(cli.status, 0, cli.stderr);
+  assert.equal(JSON.parse(cli.stdout.trim().split('\n').pop())[0].status, 'queued');
+  assert.doesNotMatch(fs.readFileSync(path.join(tmp, 'claude', 'CLAUDE.md'), 'utf8'), /one working day/);
+  for (const c of db.prepare("SELECT id FROM candidates WHERE outcome = 'queued'").all()) curator.decideQueued(db, c.id, false);
+});
+
+test('a proposal the screen gives no verdict for is never written unscreened', async () => {
+  const { tidyQueue } = await import('../scripts/evaluate.mjs');
+  curator.apply(db, { cwd: cwdA, items: [
+    { kind: 'memory', memory_type: 'project', title: 'Unscreened fact', description: 'NOVERDICT the cache lives in Redis', confidence: 0.8 },
+  ] }, { actor: 'background', autonomy: 'queue' });
+  const row = () => db.prepare("SELECT outcome, triaged_at, note FROM candidates WHERE title = 'Unscreened fact'").get();
+  const first = await tidyQueue(db, { autonomy: 'auto' });
+  assert.deepEqual([first.created, first.kept], [0, 0]);
+  assert.equal(row().triaged_at, null, 'screened once more on the next check');
+  await tidyQueue(db, { autonomy: 'auto' });
+  assert.equal(row().outcome, 'queued');
+  assert.ok(row().triaged_at);
+  assert.match(row().note, /no verdict/);
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM learnings WHERE title = 'Unscreened fact'").get().n, 0);
+  assert.equal((await tidyQueue(db, { autonomy: 'auto' })).total, 0);
+});
+
+test('a saved learning the user had to repeat is counted, and from the second time a rewording is suggested once', async () => {
+  const { recordMiss } = await import('../scripts/review-worker.mjs');
+  const l = db.prepare("SELECT * FROM learnings WHERE title = 'Ask before force pushing'").get();
+  const session = { id: 'miss-1', project: l.project, cwd: cwdA };
+  assert.equal(recordMiss(db, session, 'no-such-item'), null);
+  assert.equal(recordMiss(db, session, `${l.name}.md`), l.id);
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM candidates WHERE outcome = 'suggested' AND target = ?").get(l.path).n, 0);
+  recordMiss(db, session, l.name);
+  assert.equal(db.prepare('SELECT misses FROM learnings WHERE id = ?').get(l.id).misses, 1, 'the same session counts once');
+  recordMiss(db, { ...session, id: 'miss-2' }, l.name);
+  recordMiss(db, { ...session, id: 'miss-3' }, l.title);
+  const after = db.prepare('SELECT misses, confidence FROM learnings WHERE id = ?').get(l.id);
+  assert.deepEqual([after.misses, after.confidence], [3, l.confidence], 'a miss never lowers confidence');
+  const sug = db.prepare("SELECT title, note FROM candidates WHERE outcome = 'suggested' AND target = ?").all(l.path);
+  assert.equal(sug.length, 1);
+  assert.match(sug[0].title, /^Saved but repeated: Ask before force pushing/);
+  assert.match(sug[0].note, /^fix in the project: reword what is saved/);
+});
+
+test('a correction about something saved before the session is a miss even when the reviewer does not name it', async () => {
+  const { missFromQuote } = await import('../scripts/review-worker.mjs');
+  const [m] = curator.apply(db, { cwd: cwdA, items: [{ kind: 'memory', memory_type: 'feedback', title: 'Never commit directly to main', description: 'Every change goes through a pull request; never commit or push directly to main', confidence: 0.8, owner_checked: true }] });
+  assert.equal(m.status, 'created', m.reason);
+  const l = () => db.prepare('SELECT misses, project FROM learnings WHERE id = ?').get(m.id);
+  const session = (id, started) => ({ id, project: l().project, cwd: cwdA, started_at: started });
+  const later = Date.now() + 60_000;
+  assert.equal(missFromQuote(db, session('q1', later), 'again?! I already told you last week: never commit directly to main, always a pull request'), m.id);
+  assert.equal(missFromQuote(db, session('q1', later), 'never commit directly to main, open a pull request'), m.id);
+  assert.equal(l().misses, 1, 'once per session');
+  assert.equal(missFromQuote(db, session('q2', later), 'no, use tabs for indentation in the makefile'), null, 'another subject');
+  assert.equal(missFromQuote(db, session('q3', Date.now() - 3600_000), 'never commit directly to main, always a pull request'), null, 'saved during this session: the correction that taught it is not a miss');
+  assert.equal(l().misses, 1);
 });

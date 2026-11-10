@@ -12,9 +12,22 @@ const MIN_INTERVAL = 20 * 60 * 60 * 1000;
 const KEEP_CONFIDENCE = 0.7; // unused learnings at or above this are kept
 const TARGET_RATIO = 0.7; // consolidate down to 70% of a budget
 
+/**
+ * Whether a learning does its work without ever being read: a `feedback` or `user`
+ * memory states a rule, and its line in MEMORY.md (loaded in every session of the
+ * project) already says it. Claude follows it without opening the file, so "never read"
+ * says nothing about whether it is used. A `project` or `reference` memory is a fact or a
+ * pointer looked up on demand; for those, and for skills, a read or a use is the signal.
+ */
+export function actsThroughIndex(l) {
+  return l.kind === 'memory' && ['feedback', 'user'].includes(l.memory_type);
+}
+
 /** Score for "keep this": confidence weighted by how often it was used. */
 function score(l) {
-  return (l.confidence ?? 0.5) * (1 + Math.log2(1 + (l.uses || 0)));
+  // A rule that acts through the index counts as used: its reads are not a measure.
+  const uses = actsThroughIndex(l) ? Math.max(1, l.uses || 0) : l.uses || 0;
+  return (l.confidence ?? 0.5) * (1 + Math.log2(1 + uses));
 }
 
 export function decay(db, settings, now = Date.now()) {
@@ -23,7 +36,7 @@ export function decay(db, settings, now = Date.now()) {
     SELECT * FROM learnings
     WHERE status = 'active' AND origin_session IS NOT 'native' AND kind IN ('memory', 'skill') AND pinned = 0
       AND COALESCE(confidence, 0.5) < ? AND created_at < ? AND COALESCE(last_used_at, 0) < ?
-    ORDER BY confidence, uses`).all(KEEP_CONFIDENCE, cutoff, cutoff);
+    ORDER BY confidence, uses`).all(KEEP_CONFIDENCE, cutoff, cutoff).filter((l) => !actsThroughIndex(l));
   const archived = [];
   for (const l of stale) {
     const r = forget(db, { match: l.id });
@@ -43,6 +56,17 @@ function trimToTarget(db, rows, target) {
     if (r.status === 'archived') { archived.push(l.title); count--; }
   }
   return archived;
+}
+
+/** Capture events are kept this long (longer than any range the dashboard shows). */
+const EVENT_RETENTION_DAYS = 400;
+/** Never pruned: the all-time use counts of skills and memories are read from them. */
+const KEPT_EVENT_KINDS = ['skill_used', 'memory_read'];
+
+/** Delete old capture events (turns, failures, recoveries, writes observed), which otherwise grow forever. */
+export function pruneEvents(db, now = Date.now(), days = EVENT_RETENTION_DAYS) {
+  return db.prepare(`DELETE FROM events WHERE ts < ? AND kind NOT IN (${KEPT_EVENT_KINDS.map(() => '?').join(',')})`)
+    .run(now - days * DAY, ...KEPT_EVENT_KINDS).changes;
 }
 
 export async function consolidate(db, settings, opts) {
@@ -93,6 +117,7 @@ export async function maintain(db, { force = false, now = Date.now() } = {}) {
     }
   }
   const cons = await consolidate(db, settings, opts);
+  const pruned = pruneEvents(db, now);
   const archived = [...decayed, ...cons.archived];
   db.prepare('INSERT INTO maintenance (ts, kind, detail, archived, merged, cost_usd) VALUES (?, ?, ?, ?, ?, ?)')
     .run(now, 'daily', JSON.stringify({ decayed, trimmed: cons.archived }), archived.length, 0, cons.cost);
@@ -101,5 +126,5 @@ export async function maintain(db, { force = false, now = Date.now() } = {}) {
     ...(cons.archived.length ? [`🧹 archived ${cons.archived.length} to stay within budget: ${cons.archived.slice(0, 5).join('; ')}`] : []),
   ];
   if (lines.length) db.prepare('INSERT INTO notices (ts, session_id, text) VALUES (?, ?, ?)').run(now, 'maintenance', lines.join('\n'));
-  return { status: 'ok', decayed, trimmed: cons.archived, tidied, cost: cons.cost + (tidied?.cost || 0) };
+  return { status: 'ok', decayed, trimmed: cons.archived, pruned, tidied, cost: cons.cost + (tidied?.cost || 0) };
 }

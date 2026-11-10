@@ -10,15 +10,17 @@
 //               writes one coherent set of exact-fragment edits
 //   4. validate (changesets.mjs) edits are applied by code, never by the model, and
 //               only when safe; the result is one changeset per file
-// A learning is written only when the screen and the editor both say so.
+// A change to an existing file is written only when the screen and the editor both say
+// so; a new item needs the screen's verdict and the curator. No verdict, no write.
 import fs from 'node:fs';
 import path from 'node:path';
 import { options } from './config.mjs';
-import { apply as curatorApply, DUPLICATE_THRESHOLD, similarity } from './curator.mjs';
-import { applyChangeset, applyEdits, changesetNeedsApproval, claimsOf, getChangeset, pendingChangeset, saveChangeset } from './changesets.mjs';
-import { acquireLease, assertBudget, BudgetError, logError, releaseLease } from './db.mjs';
+import { apply as curatorApply, DUPLICATE_THRESHOLD, interimOf, learnMeanwhile, retireInterim, similarity } from './curator.mjs';
+import { applyChangeset, applyEdits, changesetNeedsApproval, claimsOf, fileDisplayName, getChangeset, pendingChangeset, saveChangeset } from './changesets.mjs';
+import { acquireLease, assertBudget, BudgetError, logError, releaseLease, renewLease } from './db.mjs';
 import { buildIndex, groundIdentifiers, identifiersIn, knowledgeFiles, knowledgeKind, PATCHABLE, resolveOwner, tokenize } from './knowledge.mjs';
 import { ensureGlobalInstructions } from './paths.mjs';
+import { refFile } from './session-state.mjs';
 import { insertReview, runModel, usageOf } from './review-worker.mjs';
 import { rubricText } from './rubric.mjs';
 import { describe, noteFor, rewriteItem, triage } from './triage.mjs';
@@ -59,6 +61,7 @@ export const EDITOR_SCHEMA = {
         },
       },
     },
+    description: { type: 'string' },
   },
 };
 
@@ -117,7 +120,7 @@ STATUS of each claim:
 - "corrects": the file states something wrong or outdated, shown by the project evidence or by the user explicitly changing a standing rule ("from now on", "that changed"). A request made once, for one situation, never overturns a rule the file states: that claim is "conflict". Replace the wrong text.
 - "conflict": it contradicts another claim or the file, and neither the project evidence nor an explicit change of rule settles it (set conflicts_with when it is another claim). No edit; the user will decide.
 A claim marked confirmed_by_user="yes" is the user's explicit decision after seeing the conflict: it is never "conflict"; write it ("corrects" when it replaces what the file says, otherwise "adds").
-When two claims disagree, prefer the one the project evidence confirms, then an explicit change of rule, then the one from the more recent session.
+CLAIMS are listed oldest first, each with the time of its session. When two claims disagree, prefer the one the project evidence confirms, then an explicit change of rule, then the later one. A later claim in which the user states an exception to, or a refinement of, an earlier one is not a conflict with it: it is the current rule ("corrects" when the earlier one is already in the file, otherwise write both as one coherent statement).
 Read the whole file for each claim: text elsewhere in the file that says the opposite must be corrected by the same edits, or the file would contradict itself.
 
 EDITS:
@@ -126,6 +129,7 @@ EDITS:
 - Write as the file does: same language, tone and density, as short as its other entries. No dates, PR or issue numbers, session details or people's names unless the file already does that.
 - Only "corrects" edits may remove text, and only the wrong part. Never touch the frontmatter (the --- block at the top).
 - One edit may serve several claims: list their ids in "claims". Never write two edits that touch the same text.
+- Only when the FILE is a memory note and your edits make its "description:" line (the one-line summary in the frontmatter, also shown in the memory index) wrong or incomplete: return "description" with the new one line. It is the only part of the frontmatter that may change, and you never edit it through "edits". Otherwise omit it.
 - Claims that say the same thing are not in conflict: give them the same status and implement them with one edit listing all their ids.
 - No edit for covered, contradicted or conflict claims. Answer once for every claim id.
 ${view.partial ? '- The file is large: you see its outline and the parts related to the claims. Copy "old" only from what you see.\n' : ''}
@@ -137,7 +141,7 @@ ${view.text}
 CLAIMS:
 ${claims.map((c) => `<claim id="${c.id}"${c.when ? ` session="${c.when}"` : ''}${c.confidence ? ` confidence="${c.confidence}"` : ''}${c.corrects ? ' reported_stale="yes"' : ''}${c.confirmed ? ' confirmed_by_user="yes"' : ''}>\n${c.claim}${c.evidence ? `\nevidence: ${c.evidence}` : ''}\n</claim>`).join('\n')}
 
-PROJECT EVIDENCE (where the project's tracked code and config mention what the claims name; "not found" means no tracked file mentions it):
+PROJECT EVIDENCE (where the project's tracked code and config mention what the claims name; "not found" means no tracked file mentions it. That refutes a claim only when the claim is about what those files contain: a path, a script, a setting. Environment variables, error messages, external services, branch names and habits are normally not in tracked files, and a claim the user stated or an outcome observed in the session is never "contradicted" by their absence):
 ${grounding.length ? grounding.map((g) => (g.hits.length
     ? `- \`${g.id}\`:\n${g.hits.map((h) => `    ${h.file}:${h.line}: ${h.text}`).join('\n')}`
     : `- \`${g.id}\`: ${g.exists ? 'exists' : 'not found'}`)).join('\n') : '(nothing to look up)'}
@@ -146,6 +150,8 @@ ELSEWHERE (what other files say on these topics; a "source of truth" excerpt is 
 ${elsewhere.length ? elsewhere.map((e) => `<excerpt file="${e.file}" kind="${e.kind === 'source' ? 'source of truth' : 'knowledge'}"${e.heading ? ` heading="${e.heading}"` : ''}>\n${e.text.slice(0, 700)}\n</excerpt>`).join('\n') : '(nothing related)'}`;
 }
 
+/** Screening calls that may leave a proposal unanswered before it waits for the user. */
+const MAX_SCREEN_MISSES = 2;
 const ELSEWHERE_PER_CLAIM = 2;
 const ELSEWHERE_MAX = 8;
 
@@ -153,16 +159,17 @@ const ELSEWHERE_MAX = 8;
  * What OTHER knowledge files say about the claims (the assistant reads those too): a
  * claim another file already covers must not be copied into this one.
  */
-export function elsewhereFor(file, claims, cwd) {
+export function elsewhereFor(file, claims, cwd, exclude = []) {
   const index = buildIndex(cwd);
   const self = path.resolve(file).toLowerCase();
+  const skip = new Set(exclude.map((f) => path.resolve(f).toLowerCase()));
   const seen = new Set();
   const out = [];
   for (const c of claims) {
     let taken = 0;
     for (const hit of index.search(c.claim, ELSEWHERE_PER_CLAIM + 3)) {
       if (taken >= ELSEWHERE_PER_CLAIM) break;
-      if (path.resolve(hit.file).toLowerCase() === self || hit.score < 3) continue;
+      if (path.resolve(hit.file).toLowerCase() === self || skip.has(path.resolve(hit.file).toLowerCase()) || hit.score < 3) continue;
       const key = `${hit.file}#${hit.heading}#${hit.text.slice(0, 40)}`;
       if (seen.has(key)) continue;
       seen.add(key);
@@ -178,13 +185,13 @@ export function elsewhereFor(file, claims, cwd) {
  * Stage 3+4 for one file: the editor judges every claim and writes edits; code keeps
  * the safe ones. Returns { status: Map(id -> {status, reason}), applied, rejected, base, cost }.
  */
-export async function composeFile({ file, claims, cwd, model }) {
+export async function composeFile({ file, claims, cwd, model, exclude = [] }) {
   const base = fs.readFileSync(file, 'utf8');
   const kind = knowledgeKind(file);
   const all = claims.map((c) => c.claim).join('\n');
   const grounding = groundIdentifiers(identifiersIn(all), cwd);
   const view = fileView(base, all);
-  const elsewhere = elsewhereFor(file, claims, cwd);
+  const elsewhere = elsewhereFor(file, claims, cwd, exclude);
   const result = await runModel({ prompt: editorPrompt({ file, kind, view, claims, grounding, elsewhere }), schema: EDITOR_SCHEMA, model });
   const out = result.structured_output;
   const status = new Map();
@@ -195,6 +202,13 @@ export async function composeFile({ file, claims, cwd, model }) {
     claims: (e.claims || []).filter((id) => claims.some((c) => c.id === id)),
     corrects: (e.claims || []).some((id) => status.get(id)?.status === 'corrects'),
   }));
+  // A new one-line description for a memory whose body the edits change.
+  const described = String(out.description || '').replace(/\s+/g, ' ').trim();
+  const writing = claims.filter((c) => writes(c.id)).map((c) => c.id);
+  if (described && kind === 'memory' && writing.length && edits.some((e) => e.claims.some(writes))) {
+    const oldLine = /^description[ \t]*:.*$/m.exec(base.split(/\r?\n---/)[0] || '')?.[0] || '';
+    edits.push({ description: described, old: oldLine, new: `description: ${described}`, why: 'the summary follows the change', claims: writing, corrects: true });
+  }
   const justified = edits.filter((e) => e.claims.some(writes));
   const unjustified = edits.filter((e) => !e.claims.some(writes)).map((edit) => ({ edit, reason: 'no learning justifies it' }));
   const { applied, rejected } = applyEdits(base, justified);
@@ -223,7 +237,9 @@ function setOutcome(db, id, outcome, note, extra = {}) {
 }
 
 function when(row) {
-  return row.session_started_at ? new Date(row.session_started_at).toISOString().slice(0, 10) : undefined;
+  // Date and time: two sessions on the same day are common, and "the more recent one"
+  // decides between claims that disagree.
+  return row.session_started_at ? new Date(row.session_started_at).toISOString().slice(0, 16).replace('T', ' ') : undefined;
 }
 
 /** A claim the editor can judge, from a candidate row. */
@@ -246,6 +262,17 @@ function claimFrom(row, overrides = {}) {
 export async function composeRoutes(db, routes, ctx) {
   const report = { changesets: 0, applied: 0, queued: 0, covered: 0, contradicted: 0, conflicts: 0, unwritten: 0, cost: 0, calls: 0, results: [] };
   for (const [file, fresh] of routes) {
+    if (!fs.existsSync(file)) {
+      // The file is gone (a removed worktree, a deleted skill): nothing to compose, and
+      // retrying forever helps nobody. The learnings stay visible, with the reason.
+      const now = Date.now();
+      const gone = db.prepare("SELECT id FROM changesets WHERE status IN ('pending', 'stale') AND lower(file) = lower(?)").all(file).map((r) => r.id);
+      const ids = [...gone.flatMap((id) => claimsOf(db, id).map((c) => c.id)), ...fresh.map((c) => c.id)];
+      for (const id of new Set(ids)) setOutcome(db, id, 'dropped', `not written: ${file} no longer exists`, { target: file, changeset_id: null });
+      for (const id of gone) db.prepare("UPDATE changesets SET status = 'rejected', note = 'the file no longer exists', decided_at = ? WHERE id = ?").run(now, id);
+      report.unwritten += new Set(ids).size;
+      continue;
+    }
     const pending = pendingChangeset(db, file);
     const stale = db.prepare("SELECT id FROM changesets WHERE status = 'stale' AND lower(file) = lower(?)").all(file).map((r) => r.id);
     const previous = [pending?.id, ...stale].filter(Boolean);
@@ -255,7 +282,11 @@ export async function composeRoutes(db, routes, ctx) {
     let composed;
     try {
       assertBudget(db, options().monthlyBudgetUsd);
-      composed = await composeFile({ file, claims, cwd: ctx.cwd, model: ctx.model });
+      ctx.tick?.();
+      // The memories standing in for these claims are not "another file that already says
+      // it": they exist only until this change is decided.
+      const standIns = claims.map((c) => interimOf(db, c.id)?.path).filter(Boolean);
+      composed = await composeFile({ file, claims, cwd: ctx.cwd, model: ctx.model, exclude: standIns });
     } catch (err) {
       if (!(err instanceof BudgetError)) logError(db, 'evaluate:editor', err);
       // Leave them waiting: the next queue check tries again.
@@ -288,6 +319,7 @@ export async function composeRoutes(db, routes, ctx) {
       } else if (s.status === 'contradicted') {
         report.contradicted++;
         setOutcome(db, c.id, 'dropped', `unverified [editor]: ${s.reason}`, { target: file, changeset_id: null });
+        retireInterim(db, c.id); // the project says otherwise: its stand-in memory goes too
       } else if (s.status === 'conflict') {
         report.conflicts++;
         report.results.push({ status: 'conflict', title: c.title });
@@ -315,12 +347,28 @@ export async function composeRoutes(db, routes, ctx) {
       const r = applyChangeset(db, csId, { actor: ctx.actor });
       if (r.status === 'patched') {
         report.applied++;
-        report.results.push({ status: 'patched', title: path.basename(file), claims: inChangeset.length, changesetId: csId });
+        report.results.push({ status: 'patched', title: `${claims.filter((c) => inChangeset.includes(c.id)).map((c) => c.title).filter(Boolean).slice(0, 2).join('; ')} → ${fileDisplayName(file)}`, claims: inChangeset.length, changesetId: csId });
         continue;
       }
     }
     report.queued++;
-    report.results.push({ status: 'queued', title: `${path.basename(file)} (${inChangeset.length} change${inChangeset.length > 1 ? 's' : ''})`, changesetId: csId });
+    // Learn now, promote on approval: pure additions to a project's CLAUDE.md or rule
+    // file are saved as project memories while the change waits.
+    // The notice reports what THIS evaluation did: a learning saved meanwhile is learned
+    // (said once, when it is saved); only what is new and merely waiting is "waiting".
+    const waitingTitles = [];
+    for (const c of claims.filter((x) => inChangeset.includes(x.id))) {
+      const isFresh = fresh.some((f) => f.id === c.id);
+      if (interimOf(db, c.id)) continue;
+      const s = composed.status.get(c.id);
+      const rewrites = composed.applied.some((e) => (e.corrects || e.rewrites) && e.claims.includes(c.id));
+      const row = db.prepare('SELECT session_id FROM candidates WHERE id = ?').get(c.id);
+      const saved = s?.status === 'adds' && !rewrites
+        && learnMeanwhile(db, { candidateId: c.id, file, title: c.title, claim: c.claim, evidence: c.evidence, cwd: ctx.cwd, confidence: c.confidence, sessionId: row?.session_id, actor: ctx.actor, autonomy: ctx.autonomy });
+      if (saved) report.results.push({ status: 'created', title: `${c.title} (a project memory for now; proposed for ${fileDisplayName(file)})`, candidateId: c.id });
+      else if (isFresh && c.title) waitingTitles.push(c.title);
+    }
+    if (waitingTitles.length) report.results.push({ status: 'queued', title: `${waitingTitles.slice(0, 2).join('; ')}${waitingTitles.length > 2 ? ` (+${waitingTitles.length - 2})` : ''} → ${fileDisplayName(file)}`, changesetId: csId });
   }
   return report;
 }
@@ -335,7 +383,7 @@ function isGlobalFact(item) {
  * ctx: { cwd, sessionId, sessionStartedAt, actor, autonomy, lang, model, payload }.
  */
 export async function evaluate(db, rows, ctx) {
-  const report = { total: rows.length, kept: 0, created: 0, dropped: 0, merged: 0, routed: 0, suggested: 0, stale: 0, queued: 0, patched: 0, cost: 0, calls: 0, byRule: {}, results: [] };
+  const report = { total: rows.length, kept: 0, created: 0, dropped: 0, merged: 0, routed: 0, suggested: 0, stale: 0, queued: 0, patched: 0, unscreened: 0, cost: 0, calls: 0, byRule: {}, results: [] };
   if (!rows.length) return report;
   const items = new Map(rows.map((r) => {
     let item = {};
@@ -345,7 +393,8 @@ export async function evaluate(db, rows, ctx) {
   const proposals = rows.map((r) => ({ id: r.id, ...items.get(r.id), claim: r.claim || undefined, target: r.target || undefined, evidence: r.evidence, when: when(r) }));
   // Each screening call is recorded as it happens, so the budget check before the next
   // call (and the month's spend) always counts it.
-  const record = (usage) => insertReview(db, { sessionId: ctx.sessionId || 'maintenance', mode: ctx.sessionId ? 'background' : 'maintenance', trigger: 'triage', model: ctx.model, status: 'ok', usage, sessionStartedAt: ctx.sessionStartedAt });
+  const record = (usage) => { ctx.tick?.(); return recordUsage(usage); };
+  const recordUsage = (usage) => insertReview(db, { sessionId: ctx.sessionId || 'maintenance', mode: ctx.sessionId ? 'background' : 'maintenance', trigger: 'triage', model: ctx.model, status: 'ok', usage, sessionStartedAt: ctx.sessionStartedAt });
   const screen = await triage(proposals, { cwd: ctx.cwd, db, lang: ctx.lang, model: ctx.model, exclude: rows.map((r) => r.id), record });
   report.cost += screen.cost;
   report.calls += screen.calls;
@@ -376,7 +425,21 @@ export async function evaluate(db, rows, ctx) {
         report.stale++;
       }
     }
-    if (!v) { creates.push({ row, item }); continue; }
+    if (!v) {
+      // The screen did not answer for this proposal. Nothing is written unscreened: it
+      // is screened once more, and after that it waits for the user.
+      const payload = payloadOf(row);
+      const misses = (Number(payload.screen_misses) || 0) + 1;
+      if (misses < MAX_SCREEN_MISSES) {
+        db.prepare('UPDATE candidates SET payload = ?, triaged_at = NULL WHERE id = ?').run(JSON.stringify({ ...payload, screen_misses: misses }), row.id);
+      } else {
+        report.queued++;
+        setOutcome(db, row.id, 'queued', 'the knowledge check gave no verdict for it; nothing was written, you decide', { changeset_id: null });
+        report.results.push({ status: 'queued', title: row.title, candidateId: row.id });
+      }
+      report.unscreened++;
+      continue;
+    }
     if (v.verdict === 'drop' || v.verdict === 'merge') {
       report[v.verdict === 'drop' ? 'dropped' : 'merged']++;
       setOutcome(db, row.id, v.verdict === 'drop' ? 'dropped' : 'merged', noteFor(v), { changeset_id: null });
@@ -395,7 +458,18 @@ export async function evaluate(db, rows, ctx) {
         creates.push({ row, item: rewriteItem(item, v), note: `kept as new (owner not found: ${v.owner || 'none'})` });
       }
     } else {
-      creates.push({ row, item: rewriteItem(item, v), note: noteFor(v) });
+      // Kept as new, but the reviewer said it refines something this session already
+      // saved or queued for a file: the editor folds it into that file instead.
+      const refined = item.refines ? refFile(db, row.session_id, item.refines) : null;
+      if (refined && fs.existsSync(refined) && PATCHABLE.has(knowledgeKind(refined))) {
+        const next = rewriteItem(item, v);
+        const claim = [next.text, next.description, next.body].filter(Boolean).join('\n') || next.title;
+        report.routed++;
+        db.prepare('UPDATE candidates SET claim = ?, target = ? WHERE id = ?').run(claim, refined, row.id);
+        route(path.resolve(refined), { ...claimFrom({ ...row, claim }), title: row.title });
+      } else {
+        creates.push({ row, item: rewriteItem(item, v), note: noteFor(v) });
+      }
     }
   }
 
@@ -490,7 +564,7 @@ export function noticeLines(results) {
  * so its notice can say what happened. Call through `drainQueue`, which makes sure only
  * one process evaluates at a time.
  */
-export async function tidyQueue(db, { force = false, autonomy = 'queue' } = {}) {
+export async function tidyQueue(db, { force = false, autonomy = 'queue', tick = null } = {}) {
   const opts = options();
   if (force) {
     db.prepare("UPDATE changesets SET status = 'superseded', decided_at = ? WHERE status IN ('pending', 'stale')").run(Date.now());
@@ -524,7 +598,9 @@ export async function tidyQueue(db, { force = false, autonomy = 'queue' } = {}) 
 
   for (const g of groups.values()) {
     assertBudget(db, opts.monthlyBudgetUsd);
+    tick?.();
     const ctx = {
+      tick,
       cwd: g.cwd || undefined, actor: 'background', autonomy: g.autonomy, lang: opts.learningLanguage, model: opts.judgeModel,
       sessionId: g.sessionId || undefined, sessionStartedAt: g.sessionStartedAt, payload: { trigger: g.trigger || 'session_end' },
     };
@@ -573,11 +649,13 @@ export async function drainQueue(db, { force = false, autonomy = 'queue' } = {})
   const total = { status: 'done', rounds: 0, cost: 0, reports: [] };
   let first = true;
   for (;;) {
-    const token = acquireLease(db, LEASE);
+    let token = acquireLease(db, LEASE);
+    // Renewed before each model call: a long drain never loses the lease while it runs.
+    const tick = () => { token = renewLease(db, LEASE, token) || token; };
     if (!token) return first ? { status: 'busy', reason: 'another process is evaluating the queue; it will pick this up' } : total;
     try {
       while (total.rounds < MAX_ROUNDS && ((first && force) || queueHasWork(db))) {
-        const r = await tidyQueue(db, { force: first && force, autonomy });
+        const r = await tidyQueue(db, { force: first && force, autonomy, tick });
         first = false;
         total.rounds++;
         total.cost += r.cost || 0;

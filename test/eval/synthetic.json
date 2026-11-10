@@ -1,273 +1,288 @@
 {
-  "about": "A small fake project with known knowledge, and proposals whose right outcome is known. scripts/eval.mjs --synthetic runs the real learning evaluation on it and scores it. Each case lists the outcomes that count as right; 'file' is the end of the path a change must target; a 'group' must leave exactly one (or at most one, for conflicts) proposal waiting.",
-  "project": {
-    "CLAUDE.md": "# Shop\n\nOnline shop for a small bakery.\n\n- Run `npm test` before committing.\n- Prices are stored in cents.\n- When a task needs several decisions from the owner, ask them all at once, in one message.\n",
-    ".claude/rules/deploy.md": "---\npaths:\n  - \"scripts/**\"\n  - \".github/workflows/**\"\n---\n\n# Deploy\n\n- Deploys run from `scripts/deploy.sh`.\n- The deploy workflow runs on every push to `main`.\n",
-    ".github/workflows/deploy.yml": "name: deploy\non:\n  workflow_dispatch:\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: ./scripts/deploy.sh\n",
-    "scripts/deploy.sh": "#!/bin/sh\nset -e\nnpm run build\nrsync -a dist/ shop@server:/srv/shop\n",
-    "src/config.ts": "export const MAX_RETRIES = 5;\nexport const CURRENCY = 'EUR';\n",
-    "package.json": "{\n  \"name\": \"shop\",\n  \"scripts\": { \"test\": \"vitest run\", \"build\": \"vite build\", \"dev\": \"vite\" }\n}\n",
-    ".gitignore": "node_modules\ndist\n"
+ "about": "A small fake project with known knowledge, and proposals whose right outcome is known. scripts/eval.mjs --synthetic runs the real learning evaluation on it and scores it. Each case lists the outcomes that count as right; 'file' is the end of the path a change must target; a 'group' must leave exactly one (or at most one, for conflicts) proposal waiting.",
+ "project": {
+  "CLAUDE.md": "# Shop\n\nOnline shop for a small bakery.\n\n- Run `npm test` before committing.\n- Prices are stored in cents.\n- When a task needs several decisions from the owner, ask them all at once, in one message.\n",
+  ".claude/rules/deploy.md": "---\npaths:\n  - \"scripts/**\"\n  - \".github/workflows/**\"\n---\n\n# Deploy\n\n- Deploys run from `scripts/deploy.sh`.\n- The deploy workflow runs on every push to `main`.\n",
+  ".github/workflows/deploy.yml": "name: deploy\non:\n  workflow_dispatch:\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: ./scripts/deploy.sh\n",
+  "scripts/deploy.sh": "#!/bin/sh\nset -e\nnpm run build\nrsync -a dist/ shop@server:/srv/shop\n",
+  "src/config.ts": "export const MAX_RETRIES = 5;\nexport const CURRENCY = 'EUR';\n",
+  "package.json": "{\n  \"name\": \"shop\",\n  \"engines\": { \"node\": \">=22\" },\n  \"scripts\": { \"test\": \"vitest run\", \"build\": \"vite build\", \"dev\": \"vite\" }\n}\n",
+  ".gitignore": "node_modules\ndist\n"
+ },
+ "skills": {
+  "shop-local/SKILL.md": "---\nname: shop-local\ndescription: Run the shop locally - start the stack, seed data, reset. Use for \"start local\", \"reset the database\".\n---\n\n# Shop local\n\n## Start\n\nRun `docker compose up -d` in the repo, then `npm run dev`.\n\n## Reset\n\n`docker compose down -v` drops the local database.\n",
+  "shop-local/reference/glossary.md": "# Glossary\n\n| Term | Meaning |\n|---|---|\n| order | a confirmed purchase |\n"
+ },
+ "cases": [
+  {
+   "id": "covered",
+   "proposal": {
+    "kind": "memory",
+    "memory_type": "feedback",
+    "title": "Test before committing",
+    "description": "Always run the test suite (npm test) before making a commit."
+   },
+   "expect": {
+    "outcome": [
+     "dropped",
+     "duplicate"
+    ]
+   }
   },
-  "skills": {
-    "shop-local/SKILL.md": "---\nname: shop-local\ndescription: Run the shop locally - start the stack, seed data, reset. Use for \"start local\", \"reset the database\".\n---\n\n# Shop local\n\n## Start\n\nRun `docker compose up -d` in the repo, then `npm run dev`.\n\n## Reset\n\n`docker compose down -v` drops the local database.\n",
-    "shop-local/reference/glossary.md": "# Glossary\n\n| Term | Meaning |\n|---|---|\n| order | a confirmed purchase |\n"
+  {
+   "id": "contradicted-by-code",
+   "proposal": {
+    "kind": "memory",
+    "memory_type": "project",
+    "title": "Retry limit is three",
+    "description": "MAX_RETRIES in src/config.ts is 3, so callers retry at most three times."
+   },
+   "expect": {
+    "outcome": [
+     "dropped"
+    ]
+   }
   },
-  "cases": [
-    {
-      "id": "covered",
-      "proposal": {
-        "kind": "memory",
-        "memory_type": "feedback",
-        "title": "Test before committing",
-        "description": "Always run the test suite (npm test) before making a commit."
-      },
-      "expect": {
-        "outcome": [
-          "dropped",
-          "duplicate"
-        ]
-      }
-    },
-    {
-      "id": "contradicted-by-code",
-      "proposal": {
-        "kind": "memory",
-        "memory_type": "project",
-        "title": "Retry limit is three",
-        "description": "MAX_RETRIES in src/config.ts is 3, so callers retry at most three times."
-      },
-      "expect": {
-        "outcome": [
-          "dropped"
-        ]
-      }
-    },
-    {
-      "id": "stale-owner",
-      "proposal": {
-        "kind": "memory",
-        "memory_type": "project",
-        "title": "Deploys are manual",
-        "description": "The deploy workflow only runs when started by hand (workflow_dispatch); a push to main does not deploy.",
-        "evidence": "USER: the deploy did not start after merging; it has to be run by hand"
-      },
-      "expect": {
-        "outcome": [
-          "queued"
-        ],
-        "file": ".claude/rules/deploy.md",
-        "corrects": true
-      }
-    },
-    {
-      "id": "dup-a",
-      "group": "vat",
-      "proposal": {
-        "kind": "memory",
-        "memory_type": "feedback",
-        "title": "Show prices with VAT",
-        "description": "The bakery wants every price shown with VAT included; never show net prices to customers.",
-        "evidence": "USER: preços sempre com IVA incluído"
-      }
-    },
-    {
-      "id": "dup-b",
-      "group": "vat",
-      "proposal": {
-        "kind": "memory",
-        "memory_type": "project",
-        "title": "Gross prices only",
-        "description": "Customer-facing prices must include VAT (gross), never net amounts.",
-        "evidence": "USER repeated it in a later session"
-      }
-    },
-    {
-      "id": "one-off",
-      "proposal": {
-        "kind": "memory",
-        "memory_type": "feedback",
-        "title": "Skip lint for this change",
-        "description": "For this hotfix, skip the lint step and push directly.",
-        "evidence": "USER: just this once, skip lint"
-      },
-      "expect": {
-        "outcome": [
-          "dropped"
-        ]
-      }
-    },
-    {
-      "id": "one-off-vs-rule",
-      "proposal": {
-        "kind": "memory",
-        "memory_type": "feedback",
-        "title": "Ask decisions one at a time",
-        "description": "Ask the owner one decision per message and wait for each answer before the next.",
-        "evidence": "USER (after a long list of questions in one task): this time, ask me one at a time"
-      },
-      "expect": {
-        "outcome": [
-          "dropped"
-        ]
-      }
-    },
-    {
-      "id": "reference-owner",
-      "proposal": {
-        "kind": "memory",
-        "memory_type": "reference",
-        "title": "Cart vs order",
-        "description": "In the shop's language a 'cart' is the list of items before checkout; it becomes an order only when paid.",
-        "evidence": "USER explained the terms"
-      },
-      "expect": {
-        "outcome": [
-          "queued"
-        ],
-        "file": "reference/glossary.md"
-      }
-    },
-    {
-      "id": "fix-at-source",
-      "proposal": {
-        "kind": "memory",
-        "memory_type": "feedback",
-        "title": "Delete .vite-cache before committing",
-        "description": "The dev server writes a .vite-cache folder in the repo root; delete it before every commit so it is not committed.",
-        "evidence": "observed in session: git status showed .vite-cache"
-      },
-      "expect": {
-        "outcome": [
-          "suggested"
-        ]
-      }
-    },
-    {
-      "id": "adds-to-skill",
-      "proposal": {
-        "kind": "memory",
-        "memory_type": "feedback",
-        "title": "Start the stack from the main checkout",
-        "description": "Do not run docker compose from a git worktree: it creates a separate, empty database volume. Start the stack from the main checkout.",
-        "evidence": "observed in session: the worktree stack had an empty database"
-      },
-      "expect": {
-        "outcome": [
-          "queued",
-          "suggested"
-        ],
-        "file": "shop-local/SKILL.md"
-      },
-      "note": "Either is right: document it in the skill, or suggest pinning the compose project name."
-    },
-    {
-      "id": "conflict-a",
-      "group": "staging",
-      "atMostOne": true,
-      "proposal": {
-        "kind": "memory",
-        "memory_type": "project",
-        "title": "Deploy to staging first",
-        "description": "Always deploy to the staging server before production."
-      }
-    },
-    {
-      "id": "conflict-b",
-      "group": "staging",
-      "atMostOne": true,
-      "proposal": {
-        "kind": "memory",
-        "memory_type": "project",
-        "title": "No staging server",
-        "description": "There is no staging server; deploys go straight to production."
-      }
-    },
-    {
-      "id": "derivable",
-      "proposal": {
-        "kind": "memory",
-        "memory_type": "project",
-        "title": "What the deploy script does",
-        "description": "scripts/deploy.sh runs npm run build and then rsyncs dist/ to the server."
-      },
-      "expect": {
-        "outcome": [
-          "dropped"
-        ]
-      }
-    },
-    {
-      "id": "new-memory",
-      "proposal": {
-        "kind": "memory",
-        "memory_type": "project",
-        "title": "Orders close at 18:00",
-        "description": "The bakery stops taking same-day orders at 18:00 local time; later orders are for the next day.",
-        "evidence": "USER stated the business rule"
-      },
-      "expect": {
-        "outcome": [
-          "queued"
-        ]
-      }
-    },
-    {
-      "id": "covered-elsewhere",
-      "note": "Real error #68: a fact another file already states was copied into the owner the screen picked.",
-      "proposal": {
-        "kind": "skill",
-        "scope": "project",
-        "title": "Store money in cents",
-        "description": "Use when handling prices in the shop.",
-        "body": "Prices are stored in cents (integers), never as decimals.",
-        "evidence": "USER: lembra que preço é em centavos"
-      },
-      "expect": {
-        "outcome": [
-          "dropped",
-          "duplicate",
-          "merged"
-        ]
-      }
-    },
-    {
-      "id": "covered-by-parent",
-      "note": "Knowledge in a CLAUDE.md above the project, which Claude Code also loads.",
-      "proposal": {
-        "kind": "memory",
-        "memory_type": "feedback",
-        "title": "Write docs in English",
-        "description": "Code comments and docs are written in English even when the user writes in Portuguese.",
-        "evidence": "USER: escreve os comentários em inglês"
-      },
-      "expect": {
-        "outcome": [
-          "dropped",
-          "duplicate",
-          "merged"
-        ]
-      }
-    },
-    {
-      "id": "preference-not-stale",
-      "note": "Real error #115: a preference stated once was turned into a correction of documentation.",
-      "proposal": {
-        "kind": "memory",
-        "memory_type": "feedback",
-        "title": "Deploy by hand",
-        "description": "This time the user ran scripts/deploy.sh from their own machine instead of starting the workflow.",
-        "evidence": "USER: deixa que eu rodo o deploy na minha máquina hoje"
-      },
-      "expect": {
-        "outcome": [
-          "dropped",
-          "conflict"
-        ]
-      }
-    }
-  ],
-  "parent": {
-    "CLAUDE.md": "# Workspace\n\nEvery file written to disk (code, comments, docs, commit messages) is in English, even when the conversation is not.\n"
+  {
+   "id": "stale-owner",
+   "proposal": {
+    "kind": "memory",
+    "memory_type": "project",
+    "title": "Deploys are manual",
+    "description": "The deploy workflow only runs when started by hand (workflow_dispatch); a push to main does not deploy.",
+    "evidence": "USER: the deploy did not start after merging; it has to be run by hand"
+   },
+   "expect": {
+    "outcome": [
+     "queued"
+    ],
+    "file": ".claude/rules/deploy.md",
+    "corrects": true
+   }
+  },
+  {
+   "id": "dup-a",
+   "group": "vat",
+   "proposal": {
+    "kind": "memory",
+    "memory_type": "feedback",
+    "title": "Show prices with VAT",
+    "description": "The bakery wants every price shown with VAT included; never show net prices to customers.",
+    "evidence": "USER: preços sempre com IVA incluído"
+   }
+  },
+  {
+   "id": "dup-b",
+   "group": "vat",
+   "proposal": {
+    "kind": "memory",
+    "memory_type": "project",
+    "title": "Gross prices only",
+    "description": "Customer-facing prices must include VAT (gross), never net amounts.",
+    "evidence": "USER repeated it in a later session"
+   }
+  },
+  {
+   "id": "one-off",
+   "proposal": {
+    "kind": "memory",
+    "memory_type": "feedback",
+    "title": "Skip lint for this change",
+    "description": "For this hotfix, skip the lint step and push directly.",
+    "evidence": "USER: just this once, skip lint"
+   },
+   "expect": {
+    "outcome": [
+     "dropped"
+    ]
+   }
+  },
+  {
+   "id": "one-off-vs-rule",
+   "proposal": {
+    "kind": "memory",
+    "memory_type": "feedback",
+    "title": "Ask decisions one at a time",
+    "description": "Ask the owner one decision per message and wait for each answer before the next.",
+    "evidence": "USER (after a long list of questions in one task): this time, ask me one at a time"
+   },
+   "expect": {
+    "outcome": [
+     "dropped"
+    ]
+   }
+  },
+  {
+   "id": "reference-owner",
+   "proposal": {
+    "kind": "memory",
+    "memory_type": "reference",
+    "title": "Cart vs order",
+    "description": "In the shop's language a 'cart' is the list of items before checkout; it becomes an order only when paid.",
+    "evidence": "USER explained the terms"
+   },
+   "expect": {
+    "outcome": [
+     "queued"
+    ],
+    "file": "reference/glossary.md"
+   }
+  },
+  {
+   "id": "fix-at-source",
+   "proposal": {
+    "kind": "memory",
+    "memory_type": "feedback",
+    "title": "Delete .vite-cache before committing",
+    "description": "The dev server writes a .vite-cache folder in the repo root; delete it before every commit so it is not committed.",
+    "evidence": "observed in session: git status showed .vite-cache"
+   },
+   "expect": {
+    "outcome": [
+     "suggested"
+    ]
+   }
+  },
+  {
+   "id": "adds-to-skill",
+   "proposal": {
+    "kind": "memory",
+    "memory_type": "feedback",
+    "title": "Start the stack from the main checkout",
+    "description": "Do not run docker compose from a git worktree: it creates a separate, empty database volume. Start the stack from the main checkout.",
+    "evidence": "observed in session: the worktree stack had an empty database"
+   },
+   "expect": {
+    "outcome": [
+     "queued",
+     "suggested"
+    ],
+    "file": "shop-local/SKILL.md"
+   },
+   "note": "Either is right: document it in the skill, or suggest pinning the compose project name."
+  },
+  {
+   "id": "conflict-a",
+   "group": "staging",
+   "atMostOne": true,
+   "proposal": {
+    "kind": "memory",
+    "memory_type": "project",
+    "title": "Deploy to staging first",
+    "description": "Always deploy to the staging server before production."
+   }
+  },
+  {
+   "id": "conflict-b",
+   "group": "staging",
+   "atMostOne": true,
+   "proposal": {
+    "kind": "memory",
+    "memory_type": "project",
+    "title": "No staging server",
+    "description": "There is no staging server; deploys go straight to production."
+   }
+  },
+  {
+   "id": "derivable",
+   "proposal": {
+    "kind": "memory",
+    "memory_type": "project",
+    "title": "What the deploy script does",
+    "description": "scripts/deploy.sh runs npm run build and then rsyncs dist/ to the server."
+   },
+   "expect": {
+    "outcome": [
+     "dropped"
+    ]
+   }
+  },
+  {
+   "id": "new-memory",
+   "proposal": {
+    "kind": "memory",
+    "memory_type": "project",
+    "title": "Orders close at 18:00",
+    "description": "The bakery stops taking same-day orders at 18:00 local time; later orders are for the next day.",
+    "evidence": "USER stated the business rule"
+   },
+   "expect": {
+    "outcome": [
+     "queued"
+    ]
+   }
+  },
+  {
+   "id": "covered-elsewhere",
+   "note": "Real error #68: a fact another file already states was copied into the owner the screen picked.",
+   "proposal": {
+    "kind": "skill",
+    "scope": "project",
+    "title": "Store money in cents",
+    "description": "Use when handling prices in the shop.",
+    "body": "Prices are stored in cents (integers), never as decimals.",
+    "evidence": "USER: lembra que preço é em centavos"
+   },
+   "expect": {
+    "outcome": [
+     "dropped",
+     "duplicate",
+     "merged"
+    ]
+   }
+  },
+  {
+   "id": "covered-by-parent",
+   "note": "Knowledge in a CLAUDE.md above the project, which Claude Code also loads.",
+   "proposal": {
+    "kind": "memory",
+    "memory_type": "feedback",
+    "title": "Write docs in English",
+    "description": "Code comments and docs are written in English even when the user writes in Portuguese.",
+    "evidence": "USER: escreve os comentários em inglês"
+   },
+   "expect": {
+    "outcome": [
+     "dropped",
+     "duplicate",
+     "merged"
+    ]
+   }
+  },
+  {
+   "id": "preference-not-stale",
+   "note": "Real error #115: a preference stated once was turned into a correction of documentation.",
+   "proposal": {
+    "kind": "memory",
+    "memory_type": "feedback",
+    "title": "Deploy by hand",
+    "description": "This time the user ran scripts/deploy.sh from their own machine instead of starting the workflow.",
+    "evidence": "USER: deixa que eu rodo o deploy na minha máquina hoje"
+   },
+   "expect": {
+    "outcome": [
+     "dropped",
+     "conflict"
+    ]
+   }
+  },
+  {
+   "id": "derivable-from-manifest",
+   "proposal": {
+    "kind": "memory",
+    "memory_type": "project",
+    "title": "The project needs Node 22 or newer",
+    "description": "This project requires Node.js 22 or newer; older versions fail to start it.",
+    "evidence": "USER #3: \"you are on node 20, this needs 22\""
+   },
+   "expect": {
+    "outcome": [
+     "dropped"
+    ]
+   }
   }
+ ],
+ "parent": {
+  "CLAUDE.md": "# Workspace\n\nEvery file written to disk (code, comments, docs, commit messages) is in English, even when the conversation is not.\n"
+ }
 }

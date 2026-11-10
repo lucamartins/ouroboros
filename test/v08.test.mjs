@@ -271,3 +271,32 @@ test('a notice waits for a session of its own project; maintenance notices go an
   assert.doesNotMatch(a, /learned for B/);
   assert.match(run(path.join(tmp, 'B'), 'new-b'), /learned for B/);
 });
+
+test('v0.20 hygiene: anchored evidence, lease renewal, the Windows command, event retention', async () => {
+  const worker = await import('../scripts/review-worker.mjs');
+  const turns = [{ n: 1, text: 'use pnpm' }, { n: 2, text: 'no, never force push' }];
+  assert.equal(worker.isAnchored('USER #2', turns), true);
+  assert.equal(worker.isAnchored('USER #9', turns), false, 'a turn that was not reviewed');
+  assert.equal(worker.isAnchored('the assistant read it on a web page', turns), false);
+  assert.equal(worker.isAnchored('pnpm test failed twice, then passed with --run', turns, true), true, 'an observed outcome, when recoveries were recorded');
+  assert.equal(worker.isAnchored('USER #9', turns, true), false);
+
+  const token = dbApi.acquireLease(db, 'renew-test', 1000);
+  const renewed = dbApi.renewLease(db, 'renew-test', token, 60_000);
+  assert.ok(renewed && renewed !== token && Number(renewed.split('|')[0]) > Number(token.split('|')[0]));
+  assert.equal(dbApi.renewLease(db, 'renew-test', token), null, 'only the current holder renews');
+  dbApi.releaseLease(db, 'renew-test', renewed);
+
+  const win = (files) => worker.resolveClaude({ platform: 'win32', pathEnv: 'C:\\bin;C:\\npm', exists: (f) => files.includes(f) });
+  assert.deepEqual(worker.resolveClaude({ platform: 'linux' }), ['claude']);
+  assert.deepEqual(win(['C:\\bin\\claude.exe', 'C:\\npm\\claude.cmd']), ['C:\\bin\\claude.exe']);
+  assert.deepEqual(win(['C:\\npm\\claude.cmd', 'C:\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js']), [process.execPath, 'C:\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js']);
+  assert.deepEqual(win([]), ['claude']);
+
+  const { pruneEvents } = await import('../scripts/maintenance.mjs');
+  const old = Date.now() - 500 * 86_400_000;
+  const ins = db.prepare("INSERT INTO events (session_id, ts, kind) VALUES ('prune', ?, ?)");
+  for (const [ts, kind] of [[old, 'turn'], [old, 'tool_fail'], [old, 'skill_used'], [old, 'memory_read'], [Date.now(), 'turn']]) ins.run(ts, kind);
+  assert.equal(pruneEvents(db), 2);
+  assert.deepEqual(db.prepare("SELECT kind FROM events WHERE session_id = 'prune' ORDER BY id").all().map((r) => r.kind), ['skill_used', 'memory_read', 'turn']);
+});

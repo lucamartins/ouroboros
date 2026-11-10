@@ -12,14 +12,19 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { options } from './config.mjs';
+import { destinationsText } from './router.mjs';
 import { rubricText } from './rubric.mjs';
 import { isExcluded } from './hook.mjs';
 import { logError, monthSpend, openDb } from './db.mjs';
-import { inventoryForPrompt } from './inventory.mjs';
-import { claudeDir, dataDir, projectKey } from './paths.mjs';
+import { inventoryForPrompt, parseFrontmatter } from './inventory.mjs';
+import { tokenize } from './knowledge.mjs';
+import { claudeDir, dataDir, projectIdFor } from './paths.mjs';
+import { closeObservations, openObservations, sessionStateText } from './session-state.mjs';
 import { buildDigest, isHumanPrompt, quotesFor, readTranscript } from './transcript.mjs';
 
 const MIN_HUMAN_TURNS = 2;
+/** User turns before the cursor shown to the reviewer as context for an unreviewed tail. */
+const CONTEXT_TURNS = 3;
 const PER_CALL_BUDGET_USD = 0.5;
 const CALL_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -67,6 +72,42 @@ export const MEASURE_SCHEMA = {
   },
 };
 
+/**
+ * What counts as a correction: the one definition behind the correction rate. The
+ * instrument (`correctionsPrompt`) and measure-mode reviews use it verbatim, over whole
+ * sessions, so "before learning" and "after" are read with the same ruler.
+ */
+export const CORRECTIONS_RULES = `"corrections": every user turn that pushes back on or redirects something the assistant did, said or assumed.
+   - explicit: "no, use pnpm", "that's wrong", "I already told you…", "stop doing X".
+   - implicit: "hmm, the test broke again", "I prefer the other way", "that's not what I asked".
+   - NOT corrections: new tasks, follow-up requests, questions, approvals, extra information the assistant asked for,
+     answers to something the assistant asked (choosing or turning down an option it offered is an answer),
+     the user changing their own earlier instruction or adding an exception or a detail to it ("actually, for docs it is fine, leave it"),
+     and standing instructions stated for the first time ("from now on, merge PRs when ready") — those can be candidates, not corrections.
+   A correction is about what the ASSISTANT did, said or assumed; a turn where the user only revises what the user said before is not one.
+   Quote the user briefly and give the USER # number.`;
+
+export const CORRECTIONS_ONLY_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['corrections'],
+  properties: { corrections: MEASURE_SCHEMA.properties.corrections },
+};
+
+/** The instrument: count the corrections of a session, and nothing else. */
+export function correctionsPrompt({ digest, part = null }) {
+  return `Review the session digest below and return only:${partNote(part)}
+
+${CORRECTIONS_RULES}
+
+An empty list is a good answer.
+
+Session digest:
+<digest>
+${digest}
+</digest>`;
+}
+
 function partNote(part) {
   return part ? `
 This digest is part ${part.index} of ${part.of} of a long session; USER numbers continue across parts. Judge only what this part shows.
@@ -76,12 +117,7 @@ This digest is part ${part.index} of ${part.of} of a long session; USER numbers 
 export function measurePrompt({ digest, inventory, part = null }) {
   return `Review the session digest below and return:${partNote(part)}
 
-1. "corrections": every user turn that pushes back on or redirects something the assistant did, said or assumed.
-   - explicit: "no, use pnpm", "that's wrong", "I already told you…", "stop doing X".
-   - implicit: "hmm, the test broke again", "I prefer the other way", "that's not what I asked".
-   - NOT corrections: new tasks, follow-up requests, answers to the assistant's questions, approvals, extra information the assistant asked for,
-     and standing instructions stated for the first time ("from now on, merge PRs when ready") — those can be candidates, not corrections.
-   Quote the user briefly and give the USER # number.
+1. ${CORRECTIONS_RULES}
 
 2. "candidates": what would be worth remembering for future sessions (at most 5; an empty list is a good answer).
    - kind "memory": a fact — a user preference or way of working (memory_type user/feedback), a project fact (project), or a pointer to an external resource (reference). memory_type is required for memories.
@@ -119,7 +155,9 @@ export const LEARN_SCHEMA = {
         additionalProperties: false,
         required: ['kind', 'title', 'confidence', 'evidence'],
         properties: {
-          kind: { type: 'string', enum: ['global', 'memory', 'skill'] },
+          kind: { type: 'string', enum: ['global', 'preference', 'memory', 'skill'] },
+          topic: { type: 'string' },
+          paths: { type: 'array', items: { type: 'string' } },
           scope: { type: 'string', enum: ['global', 'project'] },
           memory_type: { type: 'string', enum: ['feedback', 'project', 'reference'] },
           title: { type: 'string' },
@@ -129,23 +167,26 @@ export const LEARN_SCHEMA = {
           confidence: { type: 'number', minimum: 0, maximum: 1 },
           evidence: { type: 'string' },
           repeats: { type: 'string' },
+          refines: { type: 'string' },
         },
       },
     },
   },
 };
 
-export function learnPrompt({ digest, inventory, part = null, lang = options().learningLanguage }) {
+export function learnPrompt({ digest, inventory, part = null, lang = options().learningLanguage, state = '', signals = '' }) {
   const LANG_RULE = lang === 'auto' ? 'Write in the same language the user writes in.' : `Write in ${lang === 'pt-BR' ? 'Brazilian Portuguese' : 'English'}, whatever language the session is in.`;
   return `Review the session digest below. It is the part of the session not reviewed yet.${partNote(part)} Return:
 
 1. "corrections": every user turn that pushes back on or redirects something the assistant did, said or assumed (explicit or implicit). Not corrections: new tasks, follow-ups, answers to questions, approvals, first-time standing instructions. Quote briefly with the USER # number.
 
 2. "items": what to save for future sessions (at most 5; an empty list is a good answer). Each item is written as-is, so make it ready to use:
-   - kind "global": one short fact valid on every project (who the user is, how they like to work, OS/shell/tool facts). Put the fact in "text" (one sentence); it is proposed as an addition to the user's global CLAUDE.md.
+   - kind "preference": one short preference or fact valid on every project that only matters for one topic or one kind of file. Put it in "text" (one sentence) and name the "topic" in one or two words ("commits", "code review", "python"); add "paths" (globs) when it only matters with certain files.
+   - kind "global": one short fact relevant in every session whatever the task (who the user is, how they work in general, OS/shell facts). Put it in "text" (one sentence); it is proposed as an addition to the user's global CLAUDE.md. Prefer "preference" whenever the fact has a topic.
    - kind "memory": a fact about this project. memory_type "feedback" (how to work here), "project" (decision, convention) or "reference" (pointer to an external resource). Give "title", a one-line "description", and a "body" with the fact plus "**Why:**" and "**How to apply:**" lines.
    - kind "skill": a reusable procedure (multi-step workflow, the working path found after errors, an approach the user corrected). scope "global" if it works anywhere, "project" otherwise. Give "title", a "description" of at most 250 characters that says when to use it, and a "body" in Markdown with steps and pitfalls.
    - Keep an item only if it passes every rule of the rubric below. Proposing nothing is better than proposing noise; a later knowledge check drops what fails.
+   - "refines": when "This session so far" lists an entry this item refines, extends or corrects, its [ref] (for example "lrn_abc" or "c12"); the item then states the whole updated fact, not only the difference.
    - Do not repeat what the inventory already has. If the user had to repeat something the inventory already has, add an item only if it adds information, and set "repeats" to that item's name either way.
    - confidence: 0.3 tentative … 0.9 near-certain. "evidence": the USER # turns or events it comes from.
    - Titles are short and human-readable (never slugs like "feedback-x-y").
@@ -154,9 +195,12 @@ export function learnPrompt({ digest, inventory, part = null, lang = options().l
 Rubric (what is worth remembering):
 ${rubricText()}
 
+Where a learning belongs (pick the first that fits):
+${destinationsText()}
+
 Already saved (inventory):
 ${inventory}
-
+${state ? `\nThis session so far:\n${state}\n` : ''}${signals ? `\nRecorded while the session ran (a command or file that failed, then worked: the working path may be worth a skill or a memory, judged from the digest):\n${signals}\n` : ''}
 Session digest:
 <digest>
 ${digest}
@@ -168,6 +212,23 @@ function claudeCommand() {
     const custom = JSON.parse(process.env.OUROBOROS_CLAUDE_CMD || 'null');
     if (Array.isArray(custom) && custom.length) return custom;
   } catch { /* fall through */ }
+  return resolveClaude();
+}
+
+/**
+ * The command that runs Claude Code. On Windows an npm install puts `claude.cmd` on the
+ * PATH, a shim Node refuses to spawn without a shell (and a shell would mangle the JSON
+ * schema and the system prompt). So: a real `claude.exe` when there is one (the native
+ * install), else the CLI script the shim points to, run with this Node.
+ */
+export function resolveClaude({ platform = process.platform, pathEnv = process.env.PATH || process.env.Path || '', exists = fs.existsSync } = {}) {
+  if (platform !== 'win32') return ['claude'];
+  const dirs = pathEnv.split(';').map((d) => d.trim()).filter(Boolean);
+  for (const d of dirs) if (exists(path.win32.join(d, 'claude.exe'))) return [path.win32.join(d, 'claude.exe')];
+  for (const d of dirs) {
+    const cli = path.win32.join(d, 'node_modules', '@anthropic-ai', 'claude-code', 'cli.js');
+    if (exists(path.win32.join(d, 'claude.cmd')) && exists(cli)) return [process.execPath, cli];
+  }
   return ['claude'];
 }
 
@@ -245,11 +306,11 @@ export function usageOf(result) {
 
 export function insertReview(db, row) {
   const r = db.prepare(`
-    INSERT INTO reviews (session_id, mode, trigger, model, status, detail, turns_reviewed, corrections,
+    INSERT INTO reviews (session_id, mode, trigger, model, status, detail, instrument, turns_reviewed, corrections,
       input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, duration_ms, session_started_at, ts)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
-    row.sessionId, row.mode, row.trigger, row.model ?? null, row.status, row.detail ?? null,
+    row.sessionId, row.mode, row.trigger, row.model ?? null, row.status, row.detail ?? null, row.instrument ?? null,
     row.turns ?? 0, row.corrections ?? 0,
     row.usage?.input ?? 0, row.usage?.output ?? 0, row.usage?.cacheRead ?? 0, row.usage?.cacheWrite ?? 0,
     row.usage?.cost ?? 0, row.durationMs ?? null, row.sessionStartedAt ?? null, Date.now(),
@@ -265,25 +326,101 @@ function finish(db, sessionId, state, cursor) {
   `).run(state, Date.now(), cursor ?? null, Date.now(), sessionId);
 }
 
+/** Whether an item's evidence points at something real: a user turn that was reviewed, or a recorded recovery. */
+export function isAnchored(evidence, userTurns, signals = false) {
+  if (quotesFor(evidence, userTurns).length) return true;
+  return !!signals && !/USER\s*#/i.test(String(evidence || '')) && String(evidence || '').trim().length > 0;
+}
+
+const MISSES_BEFORE_SUGGESTION = 2;
+
+/**
+ * The user had to repeat something already saved (the reviewer names the saved item in
+ * "repeats"). That is not a reason to trust it less or archive it: the user cares about
+ * it. It means the saved text did not work, usually because it does not say clearly when
+ * it applies. Count it, and from the second time on ask once, in the inbox, to reword it.
+ */
+export function recordMiss(db, session, name, reviewId = 0, now = Date.now()) {
+  const n = String(name || '').trim();
+  if (!n) return null;
+  const bare = n.replace(/\.md$/i, '');
+  const l = db.prepare(`
+    SELECT * FROM learnings WHERE status = 'active' AND (name = ? OR name = ? OR name = ? OR lower(title) = lower(?))
+      AND (project IS NULL OR project = ? OR scope = 'global') ORDER BY updated_at DESC`).get(n, bare, `learned-${bare}`, n, session.project);
+  return l ? bumpMiss(db, session, l, reviewId, now) : null;
+}
+
+/** Count one miss for a learning, once per session, and suggest a rewording from the second on. */
+function bumpMiss(db, session, l, reviewId, now) {
+  const seen = db.prepare("SELECT 1 FROM events WHERE session_id = ? AND kind = 'miss' AND target = ?").get(session.id, l.id);
+  if (seen) return l.id;
+  db.prepare("INSERT INTO events (session_id, ts, kind, target) VALUES (?, ?, 'miss', ?)").run(session.id, now, l.id);
+  db.prepare('UPDATE learnings SET misses = misses + 1, last_missed_at = ? WHERE id = ?').run(now, l.id);
+  if (l.misses + 1 >= MISSES_BEFORE_SUGGESTION && !l.miss_flagged_at) {
+    db.prepare(`INSERT INTO candidates (review_id, session_id, project, kind, scope, title, summary, confidence, outcome, cwd, target, note, triaged_at, ts)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 0.7, 'suggested', ?, ?, ?, ?, ?)`).run(
+      reviewId || 0, session.id, session.project, l.kind === 'skill' ? 'skill' : 'memory', l.scope, `Saved but repeated: ${l.title}`.slice(0, 200),
+      `You told Claude this again ${l.misses + 1} times although it is saved in ${l.path}.`, session.cwd || null, l.path,
+      `fix in the project: reword what is saved. You repeated this ${l.misses + 1} times although it is saved. Reword its description (and its MEMORY.md line) so it says when it applies, or move it to the skill or rule that owns the topic`, now, now);
+    db.prepare('UPDATE learnings SET miss_flagged_at = ? WHERE id = ?').run(now, l.id);
+  }
+  return l.id;
+}
+
+const MISS_MIN_SHARED = 3;
+
+/**
+ * A correction the user made about something that was already saved before the session
+ * began is a miss, whether or not the reviewer notices and names it: compare the
+ * user's own words with what each saved learning says (its title, description and
+ * first lines). A match needs several distinct terms in common and at least half of
+ * the shorter side, so a correction on another subject never counts.
+ */
+export function missFromQuote(db, session, quote, reviewId = 0, now = Date.now()) {
+  const said = new Set(tokenize(quote));
+  if (said.size < MISS_MIN_SHARED) return null;
+  let best = null;
+  for (const l of db.prepare(`
+    SELECT * FROM learnings WHERE status = 'active' AND kind IN ('memory', 'skill', 'rules') AND origin_session IS NOT 'native'
+      AND created_at < ? AND (project IS NULL OR project = ? OR scope = 'global')`).all(session.started_at || now, session.project)) {
+    let text = '';
+    try { text = fs.readFileSync(l.path, 'utf8'); } catch { continue; }
+    const { data, body } = parseFrontmatter(text);
+    const says = new Set(tokenize(`${l.title} ${typeof data.description === 'string' && !/^The user's preferences about/.test(data.description) ? data.description : ''} ${body.split(/\n\s*\*\*Why:\*\*/)[0].slice(0, 600)}`));
+    const shared = [...said].filter((t) => says.has(t)).length;
+    if (shared < MISS_MIN_SHARED || shared < 0.5 * Math.min(said.size, says.size)) continue;
+    if (!best || shared > best.shared) best = { l, shared };
+  }
+  return best ? bumpMiss(db, session, best.l, reviewId, now) : null;
+}
+
 /**
  * Record learn-mode proposals and hand them to the evaluation queue (evaluate.mjs):
  * screen, ground, compose per file, validate, write or queue. The queue has a single
  * consumer; if another process is evaluating, it picks these up before it stops. The
  * notice for the session is written when they are evaluated.
  */
-async function applyLearnings(db, session, reviewId, items, opts, { notify = true, userTurns = [] } = {}) {
+async function applyLearnings(db, session, reviewId, items, opts, { notify = true, userTurns = [], signals = false } = {}) {
   const ts = Date.now();
   const insert = db.prepare(`
     INSERT INTO candidates (review_id, session_id, project, kind, scope, memory_type, title, summary, evidence, confidence, repeats, outcome, payload, cwd, quotes, ts)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`);
   for (const raw of items) {
     const item = { op: 'create', ...raw, scope: raw.kind === 'global' ? 'global' : raw.scope || 'project' };
+    // Learn only from trusted sources, checked by code: the evidence must cite a user
+    // turn that exists in what was reviewed (or, with recorded recoveries, an observed
+    // outcome instead of a turn). An item anchored on nothing is never written on its
+    // own: it waits for the user, whatever the autonomy.
+    const anchored = isAnchored(item.evidence, userTurns, signals);
+    if (!anchored) item.evidence = `${String(item.evidence || '').trim()} [cites no user turn of the session: held for you]`.trim();
+    const autonomy = anchored ? opts.autonomy : 'queue';
     insert.run(reviewId, session.id, session.project, item.kind, item.scope, item.memory_type ?? null,
       String(item.title || item.text || '').slice(0, 200), String(item.text || item.body || item.description || '').slice(0, 1500),
       String(item.evidence || '').slice(0, 800), item.confidence ?? null, item.repeats || null,
-      JSON.stringify({ item, cwd: session.cwd, trigger: 'session_end', actor: 'background', autonomy: opts.autonomy, notify }), session.cwd,
+      JSON.stringify({ item, cwd: session.cwd, trigger: 'session_end', actor: 'background', autonomy, notify }), session.cwd,
       JSON.stringify(quotesFor(item.evidence, userTurns)), ts);
   }
+  for (const raw of items) if (raw.repeats) recordMiss(db, session, raw.repeats, reviewId);
   if (!items.length) return null;
   const { drainQueue } = await import('./evaluate.mjs');
   try {
@@ -294,6 +431,53 @@ async function applyLearnings(db, session, reviewId, items, opts, { notify = tru
     logError(db, 'review-worker:evaluate', err);
     return null;
   }
+}
+
+/**
+ * The correction-rate instrument: one corrections-only pass over what the session added
+ * since it was last measured (`measure_cursor`), whatever the learning reviews covered.
+ * Reviews that learn also count corrections, but with other prompts, other models (the
+ * in-session one reports on itself) and only on tails; none of that enters the rate.
+ * Never throws: a failed measurement must not stop the learning review.
+ */
+export async function measureCorrections(db, session, entries, opts, trigger) {
+  const from = Math.min(session.measure_cursor || 0, entries.length);
+  const digest = buildDigest(entries, { fromLine: from, contextTurns: CONTEXT_TURNS });
+  // A correction answers something: one turn alone is measured only as the continuation of a measured session.
+  if (digest.humanTurns < 1 || (digest.humanTurns < MIN_HUMAN_TURNS && !from)) return null;
+  const base = { sessionId: session.id, mode: 'corrections', trigger, model: opts.reviewerModel, sessionStartedAt: session.started_at, instrument: 'corrections' };
+  const started = Date.now();
+  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+  const found = [];
+  let reviewed = 0;
+  try {
+    for (let i = 0; i < digest.chunks.length; i++) {
+      if (monthSpend(db) + usage.cost >= opts.monthlyBudgetUsd) break;
+      const part = digest.chunks.length > 1 ? { index: i + 1, of: digest.chunks.length } : null;
+      const result = await runModel({ prompt: correctionsPrompt({ digest: digest.chunks[i], part }), schema: CORRECTIONS_ONLY_SCHEMA, model: opts.reviewerModel });
+      const u = usageOf(result);
+      for (const k of Object.keys(usage)) usage[k] += u[k];
+      found.push(...(result.structured_output.corrections || []));
+      reviewed++;
+    }
+  } catch (err) {
+    logError(db, 'review-worker:corrections', err);
+    if (!reviewed) usage.cost += usageOf(err.result).cost;
+  }
+  // Only a complete reading counts: a partial one would understate the rate.
+  if (reviewed < digest.chunks.length || digest.omitted) {
+    insertReview(db, { ...base, instrument: null, status: reviewed ? 'failed' : 'skipped', detail: reviewed ? `measured ${reviewed} of ${digest.chunks.length} parts; not counted` : 'not measured (budget or model error)', usage, durationMs: Date.now() - started });
+    return null;
+  }
+  const reviewId = insertReview(db, { ...base, status: 'ok', turns: digest.humanTurns, corrections: found.length, usage, durationMs: Date.now() - started });
+  const ts = Date.now();
+  for (const c of found) {
+    db.prepare('INSERT INTO corrections (review_id, session_id, quote, kind, ts) VALUES (?, ?, ?, ?, ?)').run(reviewId, session.id, String(c.quote).slice(0, 500), c.kind, ts);
+  }
+  // A correction about something that was already saved is a miss (the reviewer may also name it).
+  for (const c of found) missFromQuote(db, session, c.quote, reviewId, ts);
+  db.prepare('UPDATE sessions SET measure_cursor = ? WHERE id = ?').run(digest.nextLine, session.id);
+  return { reviewId, turns: digest.humanTurns, corrections: found.length };
 }
 
 /** Review one queued session. Returns a short status string. */
@@ -325,11 +509,29 @@ export async function reviewSession(db, sessionId, trigger, overrides = {}) {
   }
 
   const entries = readTranscript(session.transcript_path);
-  const digest = buildDigest(entries, { fromLine: learnBackfill ? 0 : session.review_cursor || 0 });
+  // With learning on, the correction rate comes from its own pass over the whole session.
+  if (mode === 'background' && !learnBackfill) await measureCorrections(db, session, entries, opts, trigger);
+  const fromLine = learnBackfill ? 0 : session.review_cursor || 0;
+  const digest = buildDigest(entries, { fromLine, contextTurns: CONTEXT_TURNS });
   const parts = digest.chunks;
-  if (digest.humanTurns < MIN_HUMAN_TURNS) {
+  // What the tail does not show by itself: what earlier reviews of this session did and
+  // left open, and the failures the session worked through since the last one.
+  const lastReview = learnBackfill ? 0 : db.prepare("SELECT MAX(ts) t FROM reviews WHERE session_id = ? AND status = 'ok' AND mode IN ('inloop', 'background', 'measure')").get(sessionId).t || 0;
+  const recoveries = learnBackfill ? [] : db.prepare("SELECT target, payload FROM events WHERE session_id = ? AND kind = 'recovery' AND ts > ? ORDER BY id DESC LIMIT 8").all(sessionId, lastReview);
+  const state = mode === 'background' && !learnBackfill ? sessionStateText(db, sessionId) : '';
+  const signals = recoveries.map((r) => {
+    let p = {};
+    try { p = JSON.parse(r.payload || '{}'); } catch { /* ignore */ }
+    return `- ${r.target} failed ${p.failures || '?'}x before working${p.first_error ? ` (first error: ${String(p.first_error).split('\n')[0].slice(0, 160)})` : ''}`;
+  }).join('\n');
+  // A short tail is skipped only when nothing ties it to the rest of the session: one
+  // last turn after an earlier review is often the correction of what that review saw.
+  const standsAlone = !recoveries.length && !lastReview && !(mode === 'background' && openObservations(db, sessionId).length);
+  if (digest.humanTurns < 1 || (digest.humanTurns < MIN_HUMAN_TURNS && standsAlone)) {
     insertReview(db, { ...base, status: 'skipped', detail: `only ${digest.humanTurns} user turn(s)`, turns: digest.humanTurns });
-    finish(db, sessionId, 'skipped', digest.nextLine);
+    // Not reviewed, so the cursor stays: if the session goes on (a resume, one more
+    // headless call), the next review reads these turns together with the new ones.
+    finish(db, sessionId, 'skipped');
     return 'short';
   }
 
@@ -345,7 +547,7 @@ export async function reviewSession(db, sessionId, trigger, overrides = {}) {
     for (let i = 0; i < parts.length; i++) {
       if (i > 0 && monthSpend(db) + usage.cost >= opts.monthlyBudgetUsd) break;
       const part = parts.length > 1 ? { index: i + 1, of: parts.length } : null;
-      const promptArgs = { digest: parts[i], inventory, part };
+      const promptArgs = { digest: parts[i], inventory, part, state, signals };
       let result;
       try {
         result = await runModel({
@@ -369,6 +571,8 @@ export async function reviewSession(db, sessionId, trigger, overrides = {}) {
     const partial = reviewed < parts.length || digest.omitted;
     reviewId = insertReview(db, {
       ...base,
+      // A measure-mode review reads the session with the instrument's definition: it counts.
+      instrument: mode === 'measure' ? 'corrections' : null,
       status: 'ok',
       turns: learnBackfill ? 0 : digest.humanTurns,
       corrections: learnBackfill ? 0 : out.corrections.length,
@@ -382,12 +586,16 @@ export async function reviewSession(db, sessionId, trigger, overrides = {}) {
       durationMs: Date.now() - started,
     });
     const ts = Date.now();
-    for (const c of learnBackfill ? [] : out.corrections) {
+    // The corrections a learning review counts are its own working notes; the listed
+    // quotes come from the instrument.
+    for (const c of mode === 'measure' ? out.corrections : []) {
       db.prepare('INSERT INTO corrections (review_id, session_id, quote, kind, ts) VALUES (?, ?, ?, ?, ?)')
         .run(reviewId, sessionId, String(c.quote).slice(0, 500), c.kind, ts);
     }
     if (mode === 'background') {
-      await applyLearnings(db, session, reviewId, out.items, opts, { notify: !learnBackfill, userTurns: digest.userTurns });
+      await applyLearnings(db, session, reviewId, out.items, opts, { notify: !learnBackfill, userTurns: digest.userTurns, signals: recoveries.length > 0 });
+      // The session's last review saw every open observation: settled ones came back as items.
+      if (!learnBackfill) closeObservations(db, sessionId);
       finish(db, sessionId, 'done', digest.nextLine);
       return 'ok';
     }
@@ -398,6 +606,7 @@ export async function reviewSession(db, sessionId, trigger, overrides = {}) {
       `).run(reviewId, sessionId, session.project, c.kind, c.scope, c.memory_type ?? null, String(c.title).slice(0, 200),
         String(c.summary).slice(0, 1500), String(c.evidence).slice(0, 800), c.confidence, c.repeats || null, ts);
     }
+    db.prepare('UPDATE sessions SET measure_cursor = ? WHERE id = ?').run(digest.nextLine, sessionId);
     finish(db, sessionId, 'done', digest.nextLine);
     return 'ok';
   } catch (err) {
@@ -469,7 +678,7 @@ async function backfill(db, { days, limit, dryRun, learn, autonomy }) {
       INSERT INTO sessions (id, project, cwd, transcript_path, started_at, ended_at, turns, queue_state, last_event_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)
       ON CONFLICT(id) DO UPDATE SET queue_state = 'queued', transcript_path = excluded.transcript_path
-    `).run(s.id, projectKey(s.cwd), s.cwd, s.file, s.startedAt, s.mtime, s.humanTurns, Date.now());
+    `).run(s.id, projectIdFor(s.cwd), s.cwd, s.file, s.startedAt, s.mtime, s.humanTurns, Date.now());
     const status = await reviewSession(db, s.id, trigger, { autonomy });
     done++;
     console.log(`[${done}/${list.length}] ${s.id} ${status}`);

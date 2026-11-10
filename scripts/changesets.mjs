@@ -6,9 +6,10 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { appendToSection, containsSecret, needsApproval, writeText } from './curator.mjs';
+import { appendToSection, containsSecret, createdByOuroboros, interimOf, needsApproval, ownUntouched, retireInterim, setDescription, writeText } from './curator.mjs';
+import { parseFrontmatter } from './inventory.mjs';
 import { knowledgeKind } from './knowledge.mjs';
-import { projectKey } from './paths.mjs';
+import { projectIdFor } from './paths.mjs';
 import { addedText, isInsertion } from './textdiff.mjs';
 
 /** A changeset may grow a file by at most this many characters. */
@@ -16,6 +17,7 @@ export const MAX_GROWTH_CHARS = 6000;
 /** A correcting edit may remove at most this much text; other edits only add. */
 export const MAX_REMOVED_CHARS = 800;
 const MIN_OLD_CHARS = 4;
+const MAX_DESCRIPTION_CHARS = 300;
 
 /**
  * A knowledge file as people name it: a skill's SKILL.md by the skill ("acme-local"), a
@@ -79,7 +81,20 @@ export function applyEdits(text, edits) {
     let next;
     let edit = e;
     let added;
-    if (e.append !== undefined) {
+    let describes = false;
+    if (e.description !== undefined) {
+      // The one frontmatter value an edit may change: a memory's or skill's one-line
+      // description (a memory's line in MEMORY.md follows it). Always a correction.
+      const d = String(e.description || '').replace(/\s+/g, ' ').trim();
+      if (!d || d.length > MAX_DESCRIPTION_CHARS) { reject('the description is empty or too long'); continue; }
+      next = setDescription(cur, d);
+      if (next === cur) { reject('changes nothing'); continue; }
+      const rest = (t) => { const { description, ...other } = parseFrontmatter(t).data; return JSON.stringify(other); };
+      if (rest(next) !== rest(cur)) { reject('changes the frontmatter'); continue; }
+      edit = { ...e, corrects: true, ...(e.corrects ? {} : { rewrites: true }) };
+      added = d;
+      describes = true;
+    } else if (e.append !== undefined) {
       if (!String(e.append || '').trim()) { reject('empty addition'); continue; }
       next = appendToSection(cur, e.section, e.append);
       added = String(e.append);
@@ -102,7 +117,7 @@ export function applyEdits(text, edits) {
       }
       next = cur.replace(old, () => repl);
     }
-    if (frontmatter(next) !== frontmatter(cur)) { reject('changes the frontmatter'); continue; }
+    if (!describes && frontmatter(next) !== frontmatter(cur)) { reject('changes the frontmatter'); continue; }
     if (headingCount(next) < headingCount(cur)) { reject('removes a heading'); continue; }
     if (containsSecret(added)) { reject('adds something that looks like a secret'); continue; }
     cur = next;
@@ -142,7 +157,7 @@ export function saveChangeset(db, { file, cwd, base, edits, note = null, cost = 
   const r = db.prepare(`
     INSERT INTO changesets (file, kind, cwd, project, base_hash, edits, corrects, status, note, cost_usd, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`).run(
-    target, knowledgeKind(target), cwd || null, cwd ? projectKey(cwd) : null, hashText(base), JSON.stringify(edits),
+    target, knowledgeKind(target), cwd || null, cwd ? projectIdFor(cwd) : null, hashText(base), JSON.stringify(edits),
     edits.some((e) => e.corrects) ? 1 : 0, note, cost, now);
   const id = Number(r.lastInsertRowid);
   const attach = db.prepare("UPDATE candidates SET changeset_id = ?, target = ?, outcome = 'queued', decided_at = NULL WHERE id = ?");
@@ -155,7 +170,9 @@ export function changesetNeedsApproval(db, cs, actor, autonomy) {
   const claims = claimsOf(db, cs.id);
   const confidence = claims.length ? Math.min(...claims.map((c) => c.confidence ?? 0.6)) : 0.6;
   const kind = knowledgeKind(cs.file);
-  return needsApproval({ op: 'patch', target: cs.file, kind: kind === 'skill' ? 'skill' : 'memory', corrects: !!cs.corrects, confidence }, actor, autonomy);
+  // A learned-preferences rule file is Ouroboros's own: adding to it is not a change to a file a person wrote.
+  const ownFile = kind === 'rules' && createdByOuroboros(db, cs.file);
+  return needsApproval({ op: 'patch', target: cs.file, kind: kind === 'skill' ? 'skill' : 'memory', corrects: !!cs.corrects, confidence, ownFile, ownUntouched: ownUntouched(db, cs.file) }, actor, autonomy);
 }
 
 /**
@@ -183,6 +200,7 @@ export function applyChangeset(db, id, { actor = 'manual' } = {}) {
     title: claims.length === 1 ? claims[0].title : `${fileDisplayName(cs.file)}: ${claims.length} updates`,
     why: claims.map((c) => `- ${c.title}: ${String(c.claim || c.summary || '').replace(/\s+/g, ' ').slice(0, 300)}${c.evidence ? ` (${String(c.evidence).replace(/\s+/g, ' ').slice(0, 160)})` : ''}`).join('\n'),
     confidence: claims.length ? Math.max(...claims.map((c) => c.confidence ?? 0.6)) : 0.6,
+    description: applied.find((e) => e.description !== undefined)?.description,
   });
   if (r.status === 'stale') {
     db.prepare("UPDATE changesets SET status = 'stale', note = ? WHERE id = ?").run(r.reason, id);
@@ -194,6 +212,8 @@ export function applyChangeset(db, id, { actor = 'manual' } = {}) {
   db.prepare("UPDATE changesets SET status = 'applied', decided_at = ?, learning_id = ?, batch = ?, note = COALESCE(?, note) WHERE id = ?")
     .run(now, r.id, r.batch, rebased ? 'applied on top of a newer version of the file' : null, id);
   db.prepare("UPDATE candidates SET outcome = 'patched', learning_id = ?, decided_at = ? WHERE changeset_id = ? AND outcome = 'queued'").run(r.id, now, id);
+  // The line is in the file now: the memories that stood in for it meanwhile are retired.
+  for (const c of claims) retireInterim(db, c.id);
   return { ...r, status: 'patched', title: r.title || path.basename(cs.file), claims: claims.length, rebased };
 }
 
@@ -220,7 +240,7 @@ export function queueEdit(db, item, payload, actor) {
   const r = db.prepare(`
     INSERT INTO candidates (review_id, session_id, project, kind, scope, memory_type, title, summary, evidence, confidence, outcome, payload, cwd, claim, target, triaged_at, ts)
     VALUES (0, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)`).run(
-    payload.session_id || actor, projectKey(item.projectDir || payload.cwd || ''), item.kind, item.scope || 'project', item.memory_type ?? null,
+    payload.session_id || actor, projectIdFor(item.projectDir || payload.cwd || ''), item.kind, item.scope || 'project', item.memory_type ?? null,
     String(item.title || path.basename(file)).slice(0, 200), String(item.append ?? item.new ?? '').slice(0, 1500), String(item.evidence || '').slice(0, 800),
     item.confidence, JSON.stringify({ item: { ...item, projectDir: undefined, project_dir: item.projectDir }, cwd: payload.cwd, trigger: payload.trigger, actor }),
     payload.cwd || null, String(item.append ?? item.new ?? '').slice(0, 1500), file, now, now);
@@ -255,6 +275,6 @@ export function changesetView(db, cs) {
     status: cs.status, created_at: cs.created_at, changed: current === null || hashText(current) !== cs.base_hash,
     session_started_at: claims.reduce((m, c) => Math.min(m, c.session_started_at || c.ts), Infinity),
     edits: JSON.parse(cs.edits),
-    claims: claims.map((c) => ({ id: c.id, title: c.title, claim: c.claim || c.summary, evidence: c.evidence, note: c.note, confidence: c.confidence, session_started_at: c.session_started_at })),
+    claims: claims.map((c) => ({ id: c.id, title: c.title, claim: c.claim || c.summary, evidence: c.evidence, note: c.note, confidence: c.confidence, session_started_at: c.session_started_at, meanwhile: interimOf(db, c.id)?.path || null })),
   };
 }

@@ -6,9 +6,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { options } from './config.mjs';
-import { classifyPath, dataDir, projectKey, skillNameFromPath } from './paths.mjs';
-import { retireProfile } from './migrate.mjs';
+import { classifyPath, dataDir, projectIdFor, skillNameFromPath } from './paths.mjs';
+import { rekeyProjects, retireProfile } from './migrate.mjs';
 import { RUBRIC_SHORT } from './rubric.mjs';
+import { sessionStateText } from './session-state.mjs';
 import { globMatch, loadSettings } from './settings.mjs';
 import { countLines, readTranscript, usageSince } from './transcript.mjs';
 
@@ -59,7 +60,7 @@ function ensureSession(db, input, now) {
     ON CONFLICT(id) DO UPDATE SET
       transcript_path = COALESCE(excluded.transcript_path, sessions.transcript_path),
       last_event_at = excluded.last_event_at
-  `).run(input.session_id, projectKey(input.cwd), input.cwd || null, input.transcript_path || null, now, now);
+  `).run(input.session_id, projectIdFor(input.cwd), input.cwd || null, input.transcript_path || null, now, now);
 }
 
 function addEvent(db, input, now, kind, target = null, payload = null) {
@@ -102,7 +103,7 @@ export function isExcluded(cwd) {
 export const RESULT_RE = /\[ouroboros\]\s*reviewed=(\d+)\s+corrections=(\d+)\s+learned=(\d+)\s+patched=(\d+)/i;
 
 /** Instructions sent through the Stop hook to ask for a periodic review. */
-export function reviewRequest({ from, to, trigger, recoveries = [] }) {
+export function reviewRequest({ from, to, trigger, recoveries = [], state = '' }) {
   const why = trigger === 'recovery' ? 'after working through failures' : 'periodic';
   const signals = recoveries.map((r) => {
     let p = {};
@@ -113,6 +114,8 @@ export function reviewRequest({ from, to, trigger, recoveries = [] }) {
     `Ouroboros learning review (${why}). Before finishing, review user turns ${from}–${to} of this session — only what happened since the last review.`,
     'Use the `ouroboros:learn` skill if anything passes its filters (corrections of your approach, preferences, conventions, working paths found after errors); be brief and mention each saved item in one line.',
     signals.length ? `Signals recorded in this stretch:\n${signals.join('\n')}` : '',
+    state,
+    'Something worth keeping that is not settled yet (not verified, said once, still being worked out) is not saved and not lost: pass it in "open" when you call the skill\'s apply step, and the next review of this session picks it up.',
     'Count corrections: user turns in that range that redirected your approach, explicit or implicit.',
     'End your message with exactly this line (numbers filled in; learned/patched count only what you saved for this review), even when nothing was saved:',
     '[ouroboros] reviewed=<user turns reviewed> corrections=<n> learned=<items created> patched=<items updated>',
@@ -126,11 +129,20 @@ export function reviewRequest({ from, to, trigger, recoveries = [] }) {
  * use 15+ tool calls, and most have nothing new to learn.
  */
 export function recoveredThisTurn(db, sessionId, minFailures) {
-  const turnStart = db.prepare("SELECT MAX(ts) t FROM events WHERE session_id = ? AND kind = 'turn'").get(sessionId).t || 0;
-  return db.prepare("SELECT payload FROM events WHERE session_id = ? AND kind = 'recovery' AND ts >= ?").all(sessionId, turnStart)
+  return db.prepare("SELECT target, payload FROM events WHERE session_id = ? AND kind = 'recovery' AND ts >= ?").all(sessionId, turnStartOf(db, sessionId))
+    // Retrying an edit or a read of the same file until it applies is mechanics, not a
+    // working path worth an early review (it is still recorded and reaches the reviews).
+    .filter((r) => !FILE_TOOL_RE.test(String(r.target || '')))
     .some((r) => {
       try { return (JSON.parse(r.payload || '{}').failures || 0) >= minFailures; } catch { return false; }
     });
+}
+
+const FILE_TOOL_RE = /^(Edit|MultiEdit|Write|Read|NotebookEdit):/;
+
+/** When the session's current user turn started (0 before the first one). */
+function turnStartOf(db, sessionId) {
+  return db.prepare("SELECT MAX(ts) t FROM events WHERE session_id = ? AND kind = 'turn'").get(sessionId).t || 0;
 }
 
 /** At most one early review every EARLY_REVIEW_MIN_TURNS user turns (after any review request). */
@@ -215,6 +227,8 @@ export function inboxCount(db, project) {
 
 const handlers = {
   SessionStart(db, input, now) {
+    // v0.18: one key per repository (before: per folder, so worktrees were strangers).
+    try { rekeyProjects(db); } catch (err) { dbApi.logError(db, 'migrate:projects', err); }
     ensureSession(db, input, now);
     addEvent(db, input, now, 'session_start', input.source || null);
     // The dashboard runs outside hooks and can't see plugin options; leave a snapshot.
@@ -224,14 +238,15 @@ const handlers = {
       // project (a notice from another project waits for a session there); maintenance
       // notices have no project and go to the next session anywhere.
       const notices = db.prepare('SELECT id, text FROM notices WHERE delivered_at IS NULL AND (project IS NULL OR project = ?) ORDER BY id')
-        .all(projectKey(input.cwd));
+        .all(projectIdFor(input.cwd));
       if (notices.length) {
         db.prepare(`UPDATE notices SET delivered_at = ? WHERE id IN (${notices.map(() => '?').join(',')})`).run(now, ...notices.map((n) => n.id));
       }
-      const learnedText = notices.map((n) => n.text).join('\n');
+      // Several reviews can report the same thing (a change still waiting): say it once.
+      const learnedText = [...new Set(notices.flatMap((n) => String(n.text).split('\n')))].join('\n');
       // What waits for the user's decision (this project's and global entries): said with
       // the notices, otherwise at most once a day.
-      const waiting = inboxCount(db, projectKey(input.cwd));
+      const waiting = inboxCount(db, projectIdFor(input.cwd));
       const remind = waiting && (learnedText || now - (Number(dbApi.getMeta(db, 'inbox_hint_at')) || 0) > 20 * 60 * 60 * 1000);
       if (remind) dbApi.setMeta(db, 'inbox_hint_at', now);
       const inboxLine = remind ? `${waiting} waiting for your decision: /ouroboros:inbox (or the dashboard)` : '';
@@ -318,8 +333,10 @@ const handlers = {
     // "found the working path after errors", the strongest procedural signal.
     const target = targetOf(tool, ti);
     const streak = db.prepare('SELECT * FROM fail_streaks WHERE session_id = ? AND target = ?').get(input.session_id, target);
-    if (streak) {
-      db.prepare('DELETE FROM fail_streaks WHERE session_id = ? AND target = ?').run(input.session_id, target);
+    if (streak) db.prepare('DELETE FROM fail_streaks WHERE session_id = ? AND target = ?').run(input.session_id, target);
+    // Only within one turn: a failure three turns ago and a success now are two events,
+    // not Claude working its way through an error.
+    if (streak && streak.started_at >= turnStartOf(db, input.session_id)) {
       addEvent(db, input, now, 'recovery', target, {
         failures: streak.count,
         first_error: streak.first_error,
@@ -335,6 +352,8 @@ const handlers = {
       .run(input.session_id);
     const target = targetOf(input.tool_name || '', input.tool_input || {});
     const error = String(input.error || '').slice(0, 400);
+    // A streak left open by an earlier turn starts over.
+    db.prepare('DELETE FROM fail_streaks WHERE session_id = ? AND target = ? AND started_at < ?').run(input.session_id, target, turnStartOf(db, input.session_id));
     db.prepare(`
       INSERT INTO fail_streaks (session_id, target, agent_id, count, first_error, started_at)
       VALUES (?, ?, ?, 1, ?, ?)
@@ -377,7 +396,10 @@ const handlers = {
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: 'Stop',
-        additionalContext: reviewRequest({ from: s.turns_at_last_review + 1, to: s.turns, trigger, recoveries }),
+        additionalContext: reviewRequest({
+          from: s.turns_at_last_review + 1, to: s.turns, trigger, recoveries,
+          state: sessionStateText(db, input.session_id, { audience: 'claude' }),
+        }),
       },
     }));
   },

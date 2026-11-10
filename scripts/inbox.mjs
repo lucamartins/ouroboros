@@ -11,10 +11,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDb } from './db.mjs';
 import { applyChangeset, applyEdits, claimsOf, fileDisplayName, getChangeset, hashText, rejectChangeset } from './changesets.mjs';
-import { containsSecret, decideQueued, writeText } from './curator.mjs';
+import { containsSecret, decideQueued, interimOf, writeText } from './curator.mjs';
 import { options } from './config.mjs';
 import { knowledgeKind } from './knowledge.mjs';
-import { dataDir, memoryDirFor, projectKey } from './paths.mjs';
+import { dataDir, memoryDirFor, projectIdFor } from './paths.mjs';
 import { citedTurns, quotesFor, readTranscript, userTurnsOfReview } from './transcript.mjs';
 import { lineDiff, wordDiff } from './textdiff.mjs';
 
@@ -49,7 +49,7 @@ export function parseKey(key) {
  * global ones.
  */
 export function inboxEntries(db, { project } = {}) {
-  const key = project ? projectKey(project) : null;
+  const key = project ? projectIdFor(project) : null;
   const mine = (row) => !key || !row.project || row.project === key;
   const started = (row) => row.session_started_at || row.ts || row.created_at || 0;
   const conflicts = db.prepare(`
@@ -208,7 +208,7 @@ export function describeFile(file) {
   return 'A knowledge file';
 }
 
-const ORIGIN = { background: 'end-of-session review', session_end: 'end-of-session review', inloop: 'during the session', periodic: 'periodic review in the session', manual: 'you asked', backfill: 'review of a past session' };
+const ORIGIN = { background: 'end-of-session review', session_end: 'end-of-session review', inloop: 'during the session', periodic: 'periodic review in the session', manual: 'you asked', requested: 'you asked', backfill: 'review of a past session' };
 
 function dateOf(ts) {
   if (!ts) return null;
@@ -308,6 +308,7 @@ export function showEntry(db, key, { project } = {}) {
       `File: ${shortPath(cs.file)}`,
       `What it is: ${describeFile(cs.file)}`,
       `Waited because: ${waitedBecause({ corrects: cs.corrects, file: cs.file, kind: cs.kind, confidence, autonomy, backfill })}`,
+      claims.some((c) => interimOf(db, c.id)) ? `Meanwhile: already active as a project memory (${claims.map((c) => interimOf(db, c.id)).filter(Boolean).map((l) => shortPath(l.path)).join(', ')}). Approving writes the line here and retires the memory; rejecting keeps the memory.` : null,
       cs.note && cs.status === 'stale' ? `Note: ${oneLine(cs.note, 300)}` : null,
       '',
       `What it teaches (${claims.length} learning${claims.length > 1 ? 's' : ''}):`,
@@ -368,7 +369,8 @@ export function showEntry(db, key, { project } = {}) {
   const item = p.item || {};
   const projectDir = item.project_dir || item.projectDir || c.cwd;
   const lands = item.op === 'patch' && item.target ? `${shortPath(item.target)} — ${describeFile(item.target)}`
-    : item.kind === 'skill' ? `a new ${item.scope === 'global' ? 'global ' : ''}skill${item.name ? ` "${item.name}"` : ''}${item.scope === 'global' ? '' : ` of project ${path.basename(projectDir || '')}`}`
+    : item.kind === 'preference' ? `a preference about "${item.topic || ''}"${item.paths?.length ? ` (loaded with ${[].concat(item.paths).join(', ')})` : ' (loaded when the topic comes up)'}`
+      : item.kind === 'skill' ? `a new ${item.scope === 'global' ? 'global ' : ''}skill${item.name ? ` "${item.name}"` : ''}${item.scope === 'global' ? '' : ` of project ${path.basename(projectDir || '')}`}`
       : `a new ${item.memory_type ? `${item.memory_type} ` : ''}memory of project ${path.basename(projectDir || '')} (${shortPath(memoryDirFor({ cwd: projectDir }))})`;
   const content = [
     item.name ? `name: ${item.name}` : null,

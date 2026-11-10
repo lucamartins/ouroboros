@@ -94,12 +94,16 @@ test('capture: turns, skills, memory writes, recovery and long turns', () => {
 test('SessionEnd runs a background review that writes learnings and leaves a notice', async () => {
   hook('SessionEnd', { reason: 'prompt_input_exit' });
   const d = db();
-  const review = await waitFor(() => d.prepare('SELECT * FROM reviews WHERE session_id = ?').get('s1'));
+  const review = await waitFor(() => d.prepare("SELECT * FROM reviews WHERE session_id = ? AND mode = 'background'").get('s1'));
   assert.equal(review.status, 'ok', review.detail);
-  assert.equal(review.mode, 'background');
   assert.equal(review.turns_reviewed, 2);
   assert.equal(review.corrections, 1);
   assert.equal(review.cost_usd, 0.0042);
+  // The correction rate has its own pass over the whole session; the learning review's count is not part of it.
+  assert.equal(review.instrument, null);
+  const measured = d.prepare("SELECT * FROM reviews WHERE session_id = ? AND mode = 'corrections'").get('s1');
+  assert.deepEqual([measured.status, measured.instrument, measured.turns_reviewed, measured.corrections], ['ok', 'corrections', 2, 1]);
+  assert.equal(d.prepare('SELECT COUNT(*) n FROM corrections WHERE session_id = ?').get('s1').n, 1, 'quotes are listed once, from the instrument');
   const s = await waitFor(() => {
     const row = d.prepare('SELECT queue_state, review_cursor FROM sessions WHERE id = ?').get('s1');
     return row.queue_state === 'done' && row;
@@ -110,7 +114,7 @@ test('SessionEnd runs a background review that writes learnings and leaves a not
   assert.deepEqual(rows.map((r) => r.outcome), ['created', 'queued']);
   assert.equal(path.resolve(rows[1].target), path.join(tmp, 'claude', 'CLAUDE.md'));
   assert.equal(d.prepare('SELECT status FROM changesets WHERE id = ?').get(rows[1].changeset_id).status, 'pending');
-  assert.equal(d.prepare('SELECT learned FROM reviews WHERE session_id = ?').get('s1').learned, 1);
+  assert.equal(d.prepare("SELECT learned FROM reviews WHERE session_id = ? AND mode = 'background'").get('s1').learned, 1);
   d.close();
   assert.ok(fs.existsSync(path.join(tmp, 'claude', 'projects', '-tmp-proj', 'memory', 'use-pnpm.md')));
   assert.equal(fs.existsSync(path.join(tmp, 'ouroboros', 'user.md')), false);
@@ -118,7 +122,7 @@ test('SessionEnd runs a background review that writes learnings and leaves a not
 
   const first = JSON.parse(hook('SessionStart', { session_id: 's3', source: 'startup' }));
   assert.match(first.systemMessage, /📝 learned: Use pnpm/);
-  assert.match(first.systemMessage, /waiting for approval: CLAUDE\.md/);
+  assert.match(first.systemMessage, /waiting for approval: Shell → CLAUDE\.md/, 'the notice says what waits, not only where');
   assert.doesNotMatch(first.hookSpecificOutput.additionalContext, /Git Bash/);
   const second = JSON.parse(hook('SessionStart', { session_id: 's3b', source: 'startup' }));
   assert.equal(second.systemMessage, undefined);
@@ -147,6 +151,8 @@ test('with learning off the end-of-session review only measures', async () => {
   const review = await waitFor(() => d.prepare("SELECT * FROM reviews WHERE session_id = 's4'").get());
   assert.equal(review.mode, 'measure', review.detail);
   assert.equal(review.status, 'ok', review.detail);
+  assert.equal(review.instrument, 'corrections', 'a measure-mode review is the instrument: one call, no second pass');
+  assert.equal(d.prepare("SELECT COUNT(*) n FROM reviews WHERE session_id = 's4'").get().n, 1);
   const c = await waitFor(() => d.prepare("SELECT * FROM candidates WHERE session_id = 's4'").get());
   assert.equal(c.outcome, null);
   d.close();
@@ -224,6 +230,34 @@ test('early review: after a turn that worked through repeated failures, not afte
   assert.deepEqual(reviews.map((r) => r.trigger), ['recovery', 'recovery']);
   assert.ok(d.prepare("SELECT 1 FROM events WHERE session_id = 's9' AND kind = 'long_turn'").get(), 'long turns are still recorded');
   d.close();
+});
+
+test('a recovery is one turn working through an error; retrying a file edit asks for no early review', () => {
+  const sid = { session_id: 's10' };
+  const fail = (tool, input) => hook('PostToolUseFailure', { ...sid, tool_name: tool, tool_input: input, error: 'failed' });
+  const ok = (tool, input) => hook('PostToolUse', { ...sid, tool_name: tool, tool_input: input, tool_response: {} });
+  const recoveries = () => { const d = db(); const n = d.prepare("SELECT COUNT(*) n FROM events WHERE session_id = 's10' AND kind = 'recovery'").get().n; d.close(); return n; };
+  // Two failures in one turn, the success in a later one: not a recovery, and the streak is gone.
+  hook('UserPromptSubmit', sid);
+  fail('Bash', { command: 'pnpm build' });
+  fail('Bash', { command: 'pnpm build' });
+  hook('UserPromptSubmit', sid);
+  ok('Bash', { command: 'pnpm build' });
+  assert.equal(recoveries(), 0);
+  // A failure left open by an earlier turn does not add to this turn's streak.
+  fail('Bash', { command: 'pnpm lint' });
+  hook('UserPromptSubmit', sid);
+  fail('Bash', { command: 'pnpm lint' });
+  ok('Bash', { command: 'pnpm lint' });
+  const d = db();
+  assert.equal(JSON.parse(d.prepare("SELECT payload FROM events WHERE session_id = 's10' AND kind = 'recovery'").get().payload).failures, 1);
+  d.close();
+  // An edit that needed three tries is recorded, but it is mechanics: no early review.
+  hook('UserPromptSubmit', sid);
+  for (let i = 0; i < 3; i++) fail('Edit', { file_path: '/tmp/proj/a.ts' });
+  ok('Edit', { file_path: '/tmp/proj/a.ts' });
+  assert.equal(recoveries(), 2);
+  assert.equal(hook('Stop', { ...sid, stop_hook_active: false }), '');
 });
 
 test('learning can be turned off; reads of learned items count as uses', () => {

@@ -735,7 +735,8 @@ function changeCard(c) {
     h('div', { class: 'diffs' }, c.edits.map(editDiff)),
     h('ol', { class: 'claims', 'aria-label': 'Learnings behind this change' }, c.claims.map((l, i) => h('li', {},
       h('span', { class: 'n' }, `${i + 1}.`),
-      h('div', { class: 'claim-text' }, l.claim || l.title, l.note ? h('div', { class: 'small muted' }, reasonOf(l.note)) : null),
+      h('div', { class: 'claim-text' }, l.claim || l.title, l.note ? h('div', { class: 'small muted' }, reasonOf(l.note)) : null,
+        l.meanwhile ? h('div', { class: 'small muted', title: tilde(l.meanwhile) }, 'Already active as a project memory. Approving writes it here and retires that memory; rejecting keeps the memory.') : null),
       c.claims.length > 1
         ? actionButton('Remove', 'reject', String(l.id), { variant: 'quiet', small: true, confirmText: 'Remove it?', title: 'Reject this learning; the rest of the change is composed again without it' })
         : h('span'),
@@ -895,10 +896,11 @@ async function renderOverview() {
             : h('div', { class: 'figure' }, h('div', { class: 'v' }, fmt.rate(o.correctionRate)), h('div', { class: 'k' }, `n = ${fmt.int(o.reviewed.turns)} reviewed turns`)),
           delta !== null ? h('span', { class: `delta${tone ? '' : ' neutral'}`, title: enough ? null : `Not judged below ${MIN_SAMPLE_TURNS} turns after learning` },
             h('span', { class: `dot ${tone}` }), `${delta > 0 ? '+' : ''}${delta.toFixed(1)}`, enough ? null : h('span', { class: 'delta-note' }, 'small sample')) : null),
-        h('p', { class: 'sentence' }, text)),
+        h('p', { class: 'sentence' }, text),
+        h('p', { class: 'small faint' }, `Counted the same way before and after: one corrections-only reading of each whole session.${v.selfReported?.turns ? ` Not included: what the learning reviews counted themselves (${fmt.rate(v.selfReported.rate)} per 100 on ${fmt.int(v.selfReported.turns)} turns).` : ''}`)),
       h('div', { class: 'stats' },
         stat('Learned', fmt.int(learnedTotal), `${o.learned.memory || 0} memories · ${o.learned.skill || 0} skills${o.learned.patchedNative ? ` · ${o.learned.patchedNative} refined` : ''}`),
-        stat('Sessions using a learning', v.sessions ? fmt.pct((v.hits / v.sessions) * 100) : '—', `${fmt.int(v.hits)} of ${fmt.plural(v.sessions, 'session')}`),
+        stat('Sessions opening a learning', v.sessions ? fmt.pct((v.hits / v.sessions) * 100) : '—', `${fmt.int(v.hits)} of ${fmt.plural(v.sessions, 'session')}: a learned skill used or memory file read (rules followed from the memory index leave no trace)`),
         stat('Misses', fmt.int(o.misses), `times you repeated something already saved, in the last ${o.days} days`),
         h('div', { class: 'stat' },
           h('div', { class: 'k' }, 'Reviewer cost this month'),
@@ -912,7 +914,7 @@ async function renderOverview() {
   const charts = h('div', { class: 'charts' },
     barChart({ title: 'Corrections per 100 turns', sub: 'by the day the session started; lower is better', data: o.series, value: rate, format: (x) => x.toFixed(x > 0 && x < 10 ? 1 : 0), marker, wide: true, height: 200,
       tip: (d) => [fmt.day(d.day), `${d.corrections} corrections · ${d.reviewedTurns} turns reviewed`], emptyText: 'No reviewed sessions in this period' }),
-    failed(v) ? sectionError(v, 'this chart') : barChart({ title: 'Sessions using a learning', data: v.series, value: (d) => d.hits, format: (x) => fmt.int(x), marker,
+    failed(v) ? sectionError(v, 'this chart') : barChart({ title: 'Sessions opening a learning', data: v.series, value: (d) => d.hits, format: (x) => fmt.int(x), marker,
       tip: (d) => [fmt.day(d.day), `${d.hits} of ${d.sessions} sessions`] }),
     barChart({ title: 'User turns', data: o.series, value: (d) => d.turns, format: (x) => fmt.compact(x),
       tip: (d) => [fmt.day(d.day), fmt.plural(d.sessions, 'session')] }));
@@ -961,11 +963,12 @@ function changeKind(c) {
   return `${fixes ? 'Correction' : 'Addition'} to ${KIND_NAME[l?.kind] || 'a file'}`;
 }
 
-const ORIGIN = { inloop: 'in session', background: 'end-of-session review', manual: 'you asked' };
+const ORIGIN = { inloop: 'in session', background: 'end-of-session review', manual: 'you asked', requested: 'you asked' };
 
 function lifecycleNote(c) {
   const lc = c.lifecycle;
   if (!lc) return null;
+  if (lc.state === 'index') return h('span', { title: 'A rule Claude follows from its line in the memory index, without opening the file: not being read does not mean it is unused, so it is not archived for that' }, 'Applies from the index');
   if (lc.state === 'kept') return h('span', { title: 'Never archived automatically' }, 'Kept');
   if (lc.state === 'confident') return h('span', { title: 'Confident learnings are not archived when unused' }, 'Not archived when unused');
   return h('span', { title: 'Unused, low-confidence learnings are archived to ~/.ouroboros/archive (restorable). Keep it to stop that.' },
@@ -991,6 +994,7 @@ function learnedRow(c) {
         h('span', { title: fmt.datetime(c.ts) }, fmt.when(c.ts)),
         h('span', {}, c.project_name ? `${origin} · ${c.project_name}` : origin),
         used ? h('span', {}, used) : null,
+        c.misses ? h('span', { class: 'warn', title: 'You had to tell Claude this again although it was saved: it may not say clearly when it applies' }, `Repeated ${fmt.plural(c.misses, 'time')}`) : null,
         lifecycleNote(c)),
       c.why ? h('div', { class: 'item-reason' }, clampText(c.why, 'div')) : null,
       wrote.length ? keyed(disclose(c.op === 'create' ? 'What it saved' : 'What it changed', h('div', { class: 'diffs' }, wrote)), `wrote:${c.batch}`) : null),
@@ -1777,7 +1781,7 @@ const ACTIVITY_LISTS = {
     note: 'In-session reviews run inside your session and use your plan; the others are isolated Haiku calls billed per use.',
     columns: [
       { label: 'When', sort: 'date', render: (r) => fmt.datetime(r.ts) },
-      { label: 'Kind', render: (r) => cellMain(r.mode === 'inloop' ? 'In-session' : r.mode === 'background' ? 'End of session' : r.mode === 'maintenance' ? 'Maintenance' : r.mode, r.trigger) },
+      { label: 'Kind', render: (r) => cellMain(r.mode === 'inloop' ? 'In-session' : r.mode === 'background' ? 'End of session' : r.mode === 'corrections' ? 'Correction count' : r.mode === 'maintenance' ? 'Maintenance' : r.mode, r.trigger) },
       { label: 'Project', render: (r) => projectName(r) },
       { label: 'Status', render: (r) => h('span', { title: r.detail || '' }, reviewState(r.status)) },
       { label: 'Turns', num: true, render: (r) => fmt.int(r.turns_reviewed) },

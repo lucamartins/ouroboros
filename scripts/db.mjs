@@ -231,6 +231,32 @@ const MIGRATIONS = [
   `
   ALTER TABLE candidates ADD COLUMN quotes TEXT;      -- JSON [{ n, text }]; resolved from the transcript
   `,
+  // 10 — v0.15: what a review noticed but could not settle, carried to the session's next review
+  `
+  CREATE TABLE observations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    text        TEXT NOT NULL,
+    ts          INTEGER NOT NULL,
+    closed_at   INTEGER                            -- settled by a later review, or the session's last review ran
+  );
+  CREATE INDEX observations_session ON observations(session_id, closed_at);
+  `,
+  // 11 — v0.17: one instrument for the correction rate
+  `
+  ALTER TABLE reviews ADD COLUMN instrument TEXT;            -- 'corrections': counts toward the correction rate
+  ALTER TABLE sessions ADD COLUMN measure_cursor INTEGER NOT NULL DEFAULT 0;   -- transcript line the instrument has measured up to
+  -- Measure-mode reviews (learning off, measure backfills) read whole sessions with the
+  -- instrument's definition of a correction: they are the baseline.
+  UPDATE reviews SET instrument = 'corrections' WHERE mode = 'measure' AND status = 'ok';
+  UPDATE sessions SET measure_cursor = review_cursor WHERE id IN (SELECT session_id FROM reviews WHERE mode = 'measure' AND status = 'ok');
+  `,
+  // 12 — v0.19: a learning the user had to repeat (saved, yet it did not work)
+  `
+  ALTER TABLE learnings ADD COLUMN misses INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE learnings ADD COLUMN last_missed_at INTEGER;
+  ALTER TABLE learnings ADD COLUMN miss_flagged_at INTEGER;   -- a suggestion to reword it was sent to the inbox
+  `,
 ];
 
 export function openDb(explicitDir) {
@@ -292,6 +318,18 @@ export function acquireLease(db, name, ttlMs = 30 * 60 * 1000) {
     INSERT INTO meta (key, value) VALUES (?, ?)
     ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE CAST(meta.value AS INTEGER) < ?`).run(`lease:${name}`, token, now);
   return r.changes ? token : null;
+}
+
+/**
+ * Push a held lease's expiry forward; returns the new token, or null when the lease is
+ * no longer ours (it expired and someone took it). A long evaluation renews before each
+ * model call, so its lease never runs out while it is alive.
+ */
+export function renewLease(db, name, token, ttlMs = 30 * 60 * 1000) {
+  if (!token) return null;
+  const next = `${Date.now() + ttlMs}|${token.split('|').slice(1).join('|')}`;
+  const r = db.prepare('UPDATE meta SET value = ? WHERE key = ? AND value = ?').run(next, `lease:${name}`, token);
+  return r.changes ? next : null;
 }
 
 export function releaseLease(db, name, token) {

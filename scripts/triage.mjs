@@ -12,6 +12,7 @@ import { options } from './config.mjs';
 import { buildIndex, ownersMap } from './knowledge.mjs';
 import { assertBudget } from './db.mjs';
 import { runModel, usageOf } from './review-worker.mjs';
+import { destinationsText } from './router.mjs';
 import { languageRule, rubricText } from './rubric.mjs';
 
 const BATCH = 12;
@@ -54,7 +55,9 @@ export const TRIAGE_SCHEMA = {
             type: 'object',
             additionalProperties: false,
             properties: {
-              kind: { type: 'string', enum: ['global', 'memory', 'skill'] },
+              kind: { type: 'string', enum: ['global', 'preference', 'memory', 'skill'] },
+              topic: { type: 'string' },
+              paths: { type: 'array', items: { type: 'string' } },
               memory_type: { type: 'string', enum: ['feedback', 'project', 'reference'] },
               scope: { type: 'string', enum: ['global', 'project'] },
               title: { type: 'string' },
@@ -101,6 +104,7 @@ export function describe(p) {
   return [
     `kind=${p.kind}${p.memory_type ? `/${p.memory_type}` : ''}${p.block ? `/${p.block}` : ''}${p.scope ? ` scope=${p.scope}` : ''}${p.op === 'patch' ? ` op=patch target=${p.target}` : ''}`,
     `title: ${p.title || ''}`,
+    p.topic ? `topic: ${p.topic}${p.paths?.length ? ` (files: ${[].concat(p.paths).join(', ')})` : ''}` : '',
     p.claim ? `claim: ${p.claim}` : '',
     p.target && p.op !== 'patch' ? `previously routed to: ${p.target}` : '',
     p.description ? `description: ${p.description}` : '',
@@ -124,12 +128,15 @@ export function triagePrompt({ batch, others, excerpts, owners, lang }) {
 RUBRIC — a proposal is saved only if it passes every rule:
 ${rubricText()}
 
+DESTINATIONS — where a learning belongs (the first that fits):
+${destinationsText()}
+
 VERDICTS (set "rule" to the id of the rubric rule that decided it):
 - "drop" with drop_kind: covered (an excerpt already says it; set covered_by to the file), one_off, derivable, default_behavior, unverified (a source of truth contradicts it), stale, low_value, rejected_before (the user already rejected the same thing).
 - "merge" with merge_into: another proposal (in THIS BATCH or OTHER PROPOSALS) says the same thing in any language, kind or target. The one it merges into must not be dropped.
 - "route": the topic has an owner — a skill or one of its reference files, a rule file, a CLAUDE.md, or a memory (from OWNERS or EXCERPTS) — and the proposal may add to it or correct it. Set owner = the owner's full path (a reference file is its skill's folder + the listed relative path), claim = the knowledge as ONE self-contained statement (what is true or what to do, and the reason when the proposal gives one), section = the heading it belongs under when obvious. Choose the owner an assistant would read when the topic comes up. Do not try to judge whether the owner already says it in parts you cannot see: the editor checks the whole file. Prefer this over "keep" whenever an owner exists.
 - "fix": the proposal documents a workaround for something the project could fix once (a generated file not ignored, a broken script, a missing config line). Set fix = the change to make in the project, in one sentence. Nothing is learned.
-- "keep": worth saving as new and no owner fits. Give a rewrite that picks the right kind ("global" = one sentence valid on every project in "text", added to the user's global CLAUDE.md; "memory" = one project's fact with "description" and a "body" holding the fact plus "**Why:**" and "**How to apply:**"; "skill" = a reusable multi-step procedure with description ≤ 250 chars saying when to use it), uses a short human-readable title (never a slug), and removes details that will go stale.
+- "keep": worth saving as new and no owner fits. Give a rewrite that picks the right kind by the DESTINATIONS order ("preference" = one sentence valid on every project that matters for one topic or kind of file, in "text", with "topic" and optional "paths"; "global" = one sentence relevant in every session whatever the task, in "text", added to the user's global CLAUDE.md; "memory" = one project's fact with "description" and a "body" holding the fact plus "**Why:**" and "**How to apply:**"; "skill" = a reusable multi-step procedure with description ≤ 250 chars saying when to use it), uses a short human-readable title (never a slug), and removes details that will go stale.
 - Stale owners: whatever the verdict, if an excerpt shows a skill, rule, CLAUDE.md or memory that a SOURCE OF TRUTH contradicts on this proposal's topic, also set stale = { file: that file's path, claim: the corrected statement, source: the path of the SOURCE OF TRUTH excerpt that shows it }. Only a source-of-truth excerpt counts: a user preference, a session event or another doc is never a stale flag. This is how outdated documentation gets repaired.
 
 ${languageRule(lang)} Keep code identifiers, commands and file names as they are.
@@ -273,7 +280,7 @@ export function resolveMerges(verdicts, proposals) {
 export function rewriteItem(item, v) {
   const r = v?.rewrite || {};
   const next = { ...item };
-  for (const k of ['kind', 'memory_type', 'scope', 'title', 'description', 'text', 'body']) {
+  for (const k of ['kind', 'memory_type', 'scope', 'title', 'description', 'text', 'body', 'topic', 'paths']) {
     if (r[k] !== undefined && r[k] !== '') next[k] = r[k];
   }
   // A re-screened change to an owner that is now kept as new starts as a plain create.

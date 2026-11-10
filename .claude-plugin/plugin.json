@@ -1,7 +1,7 @@
 {
   "name": "ouroboros",
   "displayName": "Ouroboros",
-  "version": "0.14.1",
+  "version": "0.22.2",
   "description": "Self-learning for Claude Code: reviews your sessions, turns what is worth keeping into memories and skills, and shows usage, value and cost on a local dashboard.",
   "author": {
     "name": "Luca Martins",
@@ -20,7 +20,7 @@
     "autonomy": {
       "type": "string",
       "title": "Autonomy",
-      "description": "auto: learnings are written right away (undoable). hybrid: only high-confidence facts are written; skills and the rest wait for approval in the dashboard. queue: everything Claude or the reviewer proposes waits for approval. Explicit requests (\"remember that…\") are always written.",
+      "description": "auto: learnings are written right away (undoable). hybrid: only high-confidence facts are written; skills and the rest wait for approval in the dashboard. queue: everything Claude or the reviewer proposes waits for approval. Explicit requests (\"remember that…\") skip this setting; corrections and changes to CLAUDE.md or rule files always wait.",
       "options": ["auto", "hybrid", "queue"],
       "default": "auto"
     },
@@ -74,7 +74,7 @@
     "monthly_budget_usd": {
       "type": "number",
       "title": "Monthly budget (USD)",
-      "description": "Every Ouroboros model call (reviews, knowledge check, consolidation) stops for the rest of the month once this is spent.",
+      "description": "Every Ouroboros model call (reviews, knowledge check, correction count) stops for the rest of the month once this is spent.",
       "default": 5,
       "min": 0
     }

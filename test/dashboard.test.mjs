@@ -161,6 +161,21 @@ test('Overview misses count the period; the inventory groups by scope with plugi
   assert.equal(api('nope'), undefined);
 });
 
+test('the correction rate counts one instrument; what learning reviews counted is shown apart', () => {
+  const now = Date.now();
+  const ins = db.prepare(`INSERT INTO reviews (session_id, mode, trigger, status, instrument, turns_reviewed, corrections, session_started_at, ts)
+    VALUES (?, ?, 'session_end', 'ok', ?, ?, ?, ?, ?)`);
+  ins.run('s1', 'corrections', 'corrections', 40, 4, now, now);
+  ins.run('s1', 'inloop', null, 30, 0, now, now);
+  ins.run('s1', 'background', null, 10, 5, now, now);
+  const v = api('value', { days: 30 });
+  assert.deepEqual([v.before.turns, v.before.corrections, v.before.rate], [40, 4, 10]);
+  assert.deepEqual([v.selfReported.turns, v.selfReported.corrections], [40, 5]);
+  const o = api('overview', { days: 30 });
+  assert.deepEqual([o.reviewed.turns, o.reviewed.corrections, o.correctionRate], [40, 4, 10]);
+  assert.equal(o.series.reduce((n, d) => n + d.reviewedTurns, 0), 40);
+});
+
 test('a skill file is named by its skill in titles', async () => {
   const { fileDisplayName } = await import('../scripts/changesets.mjs');
   assert.equal(fileDisplayName(String.raw`C:\Users\x\.claude\skills\acme-local\SKILL.md`), 'acme-local');

@@ -54,7 +54,10 @@ Everything else is automatic: capture hooks record turns, tool calls, error → 
 
 | Learning | Destination |
 |---|---|
-| Who you are, preferences and facts valid on every project (OS, shell, tool auth) | an addition to your global `~/.claude/CLAUDE.md`, under the section it belongs to, after your approval |
+| Something a skill, rule file or CLAUDE.md already covers | an addition to that file (a correction, or a change to a CLAUDE.md or a rule file you wrote, waits for your approval; a rule waiting for a project file is active meanwhile as a project memory) |
+| A preference valid everywhere that matters for one topic (commits, code review, a tool) | `~/.claude/skills/learned-prefs-<topic>/`, a personal skill loaded when the topic comes up |
+| A preference valid everywhere that matters for certain files (a language, a file type) | `~/.claude/rules/learned-<topic>.md`, a rule loaded with those files |
+| Who you are and how you work, relevant in every session (language, OS, shell) | an addition to your global `~/.claude/CLAUDE.md`, under the section it belongs to, after your approval |
 | Project facts and conventions | the project's auto-memory directory + `MEMORY.md` |
 | Reusable procedures | `~/.claude/skills/learned-*`, or project skills routed by `~/.ouroboros/config.json` |
 
@@ -85,7 +88,7 @@ Set when enabling the plugin, or later in `/config`:
 |---|---|---|
 | `learning` | `true` | Learn from sessions (off = measure only) |
 | `learning_language` | `en` | Language of saved learnings (`en`, `pt-BR` or `auto` = the conversation's) |
-| `autonomy` | `auto` | `auto` writes right away; `hybrid` writes confident facts and queues skills and tentative items; `queue` holds everything for approval. Explicit "remember that…" requests are always written |
+| `autonomy` | `auto` | `auto` writes right away, and refines memories Ouroboros wrote itself that you never edited; `hybrid` writes confident facts and queues skills and tentative items; `queue` holds everything for approval. Explicit "remember that…" requests skip this setting, but corrections and changes to CLAUDE.md or rule files always wait for you |
 | `inloop_review` | `true` | Periodic in-session reviews |
 | `review_every_turns` | `10` | User turns between in-session reviews |
 | `background_review` | `true` | End-of-session review |
@@ -104,14 +107,15 @@ Set when enabling the plugin, or later in `/config`:
 ## Development
 
 ```
-node --test "test/*.test.mjs"      # zero dependencies
+npm test                           # node --no-warnings --test "test/*.test.mjs"; zero dependencies (a bare `node --test` also picks up the fixtures and hangs)
 claude plugin validate --strict .
 claude --plugin-dir .              # try it without installing
 node scripts/eval.mjs --synthetic  # score the knowledge check with the real model (~US$ 0.01)
+node scripts/eval.mjs --sessions   # score the corrections count and the reviewer on real-mistake cases (~US$ 0.02)
 node scripts/eval.mjs --replay     # agreement with what you approved/rejected (on a DB copy)
 ```
 
-Run both evals before and after changing the rubric or a prompt.
+Run the evals before and after changing the rubric or a prompt.
 
 ## Contributing
 

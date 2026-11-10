@@ -5,7 +5,7 @@
 //   node curator.mjs apply   [--file proposals.json]   (JSON on stdin otherwise)
 //   node curator.mjs undo    [--id lrn_x | --last]
 //   node curator.mjs forget  --match <id | name | text>
-//   node curator.mjs inventory --cwd <dir> [--memory-dir <dir>]
+//   node curator.mjs inventory --cwd <dir> [--memory-dir <dir>] [--session <id>]
 //   (all accept --data <dir>)
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -16,7 +16,9 @@ import { applyChangeset, applyEdits, claimsOf, pendingChangeset, queueEdit, reje
 import { getMeta, logError, openDb, setMetaOnce } from './db.mjs';
 import { listMemories, listMemoriesIn, listSkills, parseFrontmatter } from './inventory.mjs';
 import { knowledgeKind, PATCHABLE } from './knowledge.mjs';
-import { claudeDir, classifyPath, ensureGlobalInstructions, gitRoot, memoryDirFor, normalize, ouroborosDir, projectKey } from './paths.mjs';
+import { claudeDir, classifyPath, ensureGlobalInstructions, gitRoot, memoryDirFor, normalize, ouroborosDir, projectIdFor, repoRoot } from './paths.mjs';
+import { cleanPaths, findOwners, preferenceHome } from './router.mjs';
+import { addObservations, closeObservations, sessionStateText } from './session-state.mjs';
 import { ensureSettingsFile, expandHome, loadSettings, routeFor } from './settings.mjs';
 import { addedText, isInsertion, revertChange } from './textdiff.mjs';
 
@@ -231,7 +233,7 @@ export function indexEntriesIn(dir) {
 }
 
 /** Replaces the top-level `description:` value, including any continuation lines (block or folded scalars). */
-function setDescription(text, description) {
+export function setDescription(text, description) {
   const fm = /^(﻿?---[ \t]*\r?\n)([\s\S]*?\r?\n)(---[ \t]*(?:\r?\n|$))/.exec(text);
   if (!fm) return text;
   const lines = fm[2].split(/(?<=\n)/);
@@ -249,16 +251,40 @@ function setDescription(text, description) {
 
 function normalizeItem(raw, payload) {
   const item = { ...raw };
+  delete item.ownFile; // set by code only (a file Ouroboros created), never by a proposal
+  delete item.ownUntouched;
   item.op = item.op === 'patch' ? 'patch' : 'create';
   // "profile" is the kind used before global facts moved to the global CLAUDE.md.
-  item.kind = ['memory', 'skill', 'global'].includes(item.kind) ? item.kind : item.kind === 'profile' ? 'global' : 'memory';
-  item.scope = item.scope === 'global' ? 'global' : 'project';
+  item.kind = ['memory', 'skill', 'global', 'preference'].includes(item.kind) ? item.kind : item.kind === 'profile' ? 'global' : 'memory';
+  item.scope = item.scope === 'global' || item.kind === 'preference' ? 'global' : 'project';
   item.confidence = Math.min(0.9, Math.max(0.3, Number(item.confidence) || 0.6));
   item.trigger = payload.trigger || 'manual';
   item.projectDir = item.project_dir || payload.cwd || process.cwd();
   if (item.kind === 'memory' && item.scope === 'global') item.kind = 'global';
   if (item.kind === 'global') return item.op === 'create' ? globalFact(item) : { ...item, kind: 'instructions', scope: 'global' };
+  if (item.kind === 'preference' && item.op === 'create') return preference(item);
   return item;
+}
+
+/** The one sentence a preference or global fact states. */
+function factText(item) {
+  return String(item.text || item.append || item.body || item.description || item.title || '').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * A preference valid on every project that matters for one topic or one kind of file
+ * (router.mjs): a line in that topic's home. When the home exists, the item becomes an
+ * addition to it; when it does not, it is created with this first line.
+ */
+function preference(item) {
+  const text = factText(item);
+  const topic = slug(item.topic || '', 32);
+  if (!topic || !text) return { ...item, invalid: 'a preference needs a "topic" (one or two words) and a "text"' };
+  const paths = cleanPaths(item.paths);
+  const { home, file, name } = preferenceHome(topic, paths);
+  const base = { ...item, scope: 'global', topicSlug: topic, paths, prefHome: home, prefFile: file, prefName: name, prefText: text, title: item.title || text.slice(0, 120) };
+  if (!fs.existsSync(file)) return base;
+  return { ...base, op: 'patch', kind: home === 'skill' ? 'skill' : 'rules', target: file, append: /^[-*]\s/.test(text) ? text : `- ${text}`, section: '', ownFile: true };
 }
 
 /**
@@ -302,8 +328,13 @@ function promoteToGlobal(item, payload) {
   return { ...globalFact({ ...item, kind: 'global', text: description }), promoted: elsewhere.project };
 }
 
+/** Where a project's own skills live: the repository's main checkout (a worktree is temporary), else the folder. */
+function projectRootOf(dir) {
+  return repoRoot(dir) || gitRoot(dir) || dir;
+}
+
 function skillsInScope(item, settings) {
-  const cwds = [item.projectDir];
+  const cwds = [projectRootOf(item.projectDir)];
   const out = listSkills(cwds);
   const route = routeFor(settings, item.projectDir);
   if (route) {
@@ -404,7 +435,7 @@ function createSkill(db, batch, item, settings) {
     dir = path.join(path.resolve(expandHome(route.skillsDir)), base);
     if (route.linkInto) link = path.join(path.resolve(expandHome(route.linkInto)), base);
   } else {
-    dir = path.join(gitRoot(item.projectDir) || item.projectDir, '.claude', 'skills', base);
+    dir = path.join(projectRootOf(item.projectDir), '.claude', 'skills', base);
   }
   const file = path.join(dir, 'SKILL.md');
   if (fs.existsSync(file) || (link && fs.existsSync(link))) return { status: 'duplicate', target: file, reason: `a skill named "${base}" already exists; patch it instead` };
@@ -414,8 +445,55 @@ function createSkill(db, batch, item, settings) {
   const id = newId();
   batch.write(file, renderSkill({ name: base, description, title, id, confidence: item.confidence, trigger: item.trigger, body: item.body }), { learningId: id, op: 'create' });
   if (link) batch.write(link, { link: dir }, { learningId: id, op: 'create' });
-  upsertLearning(db, { id, kind: 'skill', scope: item.scope, project: item.scope === 'project' ? projectKey(item.projectDir) : null, name: base, title, path: file, confidence: item.confidence, trigger: item.trigger });
+  upsertLearning(db, { id, kind: 'skill', scope: item.scope, project: item.scope === 'project' ? projectIdFor(item.projectDir) : null, name: base, title, path: file, confidence: item.confidence, trigger: item.trigger });
   return { status: 'created', id, kind: 'skill', path: file, title, warning: budgetWarning(active + 1, settings.limits.learnedSkills, settings, 'learned skills') };
+}
+
+function createPreference(db, batch, item, settings) {
+  if (item.invalid) return { status: 'rejected', reason: item.invalid };
+  const topicTitle = String(item.topic).replace(/\s+/g, ' ').trim();
+  const id = newId();
+  const line = /^[-*]\s/.test(item.prefText) ? item.prefText : `- ${item.prefText}`;
+  if (item.prefHome === 'rules') {
+    const content = ['---', 'paths:', ...item.paths.map((p) => `  - ${JSON.stringify(p)}`), '---', '', `# ${topicTitle} (learned preferences)`, '', line, ''].join('\n');
+    batch.write(item.prefFile, content, { learningId: id, op: 'create' });
+    upsertLearning(db, { id, kind: 'rules', scope: 'global', name: path.basename(item.prefFile, '.md'), title: item.title, path: item.prefFile, confidence: item.confidence, trigger: item.trigger });
+    return { status: 'created', id, kind: 'rules', path: item.prefFile, title: item.title };
+  }
+  const description = String(item.description || `The user's preferences about ${topicTitle}. Use whenever the task involves ${topicTitle}.`).replace(/\s+/g, ' ').trim();
+  if (description.length > settings.limits.skillDescriptionChars) {
+    return { status: 'rejected', reason: `description has ${description.length} chars; the limit is ${settings.limits.skillDescriptionChars}` };
+  }
+  const active = db.prepare("SELECT COUNT(*) n FROM learnings WHERE kind = 'skill' AND status = 'active' AND origin_session IS NOT 'native'").get().n;
+  if (active + 1 > settings.limits.learnedSkills) {
+    return { status: 'over_budget', reason: `${active}/${settings.limits.learnedSkills} learned skills; merge or forget one first` };
+  }
+  const content = [
+    '---', `name: ${item.prefName}`, `description: ${yamlStr(description)}`, 'user-invocable: false',
+    'metadata:', '  origin: ouroboros', `  id: ${id}`, `  confidence: ${item.confidence}`, `  created: ${today()}`, `  trigger: ${item.trigger}`,
+    '---', '', `# Preferences: ${topicTitle}`, '', line, '',
+  ].join('\n');
+  batch.write(item.prefFile, content, { learningId: id, op: 'create' });
+  upsertLearning(db, { id, kind: 'skill', scope: 'global', name: item.prefName, title: item.title, path: item.prefFile, confidence: item.confidence, trigger: item.trigger });
+  return { status: 'created', id, kind: 'skill', path: item.prefFile, title: item.title, warning: budgetWarning(active + 1, settings.limits.learnedSkills, settings, 'learned skills') };
+}
+
+/** Whether Ouroboros created this file (so adding to it is not a change to something a person wrote). */
+export function createdByOuroboros(db, file) {
+  return !!db.prepare("SELECT 1 FROM learnings WHERE lower(path) = lower(?) AND status = 'active' AND origin_session IS NOT 'native'").get(path.resolve(String(file)));
+}
+
+/**
+ * Whether a memory is still exactly what Ouroboros wrote: it created the file, and the
+ * file's text is the result of its own last write (the user never edited it by hand).
+ * Refining such a memory is Ouroboros rewriting its own words, not the user's, so in
+ * `auto` it needs no approval; one hand edit and the file is the user's again.
+ */
+export function ownUntouched(db, file) {
+  const target = path.resolve(String(file));
+  if (knowledgeKind(target) !== 'memory' || !createdByOuroboros(db, target)) return false;
+  const last = db.prepare('SELECT after FROM writes WHERE lower(file) = lower(?) AND reverted_at IS NULL ORDER BY id DESC LIMIT 1').get(target);
+  return !!last && last.after !== null && last.after === readOrNull(target);
 }
 
 /** Resolve the file a patch targets: learning id, a knowledge file path, or a name. */
@@ -488,6 +566,10 @@ function patchItem(db, batch, item, settings, payload) {
   const before = readOrNull(t.file);
   if (before === null) return { status: 'rejected', reason: `file not found: ${t.file}` };
 
+  if (item.prefText) {
+    const dup = findSimilar(statements(before), item.prefText);
+    if (dup) return { status: 'duplicate', target: t.file, existing: dup.text, reason: 'that preference is already saved there; patch that line instead' };
+  }
   if (item.globalFact) {
     const dup = findSimilar(statements(before), item.globalFact);
     if (dup) return { status: 'duplicate', target: t.file, existing: dup.text, reason: 'your global CLAUDE.md already says this; patch that line instead' };
@@ -554,6 +636,8 @@ function commitText(db, batch, t, after, item) {
       batch.write(indexFile, withIndexLine(indexText, indexLine(title, fileName, item.description), fileName), { learningId: id, op: 'patch' });
     }
   }
+  // A stand-in memory that was just refined: the change waiting for the real file follows it.
+  if (t.kind === 'memory' && existing) syncInterim(db, id, t.file);
   const { data } = parseFrontmatter(after);
   upsertLearning(db, {
     id, kind: t.kind, scope: existing?.scope || (t.kind === 'memory' ? 'project' : 'global'), memory_type: data.metadata?.type,
@@ -565,26 +649,41 @@ function commitText(db, batch, t, after, item) {
 }
 
 /**
- * Whether an item proposed by Claude or the reviewer must wait for approval.
- * Explicit user requests (actor `manual`) are always written.
+ * Whether an item must wait for approval. Actors:
+ *   manual     the user decided on this very item (inbox, dashboard): always written
+ *   requested  Claude says the user asked for it in the session: skips the autonomy
+ *              setting, never the rules below (the label is Claude's own, so it cannot
+ *              be what lets a change to a CLAUDE.md, a rule file or existing text through)
+ *   inloop | background  proposed by Claude or the reviewer
  */
 export function needsApproval(item, actor, autonomy) {
   if (actor === 'manual') return false;
   // Corrections of existing knowledge, and changes to rule files or CLAUDE.md (written
-  // by people, versioned with the project), always wait for the user.
-  if (item.corrects) return true;
-  if (item.op === 'patch' && item.target && path.isAbsolute(String(item.target)) && ['rules', 'instructions'].includes(knowledgeKind(item.target))) return true;
+  // by people, versioned with the project), always wait for the user. One exception, in
+  // `auto` only: a memory Ouroboros created and nobody edited since (`ownUntouched`, set
+  // by code) may be refined without asking; the ledger undoes it.
+  if (item.corrects && !(item.ownUntouched && autonomy === 'auto')) return true;
+  // (a rule file Ouroboros created for learned preferences is its own: `ownFile`)
+  if (!item.ownFile && item.op === 'patch' && item.target && path.isAbsolute(String(item.target)) && ['rules', 'instructions'].includes(knowledgeKind(item.target))) return true;
+  if (actor === 'requested') return false;
   if (autonomy === 'auto') return false;
   if (autonomy === 'queue') return true;
   // hybrid: confident facts go in; skills and tentative items wait.
   return item.kind === 'skill' || item.confidence < 0.7;
 }
 
+/** Why a proposal waits, for the line the session shows. */
+function waitReason(item, actor, autonomy) {
+  if (item.corrects) return 'waiting for approval: it rewrites existing text (/ouroboros:inbox or the dashboard)';
+  if (needsApproval(item, 'requested', 'auto')) return 'waiting for approval: changes to CLAUDE.md and rule files are always confirmed (/ouroboros:inbox or the dashboard)';
+  return `waiting for approval (autonomy: ${autonomy}; /ouroboros:inbox or the dashboard)`;
+}
+
 /**
  * Write a validated changeset result (the whole new text of one knowledge file) in
  * its own transaction, through the ledger so it can be undone.
  */
-export function writeText(db, { file, after, title, why = null, confidence = 0.6, trigger = 'session_end', actor = 'background', sessionId = null, expectBefore }) {
+export function writeText(db, { file, after, title, why = null, confidence = 0.6, trigger = 'session_end', actor = 'background', sessionId = null, expectBefore, description = undefined }) {
   const kind = knowledgeKind(file);
   if (!PATCHABLE.has(kind)) return { status: 'rejected', reason: 'only memory, skill, rule and CLAUDE.md files can be changed' };
   const batch = new Batch(db, { actor, sessionId, title, why });
@@ -597,7 +696,8 @@ export function writeText(db, { file, after, title, why = null, confidence = 0.6
     if (expectBefore !== undefined && before !== expectBefore) return refuse('stale', 'the file changed while the change was being prepared');
     if (after === before) return refuse('rejected', 'changes nothing');
     if (containsSecret(addedText(before, after))) return refuse('rejected', 'would add something that looks like a secret');
-    const result = commitText(db, batch, { file, kind }, after, { title, confidence, trigger });
+    // A new description also replaces the memory's line in MEMORY.md, in the same batch.
+    const result = commitText(db, batch, { file, kind }, after, { title, confidence, trigger, description });
     batch.commit();
     db.exec('COMMIT');
     return { ...result, batch: batch.id };
@@ -616,6 +716,7 @@ function runItem(db, item, settings, payload, actor, { dryRun = false } = {}) {
     db.exec('BEGIN IMMEDIATE');
     let result;
     if (item.op === 'patch') result = patchItem(db, batch, item, settings, payload);
+    else if (item.kind === 'preference') result = createPreference(db, batch, item, settings);
     else if (item.kind === 'skill') result = createSkill(db, batch, item, settings);
     else result = createMemory(db, batch, item, settings, payload);
     if (dryRun) {
@@ -670,26 +771,51 @@ function enqueue(db, rawItem, payload, actor) {
   const r = db.prepare(`
     INSERT INTO candidates (review_id, session_id, project, kind, scope, memory_type, title, summary, evidence, confidence, outcome, payload, cwd, ts)
     VALUES (0, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
-  `).run(payload.session_id || actor, projectKey(item.projectDir), item.kind, item.scope, item.memory_type ?? null,
+  `).run(payload.session_id || actor, projectIdFor(item.projectDir), item.kind, item.scope, item.memory_type ?? null,
     String(item.title || item.text || item.target || '').slice(0, 200), String(item.text || item.body || item.new || item.description || '').slice(0, 1500),
     String(item.evidence || '').slice(0, 800), item.confidence, stored, payload.cwd || null, Date.now());
   return { id: Number(r.lastInsertRowid), replaced: false };
 }
 
 /** Apply a batch of proposals. Each item succeeds or fails on its own. */
-export function apply(db, payload, { actor = 'manual', autonomy = 'auto' } = {}) {
+export function apply(db, payload, { actor = 'manual', autonomy = 'auto', ownerCheck = false, promote = true } = {}) {
   ensureSettingsFile();
   const settings = loadSettings();
   const items = Array.isArray(payload?.items) ? payload.items : [];
   const results = [];
   for (const raw of items) {
-    const item = promoteToGlobal(normalizeItem(raw, payload || {}), payload || {});
+    const normalized = normalizeItem(raw, payload || {});
+    const item = promote ? promoteToGlobal(normalized, payload || {}) : normalized;
     if (containsSecret(item.title, item.description, item.body, item.text, item.new)) {
       results.push({ status: 'rejected', title: item.title, reason: 'looks like it contains a secret (token, key or password); never store secrets' });
       continue;
     }
+    // Only code says a rule file is Ouroboros's own (one it created for learned preferences).
+    if (item.op === 'patch' && item.target && path.isAbsolute(String(item.target))) {
+      item.ownFile = knowledgeKind(item.target) === 'rules' && createdByOuroboros(db, item.target);
+      item.ownUntouched = ownUntouched(db, item.target);
+    }
+    // In session nothing screens a new item against the files that own its topic, so the
+    // curator looks: when one speaks about the same thing, Claude reads it and patches it
+    // (or says it checked). The end-of-session path has the screen for this.
+    if (ownerCheck && !raw.owner_checked && item.kind !== 'skill' && (item.op === 'create' || item.globalFact || item.prefText)) {
+      // The statement itself, without the body: a long body would ask for more shared words than any passage has.
+      const said = [...new Set([item.title, item.prefText || item.globalFact || item.description].filter(Boolean))].join(' ');
+      const owners = findOwners(said, item.projectDir, { exclude: [item.target, item.prefFile], topic: item.kind === 'preference' || item.prefText ? item.topic : '' });
+      if (owners.length) {
+        results.push({
+          status: 'has_owner', title: item.title, owners: owners.map((o) => ({ file: o.file, kind: o.kind, heading: o.heading, excerpt: o.excerpt })),
+          reason: `${owners.map((o) => o.file).join(', ')} already ${owners.length > 1 ? 'speak' : 'speaks'} about this; read it and patch it instead, or resubmit with "owner_checked": true if it belongs elsewhere`,
+        });
+        continue;
+      }
+    }
     // A patch that rewrites existing text is a correction, whatever the proposer said.
     if (!item.corrects && rewritesText(db, item, settings, payload || {})) item.corrects = true;
+    if (item.corrects && item.op === 'patch' && !item.ownUntouched) {
+      const t = resolvePatchTarget(db, item, settings, payload || {});
+      if (t?.file) item.ownUntouched = ownUntouched(db, t.file);
+    }
     if (needsApproval(item, actor, autonomy)) {
       // Dry run first: only proposals that would actually be written are queued
       // (duplicates of saved items, rejections and over-budget answers come back as is).
@@ -709,16 +835,24 @@ export function apply(db, payload, { actor = 'manual', autonomy = 'auto' } = {})
         }
         // A change to an existing file joins that file's pending changeset.
         const q = queueEdit(db, item, payload || {}, actor);
+        // Learn now, promote on approval: an addition to a project's CLAUDE.md or rule
+        // file is active at once as a project memory while the change waits.
+        const added = item.corrects ? '' : item.append !== undefined ? String(item.append) : isInsertion(String(item.old ?? ''), String(item.new ?? '')) ? String(item.new).replace(String(item.old).trimEnd(), '') : '';
+        const meanwhile = added.trim() ? learnMeanwhile(db, {
+          candidateId: q.id, file: item.target, title: item.title, claim: added, evidence: item.why || item.evidence,
+          cwd: item.projectDir, confidence: item.confidence, sessionId: payload?.session_id, actor, autonomy,
+        }) : null;
         results.push({
           status: 'queued', title: item.title || path.basename(item.target), candidateId: q.id, changesetId: q.changesetId, recompose: q.recompose || undefined,
-          reason: q.recompose ? 'waiting for approval; composed together with the change already waiting for this file' : `waiting for approval in the dashboard (autonomy: ${autonomy})`,
+          reason: `${q.recompose ? 'waiting for approval; composed together with the change already waiting for this file' : waitReason(item, actor, autonomy)}${meanwhile ? '. Active now as a project memory until you decide' : ''}`,
+          ...(meanwhile ? { meanwhile: meanwhile.path } : {}),
         });
         continue;
       }
       const q = enqueue(db, item, payload || {}, actor);
       results.push({
         status: 'queued', title: item.title || item.text, candidateId: q.id, replaced: q.replaced,
-        reason: q.replaced ? 'merged with a similar proposal already waiting for approval' : `waiting for approval in the dashboard (autonomy: ${autonomy})`,
+        reason: q.replaced ? 'merged with a similar proposal already waiting for approval' : waitReason(item, actor, autonomy),
       });
       continue;
     }
@@ -726,6 +860,85 @@ export function apply(db, payload, { actor = 'manual', autonomy = 'auto' } = {})
   }
   if (results.some((r) => r.status === 'created' || r.status === 'patched')) setMetaOnce(db, 'learning_enabled_at', Date.now());
   return results;
+}
+
+// ---------- learn now, promote on approval ----------
+
+function candidatePayload(db, id) {
+  try { return JSON.parse(db.prepare('SELECT payload FROM candidates WHERE id = ?').get(id)?.payload || '{}'); } catch { return {}; }
+}
+
+/** The project memory standing in for a candidate that waits to enter a CLAUDE.md or rule file, if any. */
+export function interimOf(db, candidateId) {
+  const id = candidatePayload(db, candidateId).interim;
+  return id ? db.prepare("SELECT * FROM learnings WHERE id = ? AND status = 'active'").get(id) || null : null;
+}
+
+/**
+ * A rule about one project usually belongs in that project's CLAUDE.md or a rule file,
+ * and additions to those always wait for the user (people wrote them, the team shares
+ * them). Waiting used to mean Claude did not know the rule until someone opened the
+ * inbox: the user repeated corrections that were sitting there. So the rule is saved at
+ * once as a project memory (the same autonomy rules as any new memory), and the waiting
+ * change becomes a question about where it lives: approving writes the line and
+ * retires the memory; rejecting keeps the memory. Only for additions to a project's
+ * file: corrections change what a file says, and the global CLAUDE.md has no project
+ * memory to stand in for it.
+ */
+export function learnMeanwhile(db, { candidateId, file, title, claim, evidence, cwd, confidence = 0.6, sessionId, actor = 'background', autonomy = 'auto' }) {
+  const target = path.resolve(String(file || ''));
+  if (!cwd || !['rules', 'instructions'].includes(knowledgeKind(target))) return null;
+  if (normalize(target).startsWith(`${normalize(path.resolve(claudeDir()))}/`)) return null; // the user's global files
+  if (interimOf(db, candidateId)) return null;
+  const conf = Math.min(0.9, Math.max(0.3, Number(confidence) || 0.6));
+  if (needsApproval({ op: 'create', kind: 'memory', confidence: conf }, actor === 'manual' ? 'inloop' : actor, autonomy)) return null;
+  const text = String(claim || '').replace(/^\s*[-*]\s+/, '').trim();
+  if (text.length < 8) return null;
+  const one = text.replace(/\s+/g, ' ');
+  const [r] = apply(db, { cwd, session_id: sessionId, trigger: 'session_end', items: [{
+    op: 'create', kind: 'memory', scope: 'project', memory_type: 'feedback', project_dir: cwd,
+    title: String(title || one).slice(0, 120), description: one.length > 200 ? `${one.slice(0, 197)}…` : one,
+    body: `${text}\n\n**Why:** ${String(evidence || 'stated in a session').replace(/\s+/g, ' ').slice(0, 300)}\n**How to apply:** follow it in this project. It is also proposed as a line for ${path.basename(target)}; this note is retired when that change is approved.`,
+    confidence: conf, why: evidence,
+  }] }, { actor: actor === 'manual' ? 'inloop' : actor, autonomy, promote: false });
+  if (r?.status !== 'created') return null;
+  db.prepare('UPDATE candidates SET payload = ? WHERE id = ?').run(JSON.stringify({ ...candidatePayload(db, candidateId), interim: r.id }), candidateId);
+  return { id: r.id, path: r.path };
+}
+
+/** What a stand-in memory says now: its body up to the "Why" line (it may have been refined since). */
+export function interimText(file) {
+  const text = readOrNull(file);
+  if (text === null) return null;
+  const body = parseFrontmatter(text).body.split(/\n\s*\*\*Why:\*\*/)[0].trim();
+  return body || null;
+}
+
+/**
+ * A write landed on a memory that stands in for a waiting change (it was refined: an
+ * exception, a correction). The waiting claim takes the memory's current text, and its
+ * change is composed again, so approving it later never writes the older wording.
+ */
+export function syncInterim(db, learningId, file) {
+  if (!learningId) return 0;
+  const said = interimText(file);
+  if (!said) return 0;
+  let n = 0;
+  for (const c of db.prepare("SELECT id, changeset_id, claim, payload FROM candidates WHERE outcome = 'queued' AND payload LIKE ?").all(`%"interim":"${learningId}"%`)) {
+    if (String(c.claim || '').trim() === said) continue;
+    db.prepare('UPDATE candidates SET claim = ?, summary = ? WHERE id = ?').run(said.slice(0, 2000), said.slice(0, 1500), c.id);
+    if (c.changeset_id) db.prepare("UPDATE changesets SET status = 'stale', note = ? WHERE id = ? AND status = 'pending'").run('the memory standing in for one of its learnings was refined; composing again', c.changeset_id);
+    n++;
+  }
+  return n;
+}
+
+/** Retire the stand-in memory of a candidate (its line was written, or the claim turned out wrong). */
+export function retireInterim(db, candidateId) {
+  const l = interimOf(db, candidateId);
+  if (!l) return null;
+  const r = forget(db, { match: l.id });
+  return r.status === 'archived' ? l.id : null;
 }
 
 // ---------- approval queue and confirmation ----------
@@ -844,7 +1057,12 @@ export function forget(db, { match }) {
   const archiveDir = path.join(ouroborosDir(), 'archive');
   try {
     db.exec('BEGIN IMMEDIATE');
-    if (l.kind === 'memory') {
+    if (l.kind === 'rules') {
+      const content = readOrNull(l.path);
+      if (content === null) throw new Error(`file not found: ${l.path}`);
+      batch.write(path.join(archiveDir, `${today()}-${path.basename(l.path)}`), content, { learningId: l.id, op: 'archive' });
+      batch.write(l.path, null, { learningId: l.id, op: 'archive' });
+    } else if (l.kind === 'memory') {
       const content = readOrNull(l.path);
       if (content === null) throw new Error(`file not found: ${l.path}`);
       batch.write(path.join(archiveDir, `${today()}-${path.basename(l.path)}`), content, { learningId: l.id, op: 'archive' });
@@ -899,7 +1117,7 @@ export function inventoryText(db, { cwd, memoryDir }) {
 }
 
 export function summarize(results) {
-  const icon = { created: '📝 learned', patched: '📝 updated', queued: '⏳ queued', duplicate: '↺ duplicate', rejected: '✗ rejected', over_budget: '⚠ over budget', error: '✗ error' };
+  const icon = { created: '📝 learned', patched: '📝 updated', queued: '⏳ queued', duplicate: '↺ duplicate', has_owner: '↪ has an owner', rejected: '✗ rejected', over_budget: '⚠ over budget', error: '✗ error' };
   return results.map((r) => `${icon[r.status] || r.status}: ${r.title || ''}${r.reason ? ` — ${r.reason}` : ''}${r.warning ? ` (${r.warning})` : ''}${r.path ? ` → ${r.path}` : ''}`).join('\n');
 }
 
@@ -942,7 +1160,17 @@ async function main() {
         process.exitCode = 1;
         return;
       }
-      const results = apply(db, payload, { actor: payload.actor || 'manual', autonomy: options().autonomy });
+      // The actor in the payload is Claude's own label. "manual" (the user asked for this
+      // in the session) is a request, not a decision: only the inbox and the dashboard,
+      // which call `apply` in-process, act as the user.
+      const actor = ['inloop', 'background'].includes(payload.actor) ? payload.actor : 'requested';
+      const results = apply(db, payload, { actor, autonomy: options().autonomy, ownerCheck: true });
+      // What the review noticed but could not settle yet waits for the session's next
+      // review; what it settled (saved now, or shown to be a one-off) is closed.
+      const sid = /^[\w-]{8,}$/.test(String(payload.session_id || '')) ? payload.session_id : null;
+      const closed = closeObservations(db, sid, Array.isArray(payload.resolve) ? payload.resolve : []);
+      const opened = addObservations(db, sid, payload.open);
+      if (opened || closed) console.log(`◌ left open for the next review: ${opened}${closed ? `; settled: ${closed}` : ''}`);
       // A queued edit that did not fit with the change already waiting for its file sends
       // both back to the editor: start the evaluation queue in the background.
       if (results.some((r) => r.recompose)) {
@@ -957,6 +1185,8 @@ async function main() {
       console.log(JSON.stringify(forget(db, { match: args.match || args._[1] }), null, 2));
     } else if (cmd === 'inventory') {
       console.log(inventoryText(db, { cwd: args.cwd || process.cwd(), memoryDir: args['memory-dir'] }));
+      const state = typeof args.session === 'string' ? sessionStateText(db, args.session, { audience: 'claude' }) : '';
+      if (state) console.log(`\n## This session so far\n${state}`);
     } else if (cmd === 'confirm') {
       console.log(JSON.stringify(confirm(db, args.id), null, 2));
     } else if (cmd === 'approve' || cmd === 'reject') {

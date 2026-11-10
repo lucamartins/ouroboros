@@ -247,3 +247,85 @@ test('a conflict waits for the user; "it is a new rule" sends it to the editor a
   assert.ok(after.changeset_id);
   assert.match(cs.getChangeset(db, after.changeset_id).edits, /CONFLICTME deploy on Fridays/);
 });
+
+test('learn now, promote on approval: an addition waiting for a project CLAUDE.md is active as a project memory meanwhile', async () => {
+  const paths = await import('../scripts/paths.mjs');
+  const inbox = await import('../scripts/inbox.mjs');
+  const claudeMd = path.join(proj, 'CLAUDE.md');
+  const memDir = paths.memoryDirFor({ cwd: proj });
+  const memories = () => (fs.existsSync(memDir) ? fs.readdirSync(memDir).filter((f) => f !== 'MEMORY.md') : []);
+  const before = memories().length;
+  const report = await propose(claudeMd, ['Every change goes through a pull request, never straight to main.'], { autonomy: 'auto' });
+  assert.equal(report.queued, 1);
+  const change = pending(claudeMd);
+  const [claim] = cs.claimsOf(db, change.id);
+  const standIn = curator.interimOf(db, claim.id);
+  assert.ok(standIn, 'saved at once');
+  assert.equal(memories().length, before + 1);
+  const text = fs.readFileSync(standIn.path, 'utf8');
+  assert.match(text, /type: feedback/);
+  assert.match(text, /Every change goes through a pull request, never straight to main\./);
+  assert.match(text, /also proposed as a line for CLAUDE\.md/);
+  assert.doesNotMatch(fs.readFileSync(claudeMd, 'utf8'), /pull request/, 'the file itself still waits');
+  assert.match(inbox.showEntry(db, `cs:${change.id}`).text, /Meanwhile: already active as a project memory/);
+  // The stand-in is not "another file that already says it" when the change is composed again.
+  assert.deepEqual(ev.elsewhereFor(claudeMd, [{ id: claim.id, claim: claim.claim }], proj, [standIn.path]).filter((e) => e.file === standIn.path), []);
+  // A second claim for the file recomposes the change; the first keeps its one stand-in.
+  await propose(claudeMd, ['Squash commits when merging.'], { autonomy: 'auto' });
+  assert.equal(memories().length, before + 2);
+  assert.equal(curator.interimOf(db, claim.id).id, standIn.id);
+  // Approving writes the lines and retires the memories.
+  const r = cs.applyChangeset(db, pending(claudeMd).id, { actor: 'manual' });
+  assert.equal(r.status, 'patched', r.reason);
+  assert.match(fs.readFileSync(claudeMd, 'utf8'), /pull request[\s\S]*Squash commits/);
+  assert.equal(memories().length, before);
+  assert.equal(curator.interimOf(db, claim.id), null);
+});
+
+test('no stand-in for a correction, for the global CLAUDE.md or when the autonomy holds new memories; rejecting keeps it', async () => {
+  const paths = await import('../scripts/paths.mjs');
+  const memDir = paths.memoryDirFor({ cwd: proj });
+  const count = () => (fs.existsSync(memDir) ? fs.readdirSync(memDir).filter((f) => f !== 'MEMORY.md').length : 0);
+  // Start from an empty inbox: older pending additions would (rightly) get stand-ins too.
+  for (const c of db.prepare("SELECT id FROM candidates WHERE outcome = 'queued' AND changeset_id IS NOT NULL").all()) curator.decideQueued(db, c.id, false);
+  const before = count();
+  await propose(rules, ['FIX:Staging first.=>Staging first, then production.'], { autonomy: 'auto' });
+  assert.equal(count(), before, 'a correction changes what the file says: nothing to save beside it');
+  for (const c of db.prepare("SELECT id FROM candidates WHERE outcome = 'queued' AND changeset_id IS NOT NULL").all()) curator.decideQueued(db, c.id, false);
+  await propose(rules, ['Deploys are announced in the team channel first.'], { autonomy: 'queue' });
+  assert.equal(count(), before, 'queue: the user wants to see everything first');
+  for (const c of db.prepare("SELECT id FROM candidates WHERE outcome = 'queued' AND changeset_id IS NOT NULL").all()) curator.decideQueued(db, c.id, false);
+  const [g] = curator.apply(db, { cwd: proj, items: [{ kind: 'global', text: 'Prefers diagrams as plain text', confidence: 0.8 }] }, { actor: 'inloop', autonomy: 'auto' });
+  assert.equal(g.status, 'queued');
+  assert.equal(g.meanwhile, undefined);
+  assert.equal(count(), before);
+  for (const c of db.prepare("SELECT id FROM candidates WHERE outcome = 'queued' AND changeset_id IS NOT NULL").all()) curator.decideQueued(db, c.id, false);
+
+  // In session: the patch waits, the rule is active; rejecting the change keeps the memory.
+  const [q] = curator.apply(db, { cwd: proj, session_id: 'sess-meanwhile-1', items: [{ op: 'patch', target: rules, append: 'Rollbacks need a second approver.', title: 'Rollbacks need a second approver', why: 'the user said so after a bad rollback' }] }, { actor: 'inloop', autonomy: 'auto' });
+  assert.equal(q.status, 'queued');
+  assert.match(q.reason, /Active now as a project memory until you decide/);
+  assert.ok(fs.existsSync(q.meanwhile));
+  assert.equal(curator.decideQueued(db, q.candidateId, false).status, 'rejected_by_user');
+  assert.ok(fs.existsSync(q.meanwhile), 'not in the rule file, still known');
+});
+
+test('refining a stand-in memory updates the change that waits for the real file', async () => {
+  for (const c of db.prepare("SELECT id FROM candidates WHERE outcome = 'queued' AND changeset_id IS NOT NULL").all()) curator.decideQueued(db, c.id, false);
+  const claudeMd = path.join(proj, 'CLAUDE.md');
+  await propose(claudeMd, ['Deploys on Fridays are forbidden.'], { autonomy: 'auto' });
+  const [claim] = cs.claimsOf(db, pending(claudeMd).id);
+  const standIn = curator.interimOf(db, claim.id);
+  // A later session adds an exception: Ouroboros refines its own memory, no approval needed.
+  const [r] = curator.apply(db, { cwd: proj, items: [{ op: 'patch', target: standIn.path, old: 'forbidden.\n\n**Why:**', new: 'forbidden, except hotfixes.\n\n**Why:**' }] }, { actor: 'inloop', autonomy: 'auto' });
+  assert.equal(r.status, 'patched', r.reason);
+  assert.equal(db.prepare('SELECT claim FROM candidates WHERE id = ?').get(claim.id).claim, 'Deploys on Fridays are forbidden, except hotfixes.');
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM changesets WHERE status = 'stale' AND lower(file) = lower(?)").get(claudeMd).n, 1);
+  await ev.tidyQueue(db, { autonomy: 'auto' });
+  assert.match(JSON.parse(pending(claudeMd).edits)[0].new, /Deploys on Fridays are forbidden, except hotfixes\./);
+  assert.equal(curator.interimOf(db, claim.id).id, standIn.id, 'still one stand-in');
+  const done = cs.applyChangeset(db, pending(claudeMd).id, { actor: 'manual' });
+  assert.equal(done.status, 'patched', done.reason);
+  assert.match(fs.readFileSync(claudeMd, 'utf8'), /except hotfixes/);
+  assert.ok(!fs.existsSync(standIn.path));
+});
