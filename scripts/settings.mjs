@@ -13,6 +13,8 @@ export const DEFAULT_SETTINGS = {
   },
   archiveAfterDaysUnused: 60,
   excludeProjects: [],
+  // Projects (globs) where Ouroboros only measures: the control group of the correction rate.
+  controlProjects: [],
 };
 
 export function settingsFile() {

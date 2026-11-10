@@ -897,6 +897,7 @@ async function renderOverview() {
           delta !== null ? h('span', { class: `delta${tone ? '' : ' neutral'}`, title: enough ? null : `Not judged below ${MIN_SAMPLE_TURNS} turns after learning` },
             h('span', { class: `dot ${tone}` }), `${delta > 0 ? '+' : ''}${delta.toFixed(1)}`, enough ? null : h('span', { class: 'delta-note' }, 'small sample')) : null),
         h('p', { class: 'sentence' }, text),
+        controlNote(v.concurrent),
         h('p', { class: 'small faint' }, `Counted the same way before and after: one corrections-only reading of each whole session.${v.selfReported?.turns ? ` Not included: what the learning reviews counted themselves (${fmt.rate(v.selfReported.rate)} per 100 on ${fmt.int(v.selfReported.turns)} turns).` : ''}`)),
       h('div', { class: 'stats' },
         stat('Learned', fmt.int(learnedTotal), `${o.learned.memory || 0} memories · ${o.learned.skill || 0} skills${o.learned.patchedNative ? ` · ${o.learned.patchedNative} refined` : ''}`),
@@ -973,6 +974,19 @@ function lifecycleNote(c) {
   if (lc.state === 'confident') return h('span', { title: 'Confident learnings are not archived when unused' }, 'Not archived when unused');
   return h('span', { title: 'Unused, low-confidence learnings are archived to ~/.ouroboros/archive (restorable). Keep it to stop that.' },
     lc.at > Date.now() ? `Archived ${fmt.date(lc.at)} if unused` : 'Archived at the next maintenance if unused');
+}
+
+/**
+ * The control group next to the learning projects, over the same days: the comparison
+ * that does not depend on the work, the model or the user having changed since "before".
+ */
+function controlNote(c) {
+  if (!c || !c.control.turns) return null;
+  const enough = c.control.turns >= MIN_SAMPLE_TURNS && c.learning.turns >= MIN_SAMPLE_TURNS;
+  const side = (label, a) => `${label}: ${fmt.rate(a.rate)} per 100 on ${fmt.int(a.turns)} turns`;
+  return h('p', { class: 'small', title: 'Control projects are listed in controlProjects (~/.ouroboros/config.json): measured with the same instrument, never learned from' },
+    `Same period, since ${fmt.date(c.since)} · ${side('learning projects', c.learning)} · ${side('control projects', c.control)}`,
+    enough ? null : h('span', { class: 'faint' }, ` · too few turns to compare (each side needs ${fmt.int(MIN_SAMPLE_TURNS)})`));
 }
 
 function learnedRow(c) {

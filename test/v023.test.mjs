@@ -129,11 +129,10 @@ test('an addition only adds whole lines; words put inside a line are a correctio
   assert.equal(isInsertion('a\nb\n', 'a\nb c\n'), false);
   assert.equal(isInsertion('a\nb\n', 'b\na\n'), false);
 
-  // In `auto`, the rewrite of a skill a person wrote waits; a line added to it does not.
-  const skill = path.join(process.env.CLAUDE_CONFIG_DIR, 'skills', 'deploy', 'SKILL.md');
-  fs.mkdirSync(path.dirname(skill), { recursive: true });
-  const body = '---\nname: deploy\ndescription: Deploy the app.\n---\n\n# Deploy\n\n## Steps\n\n1. run the tests before pushing\n';
-  fs.writeFileSync(skill, body);
+  // In `auto`, on a skill Ouroboros created itself: a rewrite waits; a line added does not.
+  const [made] = curator.apply(db, { cwd: proj, items: [{ kind: 'skill', scope: 'global', title: 'Deploy the app', description: 'Deploy the app. Use when releasing.', body: '## Steps\n\n1. run the tests before pushing', confidence: 0.7 }] }, { actor: 'inloop', autonomy: 'auto' });
+  const skill = made.path;
+  const body = read(skill);
   const apply = (item) => curator.apply(db, { cwd: proj, items: [{ op: 'patch', kind: 'skill', target: skill, ...item }] }, { actor: 'inloop', autonomy: 'auto' })[0];
   assert.equal(apply({ old: 'run the tests before pushing', new: 'do not run the tests before pushing', title: 'negate' }).status, 'queued');
   assert.equal(read(skill), body);
@@ -287,7 +286,7 @@ test('a skill proposed by the end-of-session review waits for the user, whatever
   assert.equal(bg.status, 'queued');
   assert.match(bg.reason, /a skill proposed by the end-of-session review is always confirmed/);
   // The user's decision writes it; Claude saving one in session follows the autonomy setting.
-  const c = db.prepare("SELECT id FROM candidates WHERE outcome = 'queued' AND kind = 'skill'").get();
+  const c = db.prepare("SELECT id FROM candidates WHERE outcome = 'queued' AND kind = 'skill' AND title = 'Zip for Linux'").get();
   assert.equal(curator.decideQueued(db, c.id, true).status, 'created');
   assert.equal(curator.apply(db, { cwd: proj, items: [skill('Rotate the staging certificate')] }, { actor: 'inloop', autonomy: 'auto' })[0].status, 'created');
   // A memory from the same reviewer is still written in `auto`.

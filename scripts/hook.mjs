@@ -108,6 +108,18 @@ export function isExcluded(cwd) {
   return excludeProjects.some((p) => typeof p === 'string' && globMatch(p, cwd));
 }
 
+/**
+ * Projects listed in `controlProjects` are the control group: Ouroboros measures their
+ * sessions with the same instrument and teaches nothing there (no protocol, no reviews
+ * that write). "Before and after" compares two periods, in which the work, the model
+ * and the user's own habits also changed; a control compares the same weeks.
+ */
+export function isControl(cwd) {
+  if (!cwd) return false;
+  const { controlProjects = [] } = loadSettings();
+  return controlProjects.some((p) => typeof p === 'string' && globMatch(p, cwd));
+}
+
 export const RESULT_RE = /\[ouroboros\]\s*reviewed=(\d+)\s+corrections=(\d+)\s+learned=(\d+)\s+patched=(\d+)/i;
 
 const FILE_TOOL_RE = /^(Edit|MultiEdit|Write|Read|NotebookEdit):/;
@@ -260,10 +272,12 @@ const handlers = {
     // v0.18: one key per repository (before: per folder, so worktrees were strangers).
     try { rekeyProjects(db); } catch (err) { dbApi.logError(db, 'migrate:projects', err); }
     ensureSession(db, input, now);
+    const control = isControl(input.cwd);
+    db.prepare('UPDATE sessions SET control = ? WHERE id = ?').run(control ? 1 : 0, input.session_id);
     addEvent(db, input, now, 'session_start', input.source || null);
     // The dashboard runs outside hooks and can't see plugin options; leave a snapshot.
     fs.writeFileSync(path.join(dataDir(), 'options.json'), JSON.stringify({ ...options(), updatedAt: now }));
-    if (options().learning) {
+    if (options().learning && !control) {
       // Files deleted outside Ouroboros (by the user, or by Claude Code tidying its
       // memory): the records follow, and the notice below says so.
       try {
@@ -425,7 +439,7 @@ const handlers = {
     }
 
     // 2. Decide whether to ask for a periodic review now.
-    if (!opts.learning || !opts.inloopReview || input.stop_hook_active || input.agent_id) return;
+    if (!opts.learning || !opts.inloopReview || input.stop_hook_active || input.agent_id || s.control) return;
     // Background agents or commands are still running: Claude stopped only to wait for
     // them, in the middle of the work. The review waits for a stop that ends something.
     if (Array.isArray(input.background_tasks) && input.background_tasks.length) return;

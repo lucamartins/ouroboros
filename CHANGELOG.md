@@ -2,6 +2,14 @@
 
 All notable changes to Ouroboros. Versions follow [semantic versioning](https://semver.org/) (pre-1.0: a minor version may change behavior). The reasoning behind each change is in [DESIGN.md](DESIGN.md).
 
+## 0.24.0 — 2026-11-10
+
+- Measure whether it works against a control, not only against the past. List one or two projects under `controlProjects` in `~/.ouroboros/config.json`: Ouroboros only measures there (nothing injected, nothing saved), and the Overview shows corrections per 100 turns for learning and control projects over the same period.
+- A skill you wrote changes only with your approval, like a CLAUDE.md or a rule file. Until now a line could be added to it in `auto` without asking. What waits is active meanwhile as a project memory, so Claude knows it from the next session either way. Skills Ouroboros created still take additions directly.
+- Proposing a fact for your global `CLAUDE.md` no longer creates that file when you have none: approving does, and undo removes it again.
+- The inbox skill passes its JSON as a file in every example (no heredoc).
+- The README says its screenshots show demo data.
+
 ## 0.23.0 — 2026-11-10
 
 A review of the mechanisms, each problem reproduced before it was fixed (DESIGN.md §7.6).

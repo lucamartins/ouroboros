@@ -75,18 +75,22 @@ If the user answers with a comment or question, discuss it — that is the point
 | Reject | `reject <key> --reason "<the user's reason, short, in English>"` |
 | Skip | nothing; it keeps waiting |
 | Keep current rule (conflict) | `resolve <cf:key> keep --reason "…"` |
-| New rule (conflict) | compose the correction yourself (below), then `resolve <cf:key> new` with it on stdin |
+| New rule (conflict) | compose the correction yourself (below), then `resolve <cf:key> new --file <path>` with it |
 | Fix it now (suggestion) | do the fix as normal work (the project's own rules for commits and pushes apply), then `done <sg:key>` |
 | Already fixed / Dismiss | `done <sg:key>` / `dismiss <sg:key> --reason "…"` |
 
-**Editing.** Write the user's version, run `preview <key>` with it on stdin, show the resulting diff **in your message** and confirm, then run `edit <key>` with the same JSON. Prefer writing the JSON to a file in your scratchpad or temp directory and passing `--file <path>` (braces and quotes in a shell command trip Claude Code's command check); a quoted heredoc on stdin also works:
+**Editing.** Write the user's version as JSON to a file in your scratchpad or temp directory (Write tool), run `preview <key> --file <path>`, show the resulting diff **in your message** and confirm, then run `edit <key>` with the same file. Do not pipe the JSON through a heredoc: braces and quotes in a shell command trip Claude Code's command check and cost a permission prompt or a retry.
 
 ```bash
-node --no-warnings "${CLAUDE_PLUGIN_ROOT}/scripts/inbox.mjs" edit cs:22 --data "${CLAUDE_PLUGIN_DATA}" <<'JSON'
+node --no-warnings "${CLAUDE_PLUGIN_ROOT}/scripts/inbox.mjs" edit cs:22 --data "${CLAUDE_PLUGIN_DATA}" --file "<path of the JSON file>"
+```
+
+The file:
+
+```json
 { "edits": [ { "old": "<exact text in the file now>", "new": "<text that replaces it>", "claims": [63] },
              { "append": "<new line>", "section": "<heading or bold topic>", "claims": [87] } ],
   "drop": [92], "reason": "<what the user changed, short>" }
-JSON
 ```
 
 - `cs:` (change to a file) — `edits` replace the proposed ones entirely, against the file **as it is now** (read it; `old` must occur exactly once). Keep a learning's id in `claims`; list learnings the user rejected in `drop`. A stale change (the file changed since) is fixed the same way.

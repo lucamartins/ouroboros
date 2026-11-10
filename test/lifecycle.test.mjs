@@ -236,7 +236,7 @@ test('a request Claude labels as the user\'s skips the autonomy setting, never t
     { op: 'patch', target: claudeMd, old: 'Run pnpm test.', new: 'Run pnpm test:all.', title: 'Test command changed' },
   ] }, { actor: 'requested', autonomy: 'queue' });
   assert.deepEqual(r.map((x) => x.status), ['created', 'queued', 'queued']);
-  assert.match(r[1].reason, /CLAUDE\.md and rule files are always confirmed/);
+  assert.match(r[1].reason, /changes to a file you wrote .* are always confirmed/);
   assert.match(r[2].reason, /rewrites existing text/);
   assert.equal(fs.readFileSync(claudeMd, 'utf8'), before);
 
@@ -248,7 +248,8 @@ test('a request Claude labels as the user\'s skips the autonomy setting, never t
   });
   assert.equal(cli.status, 0, cli.stderr);
   assert.equal(JSON.parse(cli.stdout.trim().split('\n').pop())[0].status, 'queued');
-  assert.doesNotMatch(fs.readFileSync(path.join(tmp, 'claude', 'CLAUDE.md'), 'utf8'), /one working day/);
+  const globalMd = path.join(tmp, 'claude', 'CLAUDE.md');
+  assert.ok(!fs.existsSync(globalMd) || !/one working day/.test(fs.readFileSync(globalMd, 'utf8')));
   for (const c of db.prepare("SELECT id FROM candidates WHERE outcome = 'queued'").all()) curator.decideQueued(db, c.id, false);
 });
 

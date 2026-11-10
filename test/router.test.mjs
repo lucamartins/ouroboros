@@ -108,7 +108,11 @@ test('in session, a new item whose topic has an owner is sent back to patch it; 
   assert.ok(!fs.existsSync(path.join(claude, 'skills', 'learned-prefs-commits')));
 
   const [patched] = curator.apply(db, { cwd: proj, items: [{ op: 'patch', kind: 'skill', target: owners[0].file, section: 'Message format', append: 'The scope is lowercase.', title: 'Lowercase commit scope' }] }, { ...auto, ownerCheck: true });
-  assert.equal(patched.status, 'patched', patched.reason);
+  // The commit skill is the user's own: the line waits for them, and is known meanwhile (v0.24).
+  assert.equal(patched.status, 'queued', patched.reason);
+  assert.match(patched.reason, /a file you wrote .* always confirmed.*Active now as a project memory/);
+  assert.ok(fs.existsSync(patched.meanwhile));
+  assert.doesNotMatch(fs.readFileSync(owners[0].file, 'utf8'), /The scope is lowercase/);
 
   const [forced] = curator.apply(db, { cwd: proj, items: [{ ...item, owner_checked: true }] }, { ...auto, ownerCheck: true });
   assert.equal(forced.status, 'created', forced.reason);

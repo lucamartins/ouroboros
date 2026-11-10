@@ -41,13 +41,14 @@ test('a patch records what it learned, why and the session; the dashboard shows 
       op: 'patch', kind: 'skill', target: skill, section: 'Pitfalls', append: '- The API dies with SQL error 207 when a migration is missing; apply it first.',
       title: 'Missing migration makes the API die at startup', why: 'The API crashed twice before the migration was applied.',
     }],
-  }, { actor: 'inloop', autonomy: 'auto' });
+  // The user's own decision: a line added to a skill a person wrote otherwise waits (v0.24).
+  }, { actor: 'manual', autonomy: 'auto' });
   assert.equal(r.status, 'patched', r.reason);
   const [c] = api('changes').rows;
   assert.equal(c.title, 'Missing migration makes the API die at startup');
   assert.equal(c.why, 'The API crashed twice before the migration was applied.');
   assert.equal(c.session.id, 'sess-1');
-  assert.equal(c.actor, 'inloop');
+  assert.equal(c.actor, 'manual');
   assert.deepEqual(c.files[0].hunks[0].after, ['- The API dies with SQL error 207 when a migration is missing; apply it first.']);
   assert.equal(c.learning.own, false);
   assert.equal(c.canArchive, false, 'a file Ouroboros did not create cannot be archived');
