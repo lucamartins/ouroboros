@@ -22,7 +22,7 @@ const MIGRATIONS = [
     turn_tool_calls       INTEGER NOT NULL DEFAULT 0,
     turns_at_last_review  INTEGER NOT NULL DEFAULT 0,
     review_cursor         INTEGER NOT NULL DEFAULT 0,
-    queue_state           TEXT,              -- NULL | queued | running | done | skipped | failed
+    queue_state           TEXT,              -- NULL | queued | running | done | skipped | failed | waiting (v0.23: to finish later)
     reviewed_at           INTEGER,
     last_event_at         INTEGER
   );
@@ -123,7 +123,7 @@ const MIGRATIONS = [
     title          TEXT NOT NULL,
     path           TEXT NOT NULL,
     confidence     REAL,
-    status         TEXT NOT NULL,             -- active | archived | reverted
+    status         TEXT NOT NULL,             -- active | archived | reverted | removed (v0.23: file deleted outside Ouroboros)
     trigger        TEXT,
     origin_session TEXT,
     created_at     INTEGER NOT NULL,
@@ -256,6 +256,14 @@ const MIGRATIONS = [
   ALTER TABLE learnings ADD COLUMN misses INTEGER NOT NULL DEFAULT 0;
   ALTER TABLE learnings ADD COLUMN last_missed_at INTEGER;
   ALTER TABLE learnings ADD COLUMN miss_flagged_at INTEGER;   -- a suggestion to reword it was sent to the inbox
+  `,
+  // 13 — v0.23: what happened between the failures and the success of a command
+  // (learnings.status also takes 'removed': the file was deleted outside Ouroboros;
+  //  sessions.queue_state also takes 'waiting': a review to finish later)
+  `
+  ALTER TABLE fail_streaks ADD COLUMN first_command TEXT;                -- the command text of the first failure
+  ALTER TABLE fail_streaks ADD COLUMN edits INTEGER NOT NULL DEFAULT 0;   -- files written meanwhile (the code was being fixed)
+  ALTER TABLE fail_streaks ADD COLUMN others INTEGER NOT NULL DEFAULT 0;  -- other commands run meanwhile
   `,
 ];
 

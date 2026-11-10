@@ -1,7 +1,7 @@
 {
   "name": "ouroboros",
   "displayName": "Ouroboros",
-  "version": "0.22.3",
+  "version": "0.23.0",
   "description": "Self-learning for Claude Code: reviews your sessions, turns what is worth keeping into memories and skills, and shows usage, value and cost on a local dashboard.",
   "author": {
     "name": "Luca Martins",
@@ -74,8 +74,15 @@
     "monthly_budget_usd": {
       "type": "number",
       "title": "Monthly budget (USD)",
-      "description": "Every Ouroboros model call (reviews, knowledge check, correction count) stops for the rest of the month once this is spent.",
+      "description": "Every model call Ouroboros makes on its own (end-of-session reviews, knowledge check, correction count) stops once this is spent; a review it could not afford is finished when there is budget again. In-session reviews run inside your session and are not part of it: they are limited by the context size below.",
       "default": 5,
+      "min": 0
+    },
+    "inloop_review_max_context": {
+      "type": "number",
+      "title": "Largest context for an in-session review (tokens)",
+      "description": "An in-session review reads the whole conversation again, on your session's model. Above this context size it is skipped and that stretch is left to the end-of-session review, which reads a digest with a small model. 0 = no limit.",
+      "default": 150000,
       "min": 0
     }
   }

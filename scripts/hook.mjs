@@ -11,13 +11,16 @@ import { rekeyProjects, retireProfile } from './migrate.mjs';
 import { RUBRIC_SHORT } from './rubric.mjs';
 import { sessionStateText } from './session-state.mjs';
 import { globMatch, loadSettings } from './settings.mjs';
-import { countLines, readTranscript, usageSince } from './transcript.mjs';
+import { contextTokens, countLines, isHumanPrompt, readTranscript, usageSince } from './transcript.mjs';
 
 const MIN_NODE = [22, 13];
 /** Tool calls that make a turn "long" (recorded as a metric only). */
 export const LONG_TURN_TOOL_CALLS = 15;
 /** Early (recovery) reviews are at least this many user turns apart from any review. */
 export const EARLY_REVIEW_MIN_TURNS = 5;
+export const MAINTENANCE_EVERY_MS = 20 * 60 * 60 * 1000;
+/** A review left to finish later is tried again after this long. */
+const RETRY_AFTER_MS = 30 * 60 * 1000;
 const here = path.dirname(fileURLToPath(import.meta.url));
 // db.mjs needs node:sqlite, so it is loaded only after the Node version check.
 let dbApi;
@@ -41,6 +44,11 @@ export function targetOf(toolName, input = {}) {
     return `${toolName}:${cmd}`;
   }
   return toolName;
+}
+
+/** The whole command of a shell call, as one line, to tell a retry from a different invocation. */
+function commandText(toolName, input = {}) {
+  return COMMAND_TOOL_RE.test(toolName) && typeof input.command === 'string' ? input.command.replace(/\s+/g, ' ').trim().slice(0, 500) : '';
 }
 
 function readStdin() {
@@ -102,16 +110,33 @@ export function isExcluded(cwd) {
 
 export const RESULT_RE = /\[ouroboros\]\s*reviewed=(\d+)\s+corrections=(\d+)\s+learned=(\d+)\s+patched=(\d+)/i;
 
+const FILE_TOOL_RE = /^(Edit|MultiEdit|Write|Read|NotebookEdit):/;
+const FILE_WRITE_TOOL_RE = /^(Edit|MultiEdit|Write|NotebookEdit)$/;
+const COMMAND_TOOL_RE = /^(Bash|PowerShell)$/;
+
 /**
- * The recoveries worth showing to a review: a command that failed at least
- * `minFailures` times before it worked. One failed try, or an edit or a read retried
- * until it applied, is everyday mechanics: listing those buried the real ones.
+ * Whether a recovery reads as finding the working path: a command that failed at least
+ * `minFailures` times and then worked because the command changed, or because another
+ * command was run in between. Three other things look the same and are everyday work:
+ * an edit or a read retried until it applied; tests that fail until the code is fixed
+ * (files were written between the failures and the success: the lesson, if any, is in
+ * the code); and the same command repeated until a flaky service answered (nothing
+ * changed and nothing else ran). Recoveries recorded before v0.23 carry no such detail
+ * and are taken as they were.
  */
+export function isWorkingPath(r, minFailures = 2) {
+  if (FILE_TOOL_RE.test(String(r?.target || ''))) return false;
+  let p;
+  try { p = JSON.parse(r.payload || '{}'); } catch { return false; }
+  if ((p.failures || 0) < minFailures) return false;
+  if (p.edits === undefined) return true;
+  if (p.edits > 0) return false;
+  return !!p.changed || (p.commands || 0) > 0;
+}
+
+/** The recoveries worth showing to a review (see `isWorkingPath`): listing the rest buried the real ones. */
 export function significantRecoveries(rows, minFailures = 2) {
-  return (rows || []).filter((r) => {
-    if (FILE_TOOL_RE.test(String(r.target || ''))) return false;
-    try { return (JSON.parse(r.payload || '{}').failures || 0) >= minFailures; } catch { return false; }
-  });
+  return (rows || []).filter((r) => isWorkingPath(r, minFailures));
 }
 
 /**
@@ -136,22 +161,14 @@ export function reviewRequest({ from, to, trigger, recoveries = [], state = '' }
 }
 
 /**
- * Whether the turn that just ended found a working path after failures: a recovery
- * (same command or file failed, then worked) with at least `minFailures` failures,
+ * Whether the turn that just ended found a working path after failures (`isWorkingPath`),
  * here or inside a subagent. A long turn alone is not a signal: a third of real turns
  * use 15+ tool calls, and most have nothing new to learn.
  */
 export function recoveredThisTurn(db, sessionId, minFailures) {
   return db.prepare("SELECT target, payload FROM events WHERE session_id = ? AND kind = 'recovery' AND ts >= ?").all(sessionId, turnStartOf(db, sessionId))
-    // Retrying an edit or a read of the same file until it applies is mechanics, not a
-    // working path worth an early review (it is still recorded and reaches the reviews).
-    .filter((r) => !FILE_TOOL_RE.test(String(r.target || '')))
-    .some((r) => {
-      try { return (JSON.parse(r.payload || '{}').failures || 0) >= minFailures; } catch { return false; }
-    });
+    .some((r) => isWorkingPath(r, minFailures));
 }
-
-const FILE_TOOL_RE = /^(Edit|MultiEdit|Write|Read|NotebookEdit):/;
 
 /** When the session's current user turn started (0 before the first one). */
 function turnStartOf(db, sessionId) {
@@ -160,7 +177,7 @@ function turnStartOf(db, sessionId) {
 
 /** At most one early review every EARLY_REVIEW_MIN_TURNS user turns (after any review request). */
 function earlyAllowed(db, sessionId, turns) {
-  const last = db.prepare("SELECT payload FROM events WHERE session_id = ? AND kind = 'review_requested' ORDER BY id DESC LIMIT 1").get(sessionId);
+  const last = db.prepare("SELECT payload FROM events WHERE session_id = ? AND kind IN ('review_requested', 'review_skipped') ORDER BY id DESC LIMIT 1").get(sessionId);
   if (!last) return true;
   let at = 0;
   try { at = JSON.parse(last.payload || '{}').turns?.[1] || 0; } catch { /* ignore */ }
@@ -239,7 +256,7 @@ export function inboxCount(db, project) {
 }
 
 const handlers = {
-  SessionStart(db, input, now) {
+  async SessionStart(db, input, now) {
     // v0.18: one key per repository (before: per folder, so worktrees were strangers).
     try { rekeyProjects(db); } catch (err) { dbApi.logError(db, 'migrate:projects', err); }
     ensureSession(db, input, now);
@@ -247,6 +264,12 @@ const handlers = {
     // The dashboard runs outside hooks and can't see plugin options; leave a snapshot.
     fs.writeFileSync(path.join(dataDir(), 'options.json'), JSON.stringify({ ...options(), updatedAt: now }));
     if (options().learning) {
+      // Files deleted outside Ouroboros (by the user, or by Claude Code tidying its
+      // memory): the records follow, and the notice below says so.
+      try {
+        const { reconcile } = await import('./curator.mjs');
+        reconcile(db, now);
+      } catch (err) { dbApi.logError(db, 'hook:reconcile', err); }
       // What the end-of-session reviewer learned since the last session start, for this
       // project (a notice from another project waits for a session there); maintenance
       // notices have no project and go to the next session anywhere.
@@ -276,23 +299,28 @@ const handlers = {
     // Sessions whose SessionEnd never ran a worker (crash, killed terminal) or whose
     // worker died: queue them again, at most a few per start.
     const stale = now - 10 * 60 * 1000;
+    // Also reviews left to finish later (a part of a long session failed, the model
+    // call failed, the month's budget ran out): tried again once there is budget.
+    const canSpend = dbApi.monthSpend(db) < options().monthlyBudgetUsd;
     const orphans = db.prepare(`
       SELECT id FROM sessions
       WHERE id != ? AND (
         (queue_state = 'queued' AND COALESCE(ended_at, last_event_at) < ?) OR
-        (queue_state = 'running' AND last_event_at < ?)
+        (queue_state = 'running' AND last_event_at < ?) OR
+        (queue_state = 'waiting' AND ? AND COALESCE(reviewed_at, last_event_at) < ?)
       )
       ORDER BY started_at DESC LIMIT 3
-    `).all(input.session_id, stale, stale);
+    `).all(input.session_id, stale, stale, canSpend ? 1 : 0, now - RETRY_AFTER_MS);
     // v0.12: the old global profile becomes proposals for the global CLAUDE.md.
     try {
       if (retireProfile(db, now) && options().learning) spawnWorker(['--drain']);
     } catch (err) {
       dbApi.logError(db, 'migrate:profile', err);
     }
-    // Daily upkeep (archive unused learnings, consolidate full budgets).
-    if (options().learning && now - (Number(dbApi.getMeta(db, 'maintenance_at')) || 0) > 20 * 60 * 60 * 1000) {
-      dbApi.setMeta(db, 'maintenance_at', now);
+    // Daily upkeep (archive unused learnings, trim full budgets, retry what waits). The
+    // worker claims the run itself (`maintain`): until v0.22 this hook wrote the time
+    // first, the worker then read "ran a moment ago" and left, and upkeep never ran.
+    if (options().learning && now - (Number(dbApi.getMeta(db, 'maintenance_at')) || 0) > MAINTENANCE_EVERY_MS) {
       spawnWorker(['--maintain']);
     }
     if (orphans.length && options().backgroundReview) {
@@ -347,6 +375,10 @@ const handlers = {
     const target = targetOf(tool, ti);
     const streak = db.prepare('SELECT * FROM fail_streaks WHERE session_id = ? AND target = ?').get(input.session_id, target);
     if (streak) db.prepare('DELETE FROM fail_streaks WHERE session_id = ? AND target = ?').run(input.session_id, target);
+    // What ran while other commands were failing tells a working path from fixing code
+    // (files written) and from waiting out a flaky command (nothing else happened).
+    const between = FILE_WRITE_TOOL_RE.test(tool) ? 'edits' : COMMAND_TOOL_RE.test(tool) ? 'others' : null;
+    if (between) db.prepare(`UPDATE fail_streaks SET ${between} = ${between} + 1 WHERE session_id = ? AND target != ?`).run(input.session_id, target);
     // Only within one turn: a failure three turns ago and a success now are two events,
     // not Claude working its way through an error.
     if (streak && streak.started_at >= turnStartOf(db, input.session_id)) {
@@ -354,6 +386,9 @@ const handlers = {
         failures: streak.count,
         first_error: streak.first_error,
         seconds: Math.round((now - streak.started_at) / 1000),
+        edits: streak.edits || 0,
+        commands: streak.others || 0,
+        changed: commandText(tool, ti) !== (streak.first_command || ''),
       });
     }
   },
@@ -368,10 +403,10 @@ const handlers = {
     // A streak left open by an earlier turn starts over.
     db.prepare('DELETE FROM fail_streaks WHERE session_id = ? AND target = ? AND started_at < ?').run(input.session_id, target, turnStartOf(db, input.session_id));
     db.prepare(`
-      INSERT INTO fail_streaks (session_id, target, agent_id, count, first_error, started_at)
-      VALUES (?, ?, ?, 1, ?, ?)
+      INSERT INTO fail_streaks (session_id, target, agent_id, count, first_error, started_at, first_command)
+      VALUES (?, ?, ?, 1, ?, ?, ?)
       ON CONFLICT(session_id, target) DO UPDATE SET count = count + 1
-    `).run(input.session_id, target, input.agent_id || null, error, now);
+    `).run(input.session_id, target, input.agent_id || null, error, now, commandText(input.tool_name || '', input.tool_input || {}));
     addEvent(db, input, now, 'tool_fail', target, { error: error.slice(0, 200) });
   },
 
@@ -395,12 +430,44 @@ const handlers = {
     // them, in the middle of the work. The review waits for a stop that ends something.
     if (Array.isArray(input.background_tasks) && input.background_tasks.length) return;
     const turnsSince = s.turns - s.turns_at_last_review;
-    const trigger = turnsSince >= opts.reviewEveryTurns ? 'periodic'
-      : recoveredThisTurn(db, input.session_id, opts.earlyReviewFailures) && earlyAllowed(db, input.session_id, s.turns) ? 'recovery'
-        : null;
-    if (!trigger) return;
+    const early = recoveredThisTurn(db, input.session_id, opts.earlyReviewFailures) && earlyAllowed(db, input.session_id, s.turns);
+    if (turnsSince < opts.reviewEveryTurns && !early) return;
 
-    const line = input.transcript_path ? countLines(input.transcript_path) : null;
+    // A review is due by the counter. The transcript settles two things before asking.
+    let entries = null;
+    try { entries = input.transcript_path ? readTranscript(input.transcript_path) : null; } catch { /* unreadable: trust the counter */ }
+    let periodic = turnsSince >= opts.reviewEveryTurns;
+    if (periodic && entries) {
+      // UserPromptSubmit also fires for prompts nobody typed (a scheduled task, a
+      // background subagent reporting back, a message from another session), so the
+      // counter runs ahead in agentic sessions. The cadence is in turns the user typed,
+      // read the same way the reviews read them.
+      const from = Math.min(s.review_requested_line || 0, entries.length);
+      const typed = entries.slice(from >= entries.length ? 0 : from).filter(isHumanPrompt).length;
+      if (typed < opts.reviewEveryTurns) {
+        periodic = false;
+        db.prepare('UPDATE sessions SET turns_at_last_review = ? WHERE id = ?').run(Math.max(s.turns_at_last_review, s.turns - typed), input.session_id);
+      }
+    }
+    const trigger = periodic ? 'periodic' : early ? 'recovery' : null;
+    if (!trigger) return;
+    const line = entries ? entries.length : input.transcript_path ? countLines(input.transcript_path) : null;
+
+    // An in-session review reads the whole context again (twice at least: the skill,
+    // then the answer), on the session's own model, outside `monthly_budget_usd`. Past
+    // a size it costs more than it is worth: the stretch is left to the end-of-session
+    // reviewer, which reads a digest with a small model, inside the budget.
+    const context = entries ? contextTokens(entries) : 0;
+    if (opts.inloopReviewMaxContext > 0 && context > opts.inloopReviewMaxContext) {
+      db.prepare('UPDATE sessions SET turns_at_last_review = turns, review_requested_line = ? WHERE id = ?').run(line, input.session_id);
+      addEvent(db, input, now, 'review_skipped', trigger, { turns: [s.turns_at_last_review + 1, s.turns], context });
+      db.prepare(`
+        INSERT INTO reviews (session_id, mode, trigger, status, detail, session_started_at, ts)
+        VALUES (?, 'inloop', ?, 'skipped', ?, ?, ?)`).run(input.session_id, trigger,
+        `context of ${context} tokens is over inloop_review_max_context (${opts.inloopReviewMaxContext}): left to the end-of-session review`, s.started_at, now);
+      return;
+    }
+
     db.prepare(`
       UPDATE sessions SET review_requested_at = ?, review_requested_line = ?, review_trigger = ?, turns_at_last_review = turns
       WHERE id = ?
@@ -462,7 +529,7 @@ async function main() {
   let db;
   try {
     db = openDb();
-    handlers[event](db, input, Date.now());
+    await handlers[event](db, input, Date.now());
   } catch (err) {
     if (db) logError(db, `hook:${event}`, err);
   } finally {

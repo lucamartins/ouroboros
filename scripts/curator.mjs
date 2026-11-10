@@ -20,7 +20,7 @@ import { claudeDir, classifyPath, ensureGlobalInstructions, gitRoot, memoryDirFo
 import { cleanPaths, findOwners, preferenceHome } from './router.mjs';
 import { addObservations, closeObservations, sessionStateText } from './session-state.mjs';
 import { ensureSettingsFile, expandHome, loadSettings, routeFor } from './settings.mjs';
-import { addedText, isInsertion, revertChange } from './textdiff.mjs';
+import { addedText, revertChange } from './textdiff.mjs';
 
 // ---------- small helpers ----------
 
@@ -58,16 +58,52 @@ const SECRET_RE = [
   /\b(sk|rk|pk)_(live|test)_[A-Za-z0-9]{10,}/,
   /\bsk-[A-Za-z0-9_-]{20,}/,
   /\bgh[opusr]_[A-Za-z0-9]{20,}/,
+  /\bgithub_pat_[A-Za-z0-9_]{20,}/,
+  /\bglpat-[A-Za-z0-9_-]{20,}/,
   /\bxox[abprs]-[A-Za-z0-9-]{10,}/,
   /\bAKIA[0-9A-Z]{16}\b/,
+  /\bAIza[0-9A-Za-z_-]{30,}/,
+  /\bya29\.[A-Za-z0-9_-]{20,}/,
+  /\bnpm_[A-Za-z0-9]{30,}/,
+  /\bhf_[A-Za-z0-9]{30,}/,
+  /\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}/,
   /\bre_[A-Za-z0-9]{20,}/,
   /\bwhsec_[A-Za-z0-9]{10,}/,
   /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/,
-  /\b(password|passwd|secret|api[_-]?key|token)\s*[:=]\s*['"]?[^\s'"]{8,}/i,
+  // A bearer token written out (not "Bearer <token>" or "Bearer $TOKEN").
+  /\bBearer\s+(?=[A-Za-z0-9._~+/-]*\d)[A-Za-z0-9._~+/-]{20,}/i,
 ];
 
+/**
+ * Patterns that capture a value: it is a secret unless it is plainly a placeholder or a
+ * reference to where the secret lives ("$TOKEN", "<password>", "process.env.X").
+ */
+const SECRET_VALUE_RE = [
+  // key = value, key: value
+  { re: /\b(?:password|passwd|secret|api[_-]?key|token)\s*[:=]\s*['"`]?([^\s'"`]{8,})/gi },
+  // scheme://user:password@host
+  { re: /\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/]+:([^\s@/]{4,})@/gi },
+  // "the password is hunter2hunter2": only what looks like a value (letters and digits), not a sentence
+  { re: /\b(?:password|passwd|passphrase|senha|secret|token|api[_ -]?key)\s+(?:is|was|é)\s+['"`]?([^\s'"`]{8,})/gi, mixed: true },
+];
+const NOT_A_SECRET_VALUE = /^(?:\$\{|\$\(|\$[A-Za-z_][A-Za-z0-9_]*$|[<{[(%]|\*+$|x{3,}$|\.{3}|pass(?:word)?\b|secret\b|changeme\b|example|your[-_]|redacted|process\.env|os\.environ|env[.[]|getenv|null\b|none\b|true\b|false\b|undefined\b)/i;
+
+function hasSecret(text) {
+  const t = String(text);
+  if (SECRET_RE.some((re) => re.test(t))) return true;
+  for (const { re, mixed } of SECRET_VALUE_RE) {
+    for (const m of t.matchAll(re)) {
+      const v = m[1];
+      if (NOT_A_SECRET_VALUE.test(v)) continue;
+      if (mixed && !(/\d/.test(v) && /[A-Za-z]/.test(v))) continue;
+      return true;
+    }
+  }
+  return false;
+}
+
 export function containsSecret(...texts) {
-  return texts.some((t) => t && SECRET_RE.some((re) => re.test(String(t))));
+  return texts.some((t) => t && hasSecret(t));
 }
 
 function yamlStr(s) {
@@ -253,6 +289,9 @@ function normalizeItem(raw, payload) {
   const item = { ...raw };
   delete item.ownFile; // set by code only (a file Ouroboros created), never by a proposal
   delete item.ownUntouched;
+  // One spelling of a file target for every check that follows: "~/.claude/CLAUDE.md"
+  // names the same file as its absolute path, and must meet the same approval rules.
+  if (typeof item.target === 'string' && path.isAbsolute(expandHome(item.target.trim()))) item.target = path.resolve(expandHome(item.target.trim()));
   item.op = item.op === 'patch' ? 'patch' : 'create';
   // "profile" is the kind used before global facts moved to the global CLAUDE.md.
   item.kind = ['memory', 'skill', 'global', 'preference'].includes(item.kind) ? item.kind : item.kind === 'profile' ? 'global' : 'memory';
@@ -613,8 +652,10 @@ function rewritesText(db, item, settings, payload) {
   const before = readOrNull(t.file);
   if (before === null) return false;
   if (item.description) {
+    // A description is one line: any change to it changes what it says.
     const { data } = parseFrontmatter(before);
-    if (data.description && !isInsertion(String(data.description), item.description)) return true;
+    const one = (x) => String(x).replace(/\s+/g, ' ').trim();
+    if (data.description && one(data.description) !== one(item.description)) return true;
   }
   const edit = editOf(item);
   if (!edit) return false;
@@ -665,6 +706,12 @@ export function needsApproval(item, actor, autonomy) {
   if (item.corrects && !(item.ownUntouched && autonomy === 'auto')) return true;
   // (a rule file Ouroboros created for learned preferences is its own: `ownFile`)
   if (!item.ownFile && item.op === 'patch' && item.target && path.isAbsolute(String(item.target)) && ['rules', 'instructions'].includes(knowledgeKind(item.target))) return true;
+  // A new procedure written by the end-of-session reviewer: a small model, a digest of
+  // the session (which carries tool errors and what the assistant made of tool output)
+  // and nobody watching. A skill is instructions later sessions follow, so it gets a look
+  // first, whatever the autonomy. Skills Claude saves in session, with the conversation
+  // and the user in front of it, follow the autonomy setting.
+  if (backgroundSkill(item, actor)) return true;
   if (actor === 'requested') return false;
   if (autonomy === 'auto') return false;
   if (autonomy === 'queue') return true;
@@ -672,8 +719,13 @@ export function needsApproval(item, actor, autonomy) {
   return item.kind === 'skill' || item.confidence < 0.7;
 }
 
+function backgroundSkill(item, actor) {
+  return actor === 'background' && item.op !== 'patch' && item.kind === 'skill';
+}
+
 /** Why a proposal waits, for the line the session shows. */
 function waitReason(item, actor, autonomy) {
+  if (backgroundSkill(item, actor)) return 'waiting for approval: a skill proposed by the end-of-session review is always confirmed (/ouroboros:inbox or the dashboard)';
   if (item.corrects) return 'waiting for approval: it rewrites existing text (/ouroboros:inbox or the dashboard)';
   if (needsApproval(item, 'requested', 'auto')) return 'waiting for approval: changes to CLAUDE.md and rule files are always confirmed (/ouroboros:inbox or the dashboard)';
   return `waiting for approval (autonomy: ${autonomy}; /ouroboros:inbox or the dashboard)`;
@@ -810,6 +862,17 @@ export function apply(db, payload, { actor = 'manual', autonomy = 'auto', ownerC
         continue;
       }
     }
+    // Saved before and deleted outside Ouroboros: Claude says why it is saved again.
+    if (ownerCheck && !raw.removed_checked) {
+      const gone = removedBefore(db, item);
+      if (gone) {
+        results.push({
+          status: 'was_removed', title: item.title, removed: { id: gone.id, title: gone.title, path: gone.path },
+          reason: `"${gone.title}" was saved before and its file (${gone.path}) was deleted outside Ouroboros, by the user or by Claude Code. Save it again only if the user asks for it now or this adds something new: resubmit with "removed_checked": true`,
+        });
+        continue;
+      }
+    }
     // A patch that rewrites existing text is a correction, whatever the proposer said.
     if (!item.corrects && rewritesText(db, item, settings, payload || {})) item.corrects = true;
     if (item.corrects && item.op === 'patch' && !item.ownUntouched) {
@@ -837,7 +900,7 @@ export function apply(db, payload, { actor = 'manual', autonomy = 'auto', ownerC
         const q = queueEdit(db, item, payload || {}, actor);
         // Learn now, promote on approval: an addition to a project's CLAUDE.md or rule
         // file is active at once as a project memory while the change waits.
-        const added = item.corrects ? '' : item.append !== undefined ? String(item.append) : isInsertion(String(item.old ?? ''), String(item.new ?? '')) ? String(item.new).replace(String(item.old).trimEnd(), '') : '';
+        const added = item.corrects ? '' : item.append !== undefined ? String(item.append) : addedText(String(item.old ?? ''), String(item.new ?? ''));
         const meanwhile = added.trim() ? learnMeanwhile(db, {
           candidateId: q.id, file: item.target, title: item.title, claim: added, evidence: item.why || item.evidence,
           cwd: item.projectDir, confidence: item.confidence, sessionId: payload?.session_id, actor, autonomy,
@@ -889,7 +952,8 @@ export function learnMeanwhile(db, { candidateId, file, title, claim, evidence, 
   const target = path.resolve(String(file || ''));
   if (!cwd || !['rules', 'instructions'].includes(knowledgeKind(target))) return null;
   if (normalize(target).startsWith(`${normalize(path.resolve(claudeDir()))}/`)) return null; // the user's global files
-  if (interimOf(db, candidateId)) return null;
+  // One stand-in per waiting change, ever: if it was archived, or deleted by the user, it is not written again.
+  if (candidatePayload(db, candidateId).interim) return null;
   const conf = Math.min(0.9, Math.max(0.3, Number(confidence) || 0.6));
   if (needsApproval({ op: 'create', kind: 'memory', confidence: conf }, actor === 'manual' ? 'inloop' : actor, autonomy)) return null;
   const text = String(claim || '').replace(/^\s*[-*]\s+/, '').trim();
@@ -1004,6 +1068,9 @@ export function undo(db, { id, last, batch } = {}) {
   for (const w of writes) {
     const current = readLinkOrFile(w.file);
     if (current === w.after) { plan.push({ file: w.file, content: w.before }); continue; }
+    // The file this write created was deleted since: nothing of it is left to undo.
+    if (current === null && w.before === null) continue;
+    if (current === null) return { status: 'conflict', file: w.file, reason: 'the file no longer exists (it was deleted outside Ouroboros), so there is nothing to revert in it' };
     const linkish = [current, w.before, w.after].some((x) => x !== null && String(x).startsWith('@link:'));
     const reverted = current !== null && w.before !== null && w.after !== null && !linkish ? revertChange(current, w.before, w.after) : null;
     if (reverted === null) {
@@ -1053,6 +1120,11 @@ export function forget(db, { match }) {
   if (l.origin_session === 'native') {
     return { status: 'refused', id: l.id, title: l.title, reason: `Ouroboros did not create ${l.path}; it only changed it. Undo those changes instead (dashboard: Knowledge, Learned).` };
   }
+  if (!fs.existsSync(l.path)) {
+    // Already deleted outside Ouroboros: there is nothing to archive, only the record to bring in step.
+    markRemoved(db, l);
+    return { status: 'removed', id: l.id, kind: l.kind, title: l.title, reason: 'its file was already deleted outside Ouroboros; it is now marked as removed' };
+  }
   const batch = new Batch(db, { actor: 'manual', title: `Archived: ${l.title}` });
   const archiveDir = path.join(ouroborosDir(), 'archive');
   try {
@@ -1091,6 +1163,101 @@ export function forget(db, { match }) {
   return { status: 'archived', id: l.id, kind: l.kind, title: l.title };
 }
 
+// ---------- files deleted outside Ouroboros ----------
+
+/** How long a deletion counts against saving the same thing again. */
+const REMOVED_MEMORY_DAYS = 180;
+
+/**
+ * Whether a file lives in a git working tree. There a missing file is not evidence that
+ * anyone threw it out: a project skill committed on one branch is simply not there on
+ * another. Such a learning still leaves the counts while its file is gone, and comes
+ * back with it, but its absence is not announced and not held against saving it again.
+ */
+export function inWorkingTree(file) {
+  return !!gitRoot(path.dirname(String(file || '')));
+}
+
+/**
+ * Mark a learning whose file is gone, and take its line out of MEMORY.md when the file
+ * was a memory Ouroboros created (a line that points at nothing is loaded in every
+ * session). Returns false when another process already did it.
+ */
+function markRemoved(db, l, now = Date.now()) {
+  const r = db.prepare("UPDATE learnings SET status = 'removed', updated_at = ? WHERE id = ? AND status = 'active'").run(now, l.id);
+  if (!r.changes) return false;
+  if (l.kind !== 'memory' || l.origin_session === 'native') return true;
+  const indexFile = path.join(path.dirname(l.path), 'MEMORY.md');
+  const fileName = path.basename(l.path);
+  const idx = readOrNull(indexFile);
+  if (idx === null || !idx.includes(`](${fileName})`)) return true;
+  const eol = idx.includes('\r\n') ? '\r\n' : '\n';
+  const batch = new Batch(db, { actor: 'background', title: `Index line of a deleted memory removed: ${l.title}`, why: `${l.path} was deleted outside Ouroboros` });
+  try {
+    batch.write(indexFile, idx.split(/\r?\n/).filter((line) => !line.includes(`](${fileName})`)).join(eol), { learningId: l.id, op: 'cleanup' });
+    batch.commit();
+  } catch (err) {
+    batch.rollback();
+    logError(db, 'curator:reconcile', err);
+  }
+  return true;
+}
+
+/**
+ * Bring the records in step with the files. The ledger knows what Ouroboros wrote, but
+ * the files are the user's: they delete a memory by hand, and Claude Code tidies its own
+ * memory directory. A learning whose file is gone was shown as learned forever, counted
+ * against the budgets, failed to archive every day, and nothing stopped the next review
+ * from saving the same thing again. Now it becomes `removed`: out of every count, and,
+ * when Ouroboros created it outside a git working tree (`inWorkingTree`), a recent
+ * rejection the reviews see (triage.rejectionDocs, `removedBefore`). A file that comes back (a restored backup, a drive mounted again)
+ * makes it active again. Returns { removed, restored }.
+ */
+export function reconcile(db, now = Date.now()) {
+  const removed = [];
+  const restored = [];
+  for (const l of db.prepare("SELECT * FROM learnings WHERE status = 'active' AND kind IN ('memory', 'skill', 'rules', 'instructions')").all()) {
+    if (!l.path || fs.existsSync(l.path)) continue;
+    if (markRemoved(db, l, now)) removed.push(l);
+  }
+  for (const l of db.prepare("SELECT * FROM learnings WHERE status = 'removed'").all()) {
+    if (removed.some((r) => r.id === l.id)) continue;
+    const text = readOrNull(l.path);
+    if (text === null) continue;
+    // The same file, not a new one saved under its name: nothing else claims the path,
+    // and a file Ouroboros created still carries its id.
+    if (db.prepare("SELECT 1 FROM learnings WHERE status = 'active' AND lower(path) = lower(?)").get(l.path)) continue;
+    if (l.origin_session !== 'native' && !text.includes(l.id)) continue;
+    db.prepare("UPDATE learnings SET status = 'active', updated_at = ? WHERE id = ? AND status = 'removed'").run(now, l.id);
+    restored.push(l);
+  }
+  // Said once, in the next session of the project (anywhere for what is not a project's).
+  const own = removed.filter((l) => l.origin_session !== 'native' && !inWorkingTree(l.path));
+  for (const project of new Set(own.map((l) => (l.scope === 'project' ? l.project || null : null)))) {
+    const titles = own.filter((l) => (l.scope === 'project' ? l.project || null : null) === project).map((l) => l.title);
+    db.prepare('INSERT INTO notices (ts, session_id, project, text) VALUES (?, ?, ?, ?)').run(now, 'maintenance', project,
+      `🗑 deleted outside Ouroboros, now marked as removed: ${titles.slice(0, 5).join('; ')}${titles.length > 5 ? ` (+${titles.length - 5})` : ''}. Not saved again unless you ask or something new comes up.`);
+  }
+  return { removed, restored };
+}
+
+/**
+ * A learning Ouroboros created and whose file was deleted since, that says what a new
+ * item says: the user (or Claude Code, tidying) took it out, so saving it again needs a
+ * reason. Same project or valid everywhere, within REMOVED_MEMORY_DAYS.
+ */
+export function removedBefore(db, item, now = Date.now()) {
+  if (item.op === 'patch') return null;
+  const probe = `${slug(item.name || item.title || item.prefText || '')} ${item.title || ''} ${item.prefText || ''}`.trim();
+  if (probe.length < 8) return null;
+  const project = projectIdFor(item.projectDir);
+  const rows = db.prepare(`
+    SELECT id, name, title, path, updated_at FROM learnings
+    WHERE status = 'removed' AND origin_session IS NOT 'native' AND updated_at >= ? AND (scope = 'global' OR project IS NULL OR project = ?)`)
+    .all(now - REMOVED_MEMORY_DAYS * 86_400_000, project).filter((r) => !inWorkingTree(r.path));
+  return findSimilar(rows.map((r) => ({ ...r, text: `${r.name} ${r.title}` })), probe);
+}
+
 // ---------- inventory for the learn skill ----------
 
 export function inventoryText(db, { cwd, memoryDir }) {
@@ -1117,7 +1284,7 @@ export function inventoryText(db, { cwd, memoryDir }) {
 }
 
 export function summarize(results) {
-  const icon = { created: '📝 learned', patched: '📝 updated', queued: '⏳ queued', duplicate: '↺ duplicate', has_owner: '↪ has an owner', rejected: '✗ rejected', over_budget: '⚠ over budget', error: '✗ error' };
+  const icon = { created: '📝 learned', patched: '📝 updated', queued: '⏳ queued', duplicate: '↺ duplicate', has_owner: '↪ has an owner', was_removed: '↺ deleted before', rejected: '✗ rejected', over_budget: '⚠ over budget', error: '✗ error' };
   return results.map((r) => `${icon[r.status] || r.status}: ${r.title || ''}${r.reason ? ` — ${r.reason}` : ''}${r.warning ? ` (${r.warning})` : ''}${r.path ? ` → ${r.path}` : ''}`).join('\n');
 }
 
@@ -1187,10 +1354,6 @@ async function main() {
       console.log(inventoryText(db, { cwd: args.cwd || process.cwd(), memoryDir: args['memory-dir'] }));
       const state = typeof args.session === 'string' ? sessionStateText(db, args.session, { audience: 'claude' }) : '';
       if (state) console.log(`\n## This session so far\n${state}`);
-    } else if (cmd === 'confirm') {
-      console.log(JSON.stringify(confirm(db, args.id), null, 2));
-    } else if (cmd === 'approve' || cmd === 'reject') {
-      console.log(JSON.stringify(decideQueued(db, Number(args.id), cmd === 'approve'), null, 2));
     } else if (cmd === 'enabled-at') {
       console.log(getMeta(db, 'learning_enabled_at') ?? '');
     } else {

@@ -62,8 +62,8 @@ export function removedWords(old, next) {
 /**
  * Apply edits in order to `text`, keeping only the safe ones. An edit is either
  * { old, new } (an exact fragment found once, replaced) or { append, section }.
- * Rules: the fragment exists exactly once; an edit that is not a pure insertion (the
- * old fragment must survive intact inside the new text) rewrites existing text, so it
+ * Rules: the fragment exists exactly once; an edit that is not a pure insertion (it
+ * only adds whole lines: every existing line of the file stays as it was) rewrites existing text, so it
  * is a correction: it is marked `corrects` (which always waits for the user) and may
  * remove only a bounded amount; the frontmatter and headings are protected; the text
  * an edit adds may hold no secret; the file grows by a bounded amount.
@@ -105,8 +105,12 @@ export function applyEdits(text, edits) {
       const count = cur.split(old).length - 1;
       if (count !== 1) { reject(count ? `the fragment appears ${count} times` : 'the fragment is not in the file'); continue; }
       if (old === repl) { reject('changes nothing'); continue; }
-      if (isInsertion(old, repl)) {
-        added = repl.replace(old.trimEnd(), '');
+      next = cur.replace(old, () => repl);
+      // Judged on the file, not on the fragment: an addition leaves every existing line
+      // as it was. Words put inside a line ("run X" -> "do not run X", a clause appended
+      // to a rule) change what the file says even though the old words are still there.
+      if (isInsertion(cur, next)) {
+        added = addedText(cur, next);
       } else {
         // Rewriting text (even one word: "Run X" -> "Never run X") changes what the file
         // says: only a correction may do it, and a correction waits for the user.
@@ -115,7 +119,6 @@ export function applyEdits(text, edits) {
         if (!e.corrects) edit = { ...e, corrects: true, rewrites: true };
         added = addedText(old, repl) || repl;
       }
-      next = cur.replace(old, () => repl);
     }
     if (!describes && frontmatter(next) !== frontmatter(cur)) { reject('changes the frontmatter'); continue; }
     if (headingCount(next) < headingCount(cur)) { reject('removes a heading'); continue; }
