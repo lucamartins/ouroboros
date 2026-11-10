@@ -80,13 +80,13 @@ test('the state lists what the session saved, queued and left open; observations
 
   const forClaude = state.sessionStateText(db, sid, { audience: 'claude' });
   assert.match(forClaude, new RegExp(`\\[${saved.id}\\] saved → .*deploys-go-through-release-branches\\.md: Deploys go through release branches`));
-  assert.match(forClaude, /\[c\d+\] waiting for approval → .*CLAUDE\.md: Prefers small pull requests/);
+  assert.match(forClaude, /\[c\d+\] waiting for approval → .*CLAUDE\.md: Prefers small pull requests$/m, 'a title that only repeats the text is said once');
   assert.match(forClaude, new RegExp(`\\[o${obs.id}\\] The staging deploy`));
   assert.match(state.sessionStateText(db, sid), /set "refines" to its \[ref\]/);
   assert.equal(state.sessionStateText(db, 'another-session'), '');
 
   const inv = spawnSync(process.execPath, ['--no-warnings', path.join(root, 'scripts', 'curator.mjs'), 'inventory', '--cwd', proj, '--session', sid], { encoding: 'utf8' });
-  assert.match(inv.stdout, /## This session so far\nAlready handled by earlier reviews of this session:/);
+  assert.match(inv.stdout, /## This session so far\nAlready handled this session \(do not save again/);
 
   assert.match(cli({ cwd: proj, session_id: sid, actor: 'inloop', items: [], resolve: [`o${obs.id}`] }).stdout, /settled: 1/);
   assert.equal(state.openObservations(db, sid).length, 0);
@@ -95,7 +95,13 @@ test('the state lists what the session saved, queued and left open; observations
 test('the periodic review request and the end-of-session prompt carry the state and the recorded recoveries', async () => {
   const { reviewRequest } = await import('../scripts/hook.mjs');
   const text = state.sessionStateText(db, 'sess-state-0001', { audience: 'claude' });
-  assert.match(reviewRequest({ from: 11, to: 13, trigger: 'periodic', state: text }), /Already handled by earlier reviews of this session:[\s\S]*pass it in "open"/);
+  const request = reviewRequest({ from: 11, to: 13, trigger: 'periodic', state: text });
+  assert.match(request, /^Ouroboros learning review \(periodic\): user turns 11–13 only\. Follow "Periodic reviews"/);
+  assert.match(request, /Already handled this session[\s\S]*\nEnd with exactly this line: \[ouroboros\] reviewed=/);
+  // Claude Code prints the request to the user at every review: it stays short.
+  assert.ok(request.split('\n').length <= 8, request);
+  const skill = fs.readFileSync(path.join(root, 'skills', 'learn', 'SKILL.md'), 'utf8');
+  assert.match(skill, /Do not save again what is listed as handled/, 'what left the request lives in the skill');
   const prompt = worker.learnPrompt({ digest: 'd', inventory: 'i', state: 'STATE', signals: '- Bash:pnpm test failed 3x before working' });
   assert.match(prompt, /This session so far:\nSTATE\n/);
   assert.match(prompt, /failed, then worked[\s\S]*pnpm test failed 3x/);
