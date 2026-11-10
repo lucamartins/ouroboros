@@ -30,7 +30,8 @@ process.stdin.on('end', () => {
     }
     const last = file.split('\n').filter((l) => l.trim() && !l.startsWith('---')).pop();
     if (adds.length && last) edits.push({ old: last, new: `${last}\n${adds.map((c) => c.text.split('\n')[0].trim()).join('\n')}`, claims: adds.map((c) => c.id) });
-    structured = { claims: status, edits };
+    const desc = claims.map((c) => /DESC:(.+)$/m.exec(c.text)?.[1]?.trim()).find(Boolean);
+    structured = { claims: status, edits, ...(desc ? { description: desc } : {}) };
   } else if (schema.includes('"verdicts"')) {
     // Screen: DROPME -> covered, MERGEME -> merged into the first proposal,
     // ROUTEME:<file> -> routed to that owner, FIXME -> a fix suggestion, NOVERDICT -> no

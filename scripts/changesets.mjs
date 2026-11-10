@@ -6,7 +6,8 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { appendToSection, containsSecret, createdByOuroboros, needsApproval, writeText } from './curator.mjs';
+import { appendToSection, containsSecret, createdByOuroboros, needsApproval, ownUntouched, setDescription, writeText } from './curator.mjs';
+import { parseFrontmatter } from './inventory.mjs';
 import { knowledgeKind } from './knowledge.mjs';
 import { projectIdFor } from './paths.mjs';
 import { addedText, isInsertion } from './textdiff.mjs';
@@ -16,6 +17,7 @@ export const MAX_GROWTH_CHARS = 6000;
 /** A correcting edit may remove at most this much text; other edits only add. */
 export const MAX_REMOVED_CHARS = 800;
 const MIN_OLD_CHARS = 4;
+const MAX_DESCRIPTION_CHARS = 300;
 
 /**
  * A knowledge file as people name it: a skill's SKILL.md by the skill ("acme-local"), a
@@ -79,7 +81,20 @@ export function applyEdits(text, edits) {
     let next;
     let edit = e;
     let added;
-    if (e.append !== undefined) {
+    let describes = false;
+    if (e.description !== undefined) {
+      // The one frontmatter value an edit may change: a memory's or skill's one-line
+      // description (a memory's line in MEMORY.md follows it). Always a correction.
+      const d = String(e.description || '').replace(/\s+/g, ' ').trim();
+      if (!d || d.length > MAX_DESCRIPTION_CHARS) { reject('the description is empty or too long'); continue; }
+      next = setDescription(cur, d);
+      if (next === cur) { reject('changes nothing'); continue; }
+      const rest = (t) => { const { description, ...other } = parseFrontmatter(t).data; return JSON.stringify(other); };
+      if (rest(next) !== rest(cur)) { reject('changes the frontmatter'); continue; }
+      edit = { ...e, corrects: true, ...(e.corrects ? {} : { rewrites: true }) };
+      added = d;
+      describes = true;
+    } else if (e.append !== undefined) {
       if (!String(e.append || '').trim()) { reject('empty addition'); continue; }
       next = appendToSection(cur, e.section, e.append);
       added = String(e.append);
@@ -102,7 +117,7 @@ export function applyEdits(text, edits) {
       }
       next = cur.replace(old, () => repl);
     }
-    if (frontmatter(next) !== frontmatter(cur)) { reject('changes the frontmatter'); continue; }
+    if (!describes && frontmatter(next) !== frontmatter(cur)) { reject('changes the frontmatter'); continue; }
     if (headingCount(next) < headingCount(cur)) { reject('removes a heading'); continue; }
     if (containsSecret(added)) { reject('adds something that looks like a secret'); continue; }
     cur = next;
@@ -157,7 +172,7 @@ export function changesetNeedsApproval(db, cs, actor, autonomy) {
   const kind = knowledgeKind(cs.file);
   // A learned-preferences rule file is Ouroboros's own: adding to it is not a change to a file a person wrote.
   const ownFile = kind === 'rules' && createdByOuroboros(db, cs.file);
-  return needsApproval({ op: 'patch', target: cs.file, kind: kind === 'skill' ? 'skill' : 'memory', corrects: !!cs.corrects, confidence, ownFile }, actor, autonomy);
+  return needsApproval({ op: 'patch', target: cs.file, kind: kind === 'skill' ? 'skill' : 'memory', corrects: !!cs.corrects, confidence, ownFile, ownUntouched: ownUntouched(db, cs.file) }, actor, autonomy);
 }
 
 /**
@@ -185,6 +200,7 @@ export function applyChangeset(db, id, { actor = 'manual' } = {}) {
     title: claims.length === 1 ? claims[0].title : `${fileDisplayName(cs.file)}: ${claims.length} updates`,
     why: claims.map((c) => `- ${c.title}: ${String(c.claim || c.summary || '').replace(/\s+/g, ' ').slice(0, 300)}${c.evidence ? ` (${String(c.evidence).replace(/\s+/g, ' ').slice(0, 160)})` : ''}`).join('\n'),
     confidence: claims.length ? Math.max(...claims.map((c) => c.confidence ?? 0.6)) : 0.6,
+    description: applied.find((e) => e.description !== undefined)?.description,
   });
   if (r.status === 'stale') {
     db.prepare("UPDATE changesets SET status = 'stale', note = ? WHERE id = ?").run(r.reason, id);

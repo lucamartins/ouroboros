@@ -2,6 +2,11 @@
 
 All notable changes to Ouroboros. Versions follow [semantic versioning](https://semver.org/) (pre-1.0: a minor version may change behavior). The reasoning behind each change is in [DESIGN.md](DESIGN.md).
 
+## 0.21.0 — 2026-11-10
+
+- In `auto`, Ouroboros refines a memory it wrote itself without asking, as long as you never edited that file: a later turn or session that extends or corrects it updates it directly (undoable). A file you touched by hand, anything you wrote, and every CLAUDE.md or rule file of yours still wait for approval; `hybrid` and `queue` are unchanged.
+- When a memory is refined, its one-line description and its line in `MEMORY.md` are updated with it, so the rule Claude actually reads is the current one.
+
 ## 0.20.0 — 2026-11-10
 
 - Fewer needless early reviews: a "recovery" is now a command that failed and then worked within the same turn, and retrying an edit until it applies no longer triggers one.

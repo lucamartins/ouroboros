@@ -61,6 +61,7 @@ export const EDITOR_SCHEMA = {
         },
       },
     },
+    description: { type: 'string' },
   },
 };
 
@@ -128,6 +129,7 @@ EDITS:
 - Write as the file does: same language, tone and density, as short as its other entries. No dates, PR or issue numbers, session details or people's names unless the file already does that.
 - Only "corrects" edits may remove text, and only the wrong part. Never touch the frontmatter (the --- block at the top).
 - One edit may serve several claims: list their ids in "claims". Never write two edits that touch the same text.
+- Only when the FILE is a memory note and your edits make its "description:" line (the one-line summary in the frontmatter, also shown in the memory index) wrong or incomplete: return "description" with the new one line. It is the only part of the frontmatter that may change, and you never edit it through "edits". Otherwise omit it.
 - Claims that say the same thing are not in conflict: give them the same status and implement them with one edit listing all their ids.
 - No edit for covered, contradicted or conflict claims. Answer once for every claim id.
 ${view.partial ? '- The file is large: you see its outline and the parts related to the claims. Copy "old" only from what you see.\n' : ''}
@@ -199,6 +201,13 @@ export async function composeFile({ file, claims, cwd, model }) {
     claims: (e.claims || []).filter((id) => claims.some((c) => c.id === id)),
     corrects: (e.claims || []).some((id) => status.get(id)?.status === 'corrects'),
   }));
+  // A new one-line description for a memory whose body the edits change.
+  const described = String(out.description || '').replace(/\s+/g, ' ').trim();
+  const writing = claims.filter((c) => writes(c.id)).map((c) => c.id);
+  if (described && kind === 'memory' && writing.length && edits.some((e) => e.claims.some(writes))) {
+    const oldLine = /^description[ \t]*:.*$/m.exec(base.split(/\r?\n---/)[0] || '')?.[0] || '';
+    edits.push({ description: described, old: oldLine, new: `description: ${described}`, why: 'the summary follows the change', claims: writing, corrects: true });
+  }
   const justified = edits.filter((e) => e.claims.some(writes));
   const unjustified = edits.filter((e) => !e.claims.some(writes)).map((edit) => ({ edit, reason: 'no learning justifies it' }));
   const { applied, rejected } = applyEdits(base, justified);

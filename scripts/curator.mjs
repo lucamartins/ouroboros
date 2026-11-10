@@ -233,7 +233,7 @@ export function indexEntriesIn(dir) {
 }
 
 /** Replaces the top-level `description:` value, including any continuation lines (block or folded scalars). */
-function setDescription(text, description) {
+export function setDescription(text, description) {
   const fm = /^(﻿?---[ \t]*\r?\n)([\s\S]*?\r?\n)(---[ \t]*(?:\r?\n|$))/.exec(text);
   if (!fm) return text;
   const lines = fm[2].split(/(?<=\n)/);
@@ -252,6 +252,7 @@ function setDescription(text, description) {
 function normalizeItem(raw, payload) {
   const item = { ...raw };
   delete item.ownFile; // set by code only (a file Ouroboros created), never by a proposal
+  delete item.ownUntouched;
   item.op = item.op === 'patch' ? 'patch' : 'create';
   // "profile" is the kind used before global facts moved to the global CLAUDE.md.
   item.kind = ['memory', 'skill', 'global', 'preference'].includes(item.kind) ? item.kind : item.kind === 'profile' ? 'global' : 'memory';
@@ -482,6 +483,19 @@ export function createdByOuroboros(db, file) {
   return !!db.prepare("SELECT 1 FROM learnings WHERE lower(path) = lower(?) AND status = 'active' AND origin_session IS NOT 'native'").get(path.resolve(String(file)));
 }
 
+/**
+ * Whether a memory is still exactly what Ouroboros wrote: it created the file, and the
+ * file's text is the result of its own last write (the user never edited it by hand).
+ * Refining such a memory is Ouroboros rewriting its own words, not the user's, so in
+ * `auto` it needs no approval; one hand edit and the file is the user's again.
+ */
+export function ownUntouched(db, file) {
+  const target = path.resolve(String(file));
+  if (knowledgeKind(target) !== 'memory' || !createdByOuroboros(db, target)) return false;
+  const last = db.prepare('SELECT after FROM writes WHERE lower(file) = lower(?) AND reverted_at IS NULL ORDER BY id DESC LIMIT 1').get(target);
+  return !!last && last.after !== null && last.after === readOrNull(target);
+}
+
 /** Resolve the file a patch targets: learning id, a knowledge file path, or a name. */
 function resolvePatchTarget(db, item, settings, payload) {
   const target = String(item.target || '').trim();
@@ -643,8 +657,10 @@ function commitText(db, batch, t, after, item) {
 export function needsApproval(item, actor, autonomy) {
   if (actor === 'manual') return false;
   // Corrections of existing knowledge, and changes to rule files or CLAUDE.md (written
-  // by people, versioned with the project), always wait for the user.
-  if (item.corrects) return true;
+  // by people, versioned with the project), always wait for the user. One exception, in
+  // `auto` only: a memory Ouroboros created and nobody edited since (`ownUntouched`, set
+  // by code) may be refined without asking; the ledger undoes it.
+  if (item.corrects && !(item.ownUntouched && autonomy === 'auto')) return true;
   // (a rule file Ouroboros created for learned preferences is its own: `ownFile`)
   if (!item.ownFile && item.op === 'patch' && item.target && path.isAbsolute(String(item.target)) && ['rules', 'instructions'].includes(knowledgeKind(item.target))) return true;
   if (actor === 'requested') return false;
@@ -665,7 +681,7 @@ function waitReason(item, actor, autonomy) {
  * Write a validated changeset result (the whole new text of one knowledge file) in
  * its own transaction, through the ledger so it can be undone.
  */
-export function writeText(db, { file, after, title, why = null, confidence = 0.6, trigger = 'session_end', actor = 'background', sessionId = null, expectBefore }) {
+export function writeText(db, { file, after, title, why = null, confidence = 0.6, trigger = 'session_end', actor = 'background', sessionId = null, expectBefore, description = undefined }) {
   const kind = knowledgeKind(file);
   if (!PATCHABLE.has(kind)) return { status: 'rejected', reason: 'only memory, skill, rule and CLAUDE.md files can be changed' };
   const batch = new Batch(db, { actor, sessionId, title, why });
@@ -678,7 +694,8 @@ export function writeText(db, { file, after, title, why = null, confidence = 0.6
     if (expectBefore !== undefined && before !== expectBefore) return refuse('stale', 'the file changed while the change was being prepared');
     if (after === before) return refuse('rejected', 'changes nothing');
     if (containsSecret(addedText(before, after))) return refuse('rejected', 'would add something that looks like a secret');
-    const result = commitText(db, batch, { file, kind }, after, { title, confidence, trigger });
+    // A new description also replaces the memory's line in MEMORY.md, in the same batch.
+    const result = commitText(db, batch, { file, kind }, after, { title, confidence, trigger, description });
     batch.commit();
     db.exec('COMMIT');
     return { ...result, batch: batch.id };
@@ -773,6 +790,7 @@ export function apply(db, payload, { actor = 'manual', autonomy = 'auto', ownerC
     // Only code says a rule file is Ouroboros's own (one it created for learned preferences).
     if (item.op === 'patch' && item.target && path.isAbsolute(String(item.target))) {
       item.ownFile = knowledgeKind(item.target) === 'rules' && createdByOuroboros(db, item.target);
+      item.ownUntouched = ownUntouched(db, item.target);
     }
     // In session nothing screens a new item against the files that own its topic, so the
     // curator looks: when one speaks about the same thing, Claude reads it and patches it
@@ -791,6 +809,10 @@ export function apply(db, payload, { actor = 'manual', autonomy = 'auto', ownerC
     }
     // A patch that rewrites existing text is a correction, whatever the proposer said.
     if (!item.corrects && rewritesText(db, item, settings, payload || {})) item.corrects = true;
+    if (item.corrects && item.op === 'patch' && !item.ownUntouched) {
+      const t = resolvePatchTarget(db, item, settings, payload || {});
+      if (t?.file) item.ownUntouched = ownUntouched(db, t.file);
+    }
     if (needsApproval(item, actor, autonomy)) {
       // Dry run first: only proposals that would actually be written are queued
       // (duplicates of saved items, rejections and over-budget answers come back as is).

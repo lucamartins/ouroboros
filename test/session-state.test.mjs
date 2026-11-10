@@ -128,3 +128,51 @@ test('an item that refines what the session already saved is folded into that fi
   assert.match(fs.readFileSync(saved.file, 'utf8'), /never from main\nHotfixes deploy from hotfix\/\* branches/);
   assert.equal(fs.readdirSync(path.dirname(saved.file)).filter((f) => /hotfix/.test(f)).length, 0, 'no second memory');
 });
+
+test('refining a memory Ouroboros wrote and nobody edited needs no approval in auto, and its description and index line follow', async () => {
+  const { tidyQueue } = await import('../scripts/evaluate.mjs');
+  const sid = 'sess-state-0001';
+  const saved = state.sessionLearnings(db, sid).find((l) => l.status === 'saved' && l.op === 'create');
+  const index = path.join(path.dirname(saved.file), 'MEMORY.md');
+  assert.equal(curator.ownUntouched(db, saved.file), true);
+  const propose = (claim, autonomy = 'auto') => {
+    const item = { op: 'create', kind: 'memory', scope: 'project', memory_type: 'project', title: 'Deploy branches changed', description: claim, confidence: 0.8, refines: saved.ref };
+    db.prepare(`INSERT INTO candidates (review_id, session_id, project, kind, scope, title, summary, confidence, outcome, payload, cwd, ts)
+      VALUES (0, ?, ?, 'memory', 'project', ?, ?, 0.8, 'pending', ?, ?, ?)`).run(sid, paths.projectKey(proj), item.title, claim,
+      JSON.stringify({ item, cwd: proj, trigger: 'session_end', actor: 'background', autonomy }), proj, Date.now());
+    return tidyQueue(db, { autonomy });
+  };
+  // A rewrite of the body plus a new one-line description: written at once.
+  const r = await propose('FIX:never from main=>never from main or develop\nDESC:Where deploys and hotfixes start from, and where they never do');
+  assert.equal(r.patched, 1);
+  const text = fs.readFileSync(saved.file, 'utf8');
+  assert.match(text, /never from main or develop/);
+  assert.match(text, /^description: Where deploys and hotfixes start from, and where they never do$/m);
+  assert.match(text, /^name: /m, 'the rest of the frontmatter is intact');
+  assert.match(fs.readFileSync(index, 'utf8'), /\(deploys-go-through-release-branches\.md\) — Where deploys and hotfixes start from, and where they never do/);
+  // Undo takes back the file and its index line together.
+  assert.equal(curator.undo(db, { last: true }).status, 'undone');
+  assert.doesNotMatch(fs.readFileSync(saved.file, 'utf8'), /develop/);
+  assert.match(fs.readFileSync(index, 'utf8'), /— Where deploys start from/);
+
+  // Outside auto, and once the user has edited the file by hand, a rewrite waits as before.
+  assert.equal((await propose('FIX:never from main=>never from main or staging', 'hybrid')).patched, 0);
+  for (const c of db.prepare("SELECT id FROM candidates WHERE outcome = 'queued' AND changeset_id IS NOT NULL").all()) curator.decideQueued(db, c.id, false);
+  fs.appendFileSync(saved.file, '\nA note the user added by hand.\n');
+  assert.equal(curator.ownUntouched(db, saved.file), false);
+  const held = await propose('FIX:never from main=>never from main or trunk');
+  assert.deepEqual([held.patched, held.queued], [0, 1]);
+  assert.doesNotMatch(fs.readFileSync(saved.file, 'utf8'), /trunk/);
+});
+
+test('a description edit cannot touch anything else in the frontmatter', async () => {
+  const { applyEdits } = await import('../scripts/changesets.mjs');
+  const text = '---\nname: x\ndescription: Old summary\nmetadata:\n  type: feedback\n---\n\nBody line here.\n';
+  const ok = applyEdits(text, [{ description: 'New summary' }]);
+  assert.equal(ok.rejected.length, 0);
+  assert.match(ok.after, /^description: New summary$/m);
+  assert.equal(ok.applied[0].corrects, true, 'always a correction');
+  assert.match(ok.after, /name: x\n[\s\S]*metadata:\n  type: feedback/);
+  assert.equal(applyEdits(text, [{ description: '' }]).rejected.length, 1);
+  assert.equal(applyEdits(text, [{ old: 'name: x', new: 'name: y' }]).rejected[0].reason, 'changes the frontmatter');
+});
