@@ -12,6 +12,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { options } from './config.mjs';
+import { destinationsText } from './router.mjs';
 import { rubricText } from './rubric.mjs';
 import { isExcluded } from './hook.mjs';
 import { logError, monthSpend, openDb } from './db.mjs';
@@ -122,7 +123,9 @@ export const LEARN_SCHEMA = {
         additionalProperties: false,
         required: ['kind', 'title', 'confidence', 'evidence'],
         properties: {
-          kind: { type: 'string', enum: ['global', 'memory', 'skill'] },
+          kind: { type: 'string', enum: ['global', 'preference', 'memory', 'skill'] },
+          topic: { type: 'string' },
+          paths: { type: 'array', items: { type: 'string' } },
           scope: { type: 'string', enum: ['global', 'project'] },
           memory_type: { type: 'string', enum: ['feedback', 'project', 'reference'] },
           title: { type: 'string' },
@@ -146,7 +149,8 @@ export function learnPrompt({ digest, inventory, part = null, lang = options().l
 1. "corrections": every user turn that pushes back on or redirects something the assistant did, said or assumed (explicit or implicit). Not corrections: new tasks, follow-ups, answers to questions, approvals, first-time standing instructions. Quote briefly with the USER # number.
 
 2. "items": what to save for future sessions (at most 5; an empty list is a good answer). Each item is written as-is, so make it ready to use:
-   - kind "global": one short fact valid on every project (who the user is, how they like to work, OS/shell/tool facts). Put the fact in "text" (one sentence); it is proposed as an addition to the user's global CLAUDE.md.
+   - kind "preference": one short preference or fact valid on every project that only matters for one topic or one kind of file. Put it in "text" (one sentence) and name the "topic" in one or two words ("commits", "code review", "python"); add "paths" (globs) when it only matters with certain files.
+   - kind "global": one short fact relevant in every session whatever the task (who the user is, how they work in general, OS/shell facts). Put it in "text" (one sentence); it is proposed as an addition to the user's global CLAUDE.md. Prefer "preference" whenever the fact has a topic.
    - kind "memory": a fact about this project. memory_type "feedback" (how to work here), "project" (decision, convention) or "reference" (pointer to an external resource). Give "title", a one-line "description", and a "body" with the fact plus "**Why:**" and "**How to apply:**" lines.
    - kind "skill": a reusable procedure (multi-step workflow, the working path found after errors, an approach the user corrected). scope "global" if it works anywhere, "project" otherwise. Give "title", a "description" of at most 250 characters that says when to use it, and a "body" in Markdown with steps and pitfalls.
    - Keep an item only if it passes every rule of the rubric below. Proposing nothing is better than proposing noise; a later knowledge check drops what fails.
@@ -158,6 +162,9 @@ export function learnPrompt({ digest, inventory, part = null, lang = options().l
 
 Rubric (what is worth remembering):
 ${rubricText()}
+
+Where a learning belongs (pick the first that fits):
+${destinationsText()}
 
 Already saved (inventory):
 ${inventory}

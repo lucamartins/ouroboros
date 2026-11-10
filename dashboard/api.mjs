@@ -162,7 +162,7 @@ const HITS_SQL = `
     (e.kind = 'memory_read' AND lower(e.target) = lower(l.path)))
   WHERE e.ts >= ? GROUP BY e.session_id`;
 
-const GROUP_LABEL = { 'new:memory': 'New memories', 'new:skill': 'New skills', fixes: 'Suggested fixes' };
+const GROUP_LABEL = { 'new:memory': 'New memories', 'new:skill': 'New skills', 'new:preference': 'New preferences', fixes: 'Suggested fixes' };
 
 export function createApi(db) {
   // ---------- projects ----------

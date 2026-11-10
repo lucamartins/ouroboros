@@ -83,7 +83,9 @@ export function knowledgeKind(file) {
   if (cls) return cls;
   // Reference files a skill points to (skills/<name>/reference/x.md) belong to the skill.
   if (/[\\/]skills[\\/][^\\/]+[\\/].+\.md$/i.test(file)) return 'skill';
-  return /[\\/]\.claude[\\/]rules[\\/][^\\/]+\.md$/i.test(file) ? 'rules' : 'source';
+  if (/[\\/]\.claude[\\/]rules[\\/][^\\/]+\.md$/i.test(file)) return 'rules';
+  // The user's own rules live in the config folder, wherever it is.
+  return path.resolve(path.dirname(file)).toLowerCase() === path.join(claudeDir(), 'rules').toLowerCase() && /\.md$/i.test(file) ? 'rules' : 'source';
 }
 
 /** SKILL.md plus the markdown reference files next to it (one folder deep). */
@@ -135,6 +137,8 @@ export function knowledgeFiles(cwd) {
     for (const f of safeList(path.join(root, '.github', 'workflows'))) if (/\.ya?ml$/i.test(f.name)) add(path.join(root, '.github', 'workflows', f.name));
     for (const name of SOURCE_FILES) add(path.join(root, name));
   }
+  // The user's own rules (loaded in every project, or with the files their `paths` name).
+  for (const f of safeList(path.join(claudeDir(), 'rules'))) if (f.isFile() && f.name.endsWith('.md')) add(path.join(claudeDir(), 'rules', f.name));
   const personal = path.join(claudeDir(), 'skills');
   for (const d of safeList(personal)) {
     // Skills installed as junctions/symlinks report as links, not directories.

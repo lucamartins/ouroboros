@@ -2,7 +2,7 @@
 
 > A Claude Code plugin that learns from your sessions on its own: it saves memories and creates/refines skills without being asked, in the spirit of Nous Research's Hermes Agent, and shows on a local dashboard what it learned, how much that is being used and what it costs.
 
-Status: v0.15.0 — every phase implemented (§13), plus the learning evaluation (§7.2), the v0.8 mechanism review (§7.4), the inbox reviewed in the conversation (§9.3), a dashboard that scales (§9.1: server-side paging and filters, the inbox grouped by project and file, page state in the URL, one project filter), a knowledge graph (§9.4, read-only, drawn with a vendored D3 subset since v0.13) and a session learning state shared by every review of a session (§6.5, v0.15). Next: one router for where a learning belongs, then measure the loop's value in real use (§7.4). Design decisions are summarized in [§12](#12-decisions).
+Status: v0.16.0 — every phase implemented (§13), plus the learning evaluation (§7.2), the v0.8 mechanism review (§7.4), the inbox reviewed in the conversation (§9.3), a dashboard that scales (§9.1: server-side paging and filters, the inbox grouped by project and file, page state in the URL, one project filter), a knowledge graph (§9.4, read-only, drawn with a vendored D3 subset since v0.13) and a session learning state shared by every review of a session (§6.5, v0.15) and one order of destinations for every path, with a home for preferences that matter for one topic or one kind of file (§7.5, v0.16). Next: measure the loop's value in real use (§7.4). Design decisions are summarized in [§12](#12-decisions).
 
 ---
 
@@ -59,7 +59,9 @@ Dashboard (node, 127.0.0.1) ◄── events.db + scan of memories/skills + tran
 
 | Content | Location | Why |
 |---|---|---|
-| Facts valid on every project (who the user is, how they work, OS/shell/tool facts) | the user's global `~/.claude/CLAUDE.md`, as additions under the section they belong to (§3.2) | Claude Code already loads it in every session; one global file instead of two |
+| Facts relevant in every session whatever the task (who the user is, how they work, OS/shell facts) | the user's global `~/.claude/CLAUDE.md`, as additions under the section they belong to (§3.2) | Claude Code already loads it in every session; one global file instead of two |
+| Preferences valid on every project that matter for one topic | `~/.claude/skills/learned-prefs-<topic>/SKILL.md`, a personal skill only the model invokes (§7.5) | Loaded when the topic comes up, not in every session |
+| Preferences valid on every project that matter for certain files | `~/.claude/rules/learned-<topic>.md`, a user rule with `paths` (§7.5) | Loaded with the files it is about |
 | Advanced config (routing, limits) | `~/.ouroboros/config.json` | Structures `userConfig` doesn't express well |
 | Telemetry + ledger | `${CLAUDE_PLUGIN_DATA}/events.db` | Plugin state; persists across updates |
 | Project facts | native auto memory (`~/.claude/projects/<proj>/memory/*.md` + `MEMORY.md`), resolved as Claude Code does: one directory per repository (its worktrees and subfolders share it), honoring `autoMemoryDirectory` (local, project or user settings) and `CLAUDE_CODE_PROJECT_DIR_NAME`; `paths.memoryDirFor` is the only place that computes it | Cooperates with the native mechanism instead of competing |
@@ -372,6 +374,22 @@ A full review of the technical mechanisms against the quality bar (a healthy, co
 
 **Open question**: the loop's value is not yet shown by the correction-rate metric (§9.2) on a large enough sample. Measuring that comes ahead of new mechanisms.
 
+### 7.5 Routing: where a learning belongs (v0.16)
+
+Until v0.15 *where* was decided before anything checked it, and in three ways: in session Claude picked a `kind` from a table in the `learn` skill, the curator mapped it mechanically (anything global became a line for the global CLAUDE.md), and only the end-of-session path had a screen that knew the owners. So "remember that I prefer X", the most common explicit request, landed by default in the one destination that costs context in every session and always waits for approval, even when X was about commits and a commit skill existed.
+
+**One order, everywhere** (`scripts/router.mjs`, `DESTINATIONS`, injected verbatim into the reviewer and the screen and kept in step with the `learn` skill by `test/router.test.mjs`), most specific first:
+
+1. the skill, rule file or CLAUDE.md that already owns the topic (a patch);
+2. a project memory, when the fact only holds in one project;
+3. a preference valid everywhere that matters for certain files: a user rule with `paths`;
+4. a preference valid everywhere that matters for one topic: a personal skill for that topic;
+5. the global CLAUDE.md, only for what is relevant in every session whatever the task.
+
+**A home for topical preferences** (kind `preference`, with `topic` and optional `paths`). Claude Code has no cross-project auto memory, a user rule without `paths` loads in every session like CLAUDE.md, and the only mechanism that loads by topic is a skill. So: with `paths`, the preference is a line in `~/.claude/rules/learned-<topic>.md` (frontmatter `paths`, loaded when Claude touches matching files); without, a line in `~/.claude/skills/learned-prefs-<topic>/SKILL.md` (`user-invocable: false`; its description says when it applies; counts against the learned-skill budget). Preferences on the same topic share one file: the first creates it, the next ones are additions, a repeated one is a `duplicate`. Both are files Ouroboros creates, so they follow the autonomy setting like any learned skill. A rule file is "written by people" only when a person wrote it: `needsApproval` exempts a rule file the ledger shows Ouroboros created (`ownFile`, set by code from `learnings`, never taken from a proposal); corrections still wait.
+
+**The owner check in session.** The end-of-session path has the screen; in session nothing looked. Now `curator.mjs apply` (the CLI the `learn` skill runs) searches the knowledge index for skills, rule files and CLAUDE.md files that speak about a new item (`findOwners`: BM25, and the excerpt must share at least three distinct terms and a third of the item's, so an unrelated file never blocks). A hit answers `has_owner` with the file and the excerpt; Claude reads it and re-submits a patch, or the same item with `owner_checked` when the topic belongs elsewhere. Same pattern as `duplicate`: the model merges, the curator guards. User-level rules (`~/.claude/rules`) are indexed as knowledge, which they were not.
+
 ## 8. Data model (`events.db`)
 
 ```sql
@@ -525,6 +543,7 @@ Phase 1 is read-only on purpose. Later, the same graph could drive behavior: wri
 | Reflection | Periodic in-loop review every N turns (+ early after a turn that recovered from repeated failures, at most every 5 turns) and an end-of-session background review of the unreviewed tail |
 | Context of a review | The session's learning state (what earlier reviews saved, queued, left open) goes to every review, and a tail gets the turns before its cursor as context; segments are still reviewed once (§6.5) |
 | Prompt classification | None — no regex or per-prompt classifier; corrections are counted by the reviews |
+| Where a learning goes | One order of destinations for every path: owner file, project memory, path-scoped user rule, topical preference skill, global CLAUDE.md last; in session the curator answers `has_owner` when a file already speaks about the topic (§7.5) |
 | Global facts | Additions to the user's global `~/.claude/CLAUDE.md`, with approval; the separate `~/.ouroboros/user.md` profile was retired in v0.12 (§3.2) |
 | Subagents | Full transcripts not reviewed; only `recovery` snippets captured inside subagents; workflow agents excluded |
 | In-Claude-Code panel | Not needed |
@@ -551,6 +570,7 @@ Phase 1 is read-only on purpose. Later, the same graph could drive behavior: wri
 | **v0.8 Mechanism review** | §7.4: insertion-only additions, one validator for both write paths, single-consumer evaluation queue, surgical profile writes, added-text secret check, line-level undo, one memory-dir resolver, ancestor CLAUDE.md files, long sessions in parts, budget guard on every call, notices per project, merges that must land; harder eval cases | 15/15 on the synthetic suite; every finding has a regression test |
 | **v0.9 Inbox in the conversation** | `/ouroboros:inbox`: list, show, preview, approve, reject, edit, resolve, done/dismiss; the dashboard uses the same module; SessionStart says when entries wait | Each kind of entry can be decided and edited in the conversation, with a regression test |
 | **v0.15 Session learning state** | §6.5: every review reads what the session's earlier reviews saved, queued and left open; open observations; tail context and end-preserving clipping; recoveries in the end-of-session prompt; refinements folded into the file they refine | A second review of a session patches what the first one saved, and a one-turn tail after a review is reviewed, each with a regression test |
+| **v0.16 Routing** | §7.5: `DESTINATIONS` shared by the skill, the reviewer and the screen; kind `preference` (topical skill or path-scoped user rule, written without approval); `has_owner` for items saved in session; user rules indexed | "Remember that I prefer X" about a topic lands in that topic's file, or in its owner, not in the global CLAUDE.md |
 | **v0.11 Knowledge graph** | Knowledge › Graph (§9.4): nodes and edges derived from the files and usage, broken links and unconnected items, filters and selection in the URL, an accessible side panel; read-only | The graph of a real setup's knowledge is legible at a glance and every relation it draws can be traced to a file or an event |
 | **v0.12 One global file** | §3.2: global facts go to `~/.claude/CLAUDE.md` through the editor and the inbox; `user.md`, its injection, budgets and consolidation removed; one-time migration of its bullets | Global facts land in the global CLAUDE.md after approval; a fact it already states is not proposed again |
 | **v0.13 Graph drawing** | Knowledge › Graph drawn with a vendored D3 subset: the layout unfolds on screen, drag pulls neighbors along, animated camera on select and Fit, curved colored edges with flow on focus, halos and a pulse on what Ouroboros changed; reduced motion respected | The graph feels alive while staying legible, with the same CSP, offline use and no install step |

@@ -368,7 +368,8 @@ export function showEntry(db, key, { project } = {}) {
   const item = p.item || {};
   const projectDir = item.project_dir || item.projectDir || c.cwd;
   const lands = item.op === 'patch' && item.target ? `${shortPath(item.target)} — ${describeFile(item.target)}`
-    : item.kind === 'skill' ? `a new ${item.scope === 'global' ? 'global ' : ''}skill${item.name ? ` "${item.name}"` : ''}${item.scope === 'global' ? '' : ` of project ${path.basename(projectDir || '')}`}`
+    : item.kind === 'preference' ? `a preference about "${item.topic || ''}"${item.paths?.length ? ` (loaded with ${[].concat(item.paths).join(', ')})` : ' (loaded when the topic comes up)'}`
+      : item.kind === 'skill' ? `a new ${item.scope === 'global' ? 'global ' : ''}skill${item.name ? ` "${item.name}"` : ''}${item.scope === 'global' ? '' : ` of project ${path.basename(projectDir || '')}`}`
       : `a new ${item.memory_type ? `${item.memory_type} ` : ''}memory of project ${path.basename(projectDir || '')} (${shortPath(memoryDirFor({ cwd: projectDir }))})`;
   const content = [
     item.name ? `name: ${item.name}` : null,

@@ -37,13 +37,21 @@ Apply the Ouroboros rubric. An item is saved only if it passes **every** rule:
 
 In practice: before saving, ask "would I act differently next time without this?" and "where does this topic already live?". Nothing qualifying is a fine outcome: say so in one line and stop.
 
-## 3. Choose the kind
+## 3. Choose where it belongs
 
-| What it is | kind | scope | Where it lands |
-|---|---|---|---|
-| Who the user is, how they like to work, a preference or fact valid on every project (OS/shell quirks, tool auth) | `global`, with `text` and the `section` (heading) it belongs under | global | an addition to the user's global CLAUDE.md (`~/.claude/CLAUDE.md`, loaded by Claude Code in every session) |
-| A fact about this project (convention, decision, pointer) | `memory` with `memory_type` `project`, `feedback` or `reference` | project | the project's auto-memory directory + `MEMORY.md` index |
-| A reusable procedure: multi-step workflow, the working path after errors, an approach the user corrected | `skill` | `global` if it works anywhere, `project` otherwise | `~/.claude/skills/learned-*` or the project's skills (routed by `~/.ouroboros/config.json`) |
+Pick the **first** destination that fits:
+
+<!-- destinations:start (generated from scripts/router.mjs; test/router.test.mjs keeps it in sync) -->
+1. A skill, rule file or CLAUDE.md that already owns the topic: add to it or correct it (a patch). Never a second copy next to an owner.
+2. A fact that only holds in one project: a project memory (kind "memory").
+3. A preference or fact valid on every project that only matters when working on certain files (a language, a file type): kind "preference" with "topic" and "paths" (globs such as "**/*.py"). It loads only with those files.
+4. A preference or fact valid on every project that only matters for one topic (commits, code review, testing, a tool): kind "preference" with "topic". It loads only when the topic comes up.
+5. Who the user is or how they work, relevant in EVERY session whatever the task (language of answers, OS and shell, how much to ask before acting): kind "global", an addition to the global CLAUDE.md, which costs context in every session and always waits for the user's approval. Use it only when no narrower destination fits.
+<!-- destinations:end -->
+
+A reusable **procedure** (a multi-step workflow, the working path after errors, an approach the user corrected) is a `skill`: `scope` `global` if it works anywhere (`~/.claude/skills/learned-*`), `project` otherwise (the project's skills, routed by `~/.ouroboros/config.json`).
+
+"Remember that I prefer X" is rarely a line for the global CLAUDE.md: ask what X is about. If a skill or rule owns that topic, patch it; if it only matters here, it is a project memory; if it matters everywhere but only for one topic or kind of file, it is a `preference`; only what matters in every session, whatever the task, is `global`.
 
 **Prefer patching** the owner of the topic (including skills, rule files and CLAUDE.md you didn't create) over creating a new item. A patch either **adds under a section** (`"section"` = a heading or bold topic of the target, `"append"` = the text) or **replaces** an exact `old` fragment with `new`, and/or replaces `description`. When verified evidence shows existing text is wrong, patch it with `"corrects": true`. Read the whole target first: if another line of it says the opposite, correct that line in the same patch so the file never contradicts itself. Skill reference files (e.g. `<skill>/reference/glossary.md`) are owners too. If the lesson is only a workaround for something the project could fix once (a generated file not ignored, a broken script), tell the user the fix instead of saving the workaround. To add, keep the old fragment intact inside the new text (or use `append`): any patch that rewrites existing text, even one word, counts as a correction. A global fact already in the global CLAUDE.md is not saved again (when that file already has a line on the topic, patch that line instead). Changes to rule files and CLAUDE.md (global facts included), and corrections, always wait for the user's approval, even when the user asked for them (say so and point to `/ouroboros:inbox`); pending changes to one file are shown together, as one diff, in the dashboard.
 
@@ -62,6 +70,8 @@ node --no-warnings "${CLAUDE_PLUGIN_ROOT}/scripts/curator.mjs" apply --data "${C
   "resolve": ["<optional: ids of open observations (o12) this review settled, saved or not>"],
   "actor": "<manual if the user explicitly asked you to remember or learn this (skips the autonomy setting; CLAUDE.md, rule files and corrections still wait); inloop otherwise>",
   "items": [
+    { "op": "create", "kind": "preference", "topic": "code review", "text": "Review comments are phrased as questions, never as orders.", "confidence": 0.8 },
+    { "op": "create", "kind": "preference", "topic": "python", "paths": ["**/*.py"], "text": "Type hints on every public function.", "confidence": 0.8 },
     { "op": "create", "kind": "global", "section": "<heading of ~/.claude/CLAUDE.md it belongs under>", "text": "Prefers concise answers in Portuguese; files on disk in English.", "confidence": 0.8 },
     { "op": "create", "kind": "memory", "scope": "project", "memory_type": "feedback", "project_dir": "<repo the fact is about>",
       "title": "Merge ready PRs without asking", "description": "When PRs are green and verified, merge them without waiting for approval",
@@ -77,7 +87,7 @@ node --no-warnings "${CLAUDE_PLUGIN_ROOT}/scripts/curator.mjs" apply --data "${C
 JSON
 ```
 
-Fields: `title` (short; for a patch, what the patch teaches, not the file's name), `why` (one line: what happened in the session that taught it — the user shows it in the dashboard next to the change), `description` (one line; ≤ 250 chars for skills — say *when to use it*), `body` (memories: the fact plus **Why** / **How to apply**; skills: steps and pitfalls), `confidence` 0.3 tentative … 0.9 near-certain, `project_dir` (the repo the item is about; defaults to `cwd`). Write learnings in the language your Ouroboros session context asks for (English by default), with short human-readable titles.
+Fields: `topic` (preferences: one or two words naming what it is about; preferences on the same topic share one file), `paths` (preferences: globs, only when it matters just for those files), `title` (short; for a patch, what the patch teaches, not the file's name), `why` (one line: what happened in the session that taught it — the user shows it in the dashboard next to the change), `description` (one line; ≤ 250 chars for skills — say *when to use it*), `body` (memories: the fact plus **Why** / **How to apply**; skills: steps and pitfalls), `confidence` 0.3 tentative … 0.9 near-certain, `project_dir` (the repo the item is about; defaults to `cwd`). Write learnings in the language your Ouroboros session context asks for (English by default), with short human-readable titles.
 
 ## 5. Handle the results
 
@@ -85,6 +95,7 @@ The first lines are a human summary; the last line is JSON.
 
 - `created` / `patched` → tell the user one line per item: `📝 learned: <title>` (or `📝 updated: …`).
 - `queued` → the user's autonomy setting holds it for approval: say `⏳ waiting for approval: <title>` (decide with `/ouroboros:inbox` or in `/ouroboros:dashboard`).
+- `has_owner` → a file Claude already reads speaks about this topic (the result names it, with the excerpt). Read that file: if it already says it, drop the item; if it lacks the detail, re-submit as a `patch` to it; only if the topic really belongs elsewhere, re-submit the same item with `"owner_checked": true`.
 - `duplicate` → read the existing item it names and, if the new information adds something, re-submit as a `patch` to that target.
 - `over_budget` → consolidate first: merge or shorten items with patches, or archive a stale one with `/ouroboros:forget`, then retry.
 - `rejected` → fix the cause it states, or drop the item.

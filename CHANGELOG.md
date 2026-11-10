@@ -2,6 +2,13 @@
 
 All notable changes to Ouroboros. Versions follow [semantic versioning](https://semver.org/) (pre-1.0: a minor version may change behavior). The reasoning behind each change is in [DESIGN.md](DESIGN.md).
 
+## 0.16.0 — 2026-11-10
+
+- One answer to "where does this belong?" for every path: the file that already owns the topic, then a project memory, then a preference file, and the global CLAUDE.md only for what matters in every session.
+- New destination for preferences valid on every project: one about a topic ("commits", "code review") goes to a personal skill for that topic, loaded when the topic comes up; one about certain files goes to a rule loaded with those files. Both are written without approval, so "remember that I prefer X" no longer lands by default in the global CLAUDE.md and its approval step.
+- When Claude saves something in session and a skill, rule file or CLAUDE.md already speaks about it, the curator answers with that file so Claude patches it instead of creating a second copy.
+- Your own rules in `~/.claude/rules` are now part of what the knowledge check reads.
+
 ## 0.15.0 — 2026-11-10
 
 - Reviews of a session no longer start from nothing. Each one is told what the earlier reviews of that session saved, queued or did not save, so it refines an earlier learning instead of repeating it: Claude patches the file in session, and an end-of-session item marked as a refinement is folded into the file it refines.

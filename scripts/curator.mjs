@@ -17,6 +17,7 @@ import { getMeta, logError, openDb, setMetaOnce } from './db.mjs';
 import { listMemories, listMemoriesIn, listSkills, parseFrontmatter } from './inventory.mjs';
 import { knowledgeKind, PATCHABLE } from './knowledge.mjs';
 import { claudeDir, classifyPath, ensureGlobalInstructions, gitRoot, memoryDirFor, normalize, ouroborosDir, projectKey } from './paths.mjs';
+import { cleanPaths, findOwners, preferenceHome } from './router.mjs';
 import { addObservations, closeObservations, sessionStateText } from './session-state.mjs';
 import { ensureSettingsFile, expandHome, loadSettings, routeFor } from './settings.mjs';
 import { addedText, isInsertion, revertChange } from './textdiff.mjs';
@@ -250,16 +251,39 @@ function setDescription(text, description) {
 
 function normalizeItem(raw, payload) {
   const item = { ...raw };
+  delete item.ownFile; // set by code only (a file Ouroboros created), never by a proposal
   item.op = item.op === 'patch' ? 'patch' : 'create';
   // "profile" is the kind used before global facts moved to the global CLAUDE.md.
-  item.kind = ['memory', 'skill', 'global'].includes(item.kind) ? item.kind : item.kind === 'profile' ? 'global' : 'memory';
-  item.scope = item.scope === 'global' ? 'global' : 'project';
+  item.kind = ['memory', 'skill', 'global', 'preference'].includes(item.kind) ? item.kind : item.kind === 'profile' ? 'global' : 'memory';
+  item.scope = item.scope === 'global' || item.kind === 'preference' ? 'global' : 'project';
   item.confidence = Math.min(0.9, Math.max(0.3, Number(item.confidence) || 0.6));
   item.trigger = payload.trigger || 'manual';
   item.projectDir = item.project_dir || payload.cwd || process.cwd();
   if (item.kind === 'memory' && item.scope === 'global') item.kind = 'global';
   if (item.kind === 'global') return item.op === 'create' ? globalFact(item) : { ...item, kind: 'instructions', scope: 'global' };
+  if (item.kind === 'preference' && item.op === 'create') return preference(item);
   return item;
+}
+
+/** The one sentence a preference or global fact states. */
+function factText(item) {
+  return String(item.text || item.append || item.body || item.description || item.title || '').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * A preference valid on every project that matters for one topic or one kind of file
+ * (router.mjs): a line in that topic's home. When the home exists, the item becomes an
+ * addition to it; when it does not, it is created with this first line.
+ */
+function preference(item) {
+  const text = factText(item);
+  const topic = slug(item.topic || '', 32);
+  if (!topic || !text) return { ...item, invalid: 'a preference needs a "topic" (one or two words) and a "text"' };
+  const paths = cleanPaths(item.paths);
+  const { home, file, name } = preferenceHome(topic, paths);
+  const base = { ...item, scope: 'global', topicSlug: topic, paths, prefHome: home, prefFile: file, prefName: name, prefText: text, title: item.title || text.slice(0, 120) };
+  if (!fs.existsSync(file)) return base;
+  return { ...base, op: 'patch', kind: home === 'skill' ? 'skill' : 'rules', target: file, append: /^[-*]\s/.test(text) ? text : `- ${text}`, section: '', ownFile: true };
 }
 
 /**
@@ -419,6 +443,40 @@ function createSkill(db, batch, item, settings) {
   return { status: 'created', id, kind: 'skill', path: file, title, warning: budgetWarning(active + 1, settings.limits.learnedSkills, settings, 'learned skills') };
 }
 
+function createPreference(db, batch, item, settings) {
+  if (item.invalid) return { status: 'rejected', reason: item.invalid };
+  const topicTitle = String(item.topic).replace(/\s+/g, ' ').trim();
+  const id = newId();
+  const line = /^[-*]\s/.test(item.prefText) ? item.prefText : `- ${item.prefText}`;
+  if (item.prefHome === 'rules') {
+    const content = ['---', 'paths:', ...item.paths.map((p) => `  - ${JSON.stringify(p)}`), '---', '', `# ${topicTitle} (learned preferences)`, '', line, ''].join('\n');
+    batch.write(item.prefFile, content, { learningId: id, op: 'create' });
+    upsertLearning(db, { id, kind: 'rules', scope: 'global', name: path.basename(item.prefFile, '.md'), title: item.title, path: item.prefFile, confidence: item.confidence, trigger: item.trigger });
+    return { status: 'created', id, kind: 'rules', path: item.prefFile, title: item.title };
+  }
+  const description = String(item.description || `The user's preferences about ${topicTitle}. Use whenever the task involves ${topicTitle}.`).replace(/\s+/g, ' ').trim();
+  if (description.length > settings.limits.skillDescriptionChars) {
+    return { status: 'rejected', reason: `description has ${description.length} chars; the limit is ${settings.limits.skillDescriptionChars}` };
+  }
+  const active = db.prepare("SELECT COUNT(*) n FROM learnings WHERE kind = 'skill' AND status = 'active' AND origin_session IS NOT 'native'").get().n;
+  if (active + 1 > settings.limits.learnedSkills) {
+    return { status: 'over_budget', reason: `${active}/${settings.limits.learnedSkills} learned skills; merge or forget one first` };
+  }
+  const content = [
+    '---', `name: ${item.prefName}`, `description: ${yamlStr(description)}`, 'user-invocable: false',
+    'metadata:', '  origin: ouroboros', `  id: ${id}`, `  confidence: ${item.confidence}`, `  created: ${today()}`, `  trigger: ${item.trigger}`,
+    '---', '', `# Preferences: ${topicTitle}`, '', line, '',
+  ].join('\n');
+  batch.write(item.prefFile, content, { learningId: id, op: 'create' });
+  upsertLearning(db, { id, kind: 'skill', scope: 'global', name: item.prefName, title: item.title, path: item.prefFile, confidence: item.confidence, trigger: item.trigger });
+  return { status: 'created', id, kind: 'skill', path: item.prefFile, title: item.title, warning: budgetWarning(active + 1, settings.limits.learnedSkills, settings, 'learned skills') };
+}
+
+/** Whether Ouroboros created this file (so adding to it is not a change to something a person wrote). */
+export function createdByOuroboros(db, file) {
+  return !!db.prepare("SELECT 1 FROM learnings WHERE lower(path) = lower(?) AND status = 'active' AND origin_session IS NOT 'native'").get(path.resolve(String(file)));
+}
+
 /** Resolve the file a patch targets: learning id, a knowledge file path, or a name. */
 function resolvePatchTarget(db, item, settings, payload) {
   const target = String(item.target || '').trim();
@@ -489,6 +547,10 @@ function patchItem(db, batch, item, settings, payload) {
   const before = readOrNull(t.file);
   if (before === null) return { status: 'rejected', reason: `file not found: ${t.file}` };
 
+  if (item.prefText) {
+    const dup = findSimilar(statements(before), item.prefText);
+    if (dup) return { status: 'duplicate', target: t.file, existing: dup.text, reason: 'that preference is already saved there; patch that line instead' };
+  }
   if (item.globalFact) {
     const dup = findSimilar(statements(before), item.globalFact);
     if (dup) return { status: 'duplicate', target: t.file, existing: dup.text, reason: 'your global CLAUDE.md already says this; patch that line instead' };
@@ -578,7 +640,8 @@ export function needsApproval(item, actor, autonomy) {
   // Corrections of existing knowledge, and changes to rule files or CLAUDE.md (written
   // by people, versioned with the project), always wait for the user.
   if (item.corrects) return true;
-  if (item.op === 'patch' && item.target && path.isAbsolute(String(item.target)) && ['rules', 'instructions'].includes(knowledgeKind(item.target))) return true;
+  // (a rule file Ouroboros created for learned preferences is its own: `ownFile`)
+  if (!item.ownFile && item.op === 'patch' && item.target && path.isAbsolute(String(item.target)) && ['rules', 'instructions'].includes(knowledgeKind(item.target))) return true;
   if (actor === 'requested') return false;
   if (autonomy === 'auto') return false;
   if (autonomy === 'queue') return true;
@@ -629,6 +692,7 @@ function runItem(db, item, settings, payload, actor, { dryRun = false } = {}) {
     db.exec('BEGIN IMMEDIATE');
     let result;
     if (item.op === 'patch') result = patchItem(db, batch, item, settings, payload);
+    else if (item.kind === 'preference') result = createPreference(db, batch, item, settings);
     else if (item.kind === 'skill') result = createSkill(db, batch, item, settings);
     else result = createMemory(db, batch, item, settings, payload);
     if (dryRun) {
@@ -690,7 +754,7 @@ function enqueue(db, rawItem, payload, actor) {
 }
 
 /** Apply a batch of proposals. Each item succeeds or fails on its own. */
-export function apply(db, payload, { actor = 'manual', autonomy = 'auto' } = {}) {
+export function apply(db, payload, { actor = 'manual', autonomy = 'auto', ownerCheck = false } = {}) {
   ensureSettingsFile();
   const settings = loadSettings();
   const items = Array.isArray(payload?.items) ? payload.items : [];
@@ -700,6 +764,23 @@ export function apply(db, payload, { actor = 'manual', autonomy = 'auto' } = {})
     if (containsSecret(item.title, item.description, item.body, item.text, item.new)) {
       results.push({ status: 'rejected', title: item.title, reason: 'looks like it contains a secret (token, key or password); never store secrets' });
       continue;
+    }
+    // Only code says a rule file is Ouroboros's own (one it created for learned preferences).
+    if (item.op === 'patch' && item.target && path.isAbsolute(String(item.target))) {
+      item.ownFile = knowledgeKind(item.target) === 'rules' && createdByOuroboros(db, item.target);
+    }
+    // In session nothing screens a new item against the files that own its topic, so the
+    // curator looks: when one speaks about the same thing, Claude reads it and patches it
+    // (or says it checked). The end-of-session path has the screen for this.
+    if (ownerCheck && !raw.owner_checked && item.kind !== 'skill' && (item.op === 'create' || item.globalFact || item.prefText)) {
+      const owners = findOwners([item.title, item.prefText || item.globalFact || item.description, item.body].filter(Boolean).join(' '), item.projectDir, { exclude: [item.target, item.prefFile] });
+      if (owners.length) {
+        results.push({
+          status: 'has_owner', title: item.title, owners: owners.map((o) => ({ file: o.file, kind: o.kind, heading: o.heading, excerpt: o.excerpt })),
+          reason: `${owners.map((o) => o.file).join(', ')} already ${owners.length > 1 ? 'speak' : 'speaks'} about this; read it and patch it instead, or resubmit with "owner_checked": true if it belongs elsewhere`,
+        });
+        continue;
+      }
     }
     // A patch that rewrites existing text is a correction, whatever the proposer said.
     if (!item.corrects && rewritesText(db, item, settings, payload || {})) item.corrects = true;
@@ -857,7 +938,12 @@ export function forget(db, { match }) {
   const archiveDir = path.join(ouroborosDir(), 'archive');
   try {
     db.exec('BEGIN IMMEDIATE');
-    if (l.kind === 'memory') {
+    if (l.kind === 'rules') {
+      const content = readOrNull(l.path);
+      if (content === null) throw new Error(`file not found: ${l.path}`);
+      batch.write(path.join(archiveDir, `${today()}-${path.basename(l.path)}`), content, { learningId: l.id, op: 'archive' });
+      batch.write(l.path, null, { learningId: l.id, op: 'archive' });
+    } else if (l.kind === 'memory') {
       const content = readOrNull(l.path);
       if (content === null) throw new Error(`file not found: ${l.path}`);
       batch.write(path.join(archiveDir, `${today()}-${path.basename(l.path)}`), content, { learningId: l.id, op: 'archive' });
@@ -912,7 +998,7 @@ export function inventoryText(db, { cwd, memoryDir }) {
 }
 
 export function summarize(results) {
-  const icon = { created: '📝 learned', patched: '📝 updated', queued: '⏳ queued', duplicate: '↺ duplicate', rejected: '✗ rejected', over_budget: '⚠ over budget', error: '✗ error' };
+  const icon = { created: '📝 learned', patched: '📝 updated', queued: '⏳ queued', duplicate: '↺ duplicate', has_owner: '↪ has an owner', rejected: '✗ rejected', over_budget: '⚠ over budget', error: '✗ error' };
   return results.map((r) => `${icon[r.status] || r.status}: ${r.title || ''}${r.reason ? ` — ${r.reason}` : ''}${r.warning ? ` (${r.warning})` : ''}${r.path ? ` → ${r.path}` : ''}`).join('\n');
 }
 
@@ -959,7 +1045,7 @@ async function main() {
       // in the session) is a request, not a decision: only the inbox and the dashboard,
       // which call `apply` in-process, act as the user.
       const actor = ['inloop', 'background'].includes(payload.actor) ? payload.actor : 'requested';
-      const results = apply(db, payload, { actor, autonomy: options().autonomy });
+      const results = apply(db, payload, { actor, autonomy: options().autonomy, ownerCheck: true });
       // What the review noticed but could not settle yet waits for the session's next
       // review; what it settled (saved now, or shown to be a one-off) is closed.
       const sid = /^[\w-]{8,}$/.test(String(payload.session_id || '')) ? payload.session_id : null;

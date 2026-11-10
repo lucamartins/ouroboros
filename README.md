@@ -54,7 +54,10 @@ Everything else is automatic: capture hooks record turns, tool calls, error → 
 
 | Learning | Destination |
 |---|---|
-| Who you are, preferences and facts valid on every project (OS, shell, tool auth) | an addition to your global `~/.claude/CLAUDE.md`, under the section it belongs to, after your approval |
+| Something a skill, rule file or CLAUDE.md already covers | an addition to that file (a correction, or a change to a CLAUDE.md or a rule file you wrote, waits for your approval) |
+| A preference valid everywhere that matters for one topic (commits, code review, a tool) | `~/.claude/skills/learned-prefs-<topic>/`, a personal skill loaded when the topic comes up |
+| A preference valid everywhere that matters for certain files (a language, a file type) | `~/.claude/rules/learned-<topic>.md`, a rule loaded with those files |
+| Who you are and how you work, relevant in every session (language, OS, shell) | an addition to your global `~/.claude/CLAUDE.md`, under the section it belongs to, after your approval |
 | Project facts and conventions | the project's auto-memory directory + `MEMORY.md` |
 | Reusable procedures | `~/.claude/skills/learned-*`, or project skills routed by `~/.ouroboros/config.json` |
 

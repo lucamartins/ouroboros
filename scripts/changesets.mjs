@@ -6,7 +6,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { appendToSection, containsSecret, needsApproval, writeText } from './curator.mjs';
+import { appendToSection, containsSecret, createdByOuroboros, needsApproval, writeText } from './curator.mjs';
 import { knowledgeKind } from './knowledge.mjs';
 import { projectKey } from './paths.mjs';
 import { addedText, isInsertion } from './textdiff.mjs';
@@ -155,7 +155,9 @@ export function changesetNeedsApproval(db, cs, actor, autonomy) {
   const claims = claimsOf(db, cs.id);
   const confidence = claims.length ? Math.min(...claims.map((c) => c.confidence ?? 0.6)) : 0.6;
   const kind = knowledgeKind(cs.file);
-  return needsApproval({ op: 'patch', target: cs.file, kind: kind === 'skill' ? 'skill' : 'memory', corrects: !!cs.corrects, confidence }, actor, autonomy);
+  // A learned-preferences rule file is Ouroboros's own: adding to it is not a change to a file a person wrote.
+  const ownFile = kind === 'rules' && createdByOuroboros(db, cs.file);
+  return needsApproval({ op: 'patch', target: cs.file, kind: kind === 'skill' ? 'skill' : 'memory', corrects: !!cs.corrects, confidence, ownFile }, actor, autonomy);
 }
 
 /**
