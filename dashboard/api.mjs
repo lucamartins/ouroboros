@@ -527,13 +527,18 @@ export function createApi(db) {
       const split = db.prepare(`
         SELECT CASE WHEN ? IS NOT NULL AND COALESCE(session_started_at, ts) >= ? THEN 'after' ELSE 'before' END phase,
                COUNT(DISTINCT session_id) sessions, COALESCE(SUM(turns_reviewed), 0) turns, COALESCE(SUM(corrections), 0) corrections
-        FROM reviews WHERE status = 'ok' GROUP BY phase`).all(enabledAt, enabledAt ?? 0);
+        FROM reviews WHERE status = 'ok' AND instrument = 'corrections' GROUP BY phase`).all(enabledAt, enabledAt ?? 0);
+      // What the learning reviews counted on their own (in session: Claude about itself;
+      // end of session: tails only). Shown apart, never mixed into the rate.
+      const other = db.prepare(`
+        SELECT COALESCE(SUM(turns_reviewed), 0) turns, COALESCE(SUM(corrections), 0) corrections
+        FROM reviews WHERE status = 'ok' AND instrument IS NULL AND mode IN ('inloop', 'background') AND turns_reviewed > 0`).get();
       const phase = (p) => {
         const r = split.find((x) => x.phase === p) || { sessions: 0, turns: 0, corrections: 0 };
         return { ...r, rate: r.turns ? (r.corrections / r.turns) * 100 : null };
       };
       const series = emptySeries(since, () => ({ reviewedTurns: 0, corrections: 0, misses: 0, sessions: 0, hits: 0 }));
-      for (const r of db.prepare("SELECT COALESCE(session_started_at, ts) t, turns_reviewed, corrections FROM reviews WHERE status = 'ok' AND COALESCE(session_started_at, ts) >= ?").all(since)) {
+      for (const r of db.prepare("SELECT COALESCE(session_started_at, ts) t, turns_reviewed, corrections FROM reviews WHERE status = 'ok' AND instrument = 'corrections' AND COALESCE(session_started_at, ts) >= ?").all(since)) {
         const d = series.get(dayKey(r.t));
         if (d) { d.reviewedTurns += r.turns_reviewed; d.corrections += r.corrections; }
       }
@@ -554,7 +559,7 @@ export function createApi(db) {
       const top = db.prepare(`
         SELECT id, kind, title, uses, last_used_at, confidence FROM learnings
         WHERE status = 'active' AND origin_session IS NOT 'native' ORDER BY uses DESC, updated_at DESC LIMIT 10`).all();
-      return { days, enabledAt, before: phase('before'), after: phase('after'), series: [...series.values()], hits: hits.length, sessions, top };
+      return { days, enabledAt, before: phase('before'), after: phase('after'), selfReported: { ...other, rate: other.turns ? (other.corrections / other.turns) * 100 : null }, series: [...series.values()], hits: hits.length, sessions, top };
     },
 
     cost(params) {
@@ -598,7 +603,7 @@ export function createApi(db) {
         FROM sessions WHERE started_at >= ?`).get(since);
       const reviewed = db.prepare(`
         SELECT COUNT(*) n, COALESCE(SUM(turns_reviewed),0) turns, COALESCE(SUM(corrections),0) corrections
-        FROM reviews WHERE status = 'ok' AND COALESCE(session_started_at, ts) >= ?`).get(since);
+        FROM reviews WHERE status = 'ok' AND instrument = 'corrections' AND COALESCE(session_started_at, ts) >= ?`).get(since);
       const candidates = db.prepare(`
         SELECT kind, COUNT(*) n FROM candidates c JOIN sessions s ON s.id = c.session_id
         WHERE s.started_at >= ? GROUP BY kind`).all(since);
@@ -619,7 +624,7 @@ export function createApi(db) {
         const d = series.get(dayKey(r.started_at));
         if (d) { d.sessions++; d.turns += r.turns; }
       }
-      for (const r of db.prepare("SELECT COALESCE(session_started_at, ts) t, turns_reviewed, corrections FROM reviews WHERE status = 'ok' AND COALESCE(session_started_at, ts) >= ?").all(since)) {
+      for (const r of db.prepare("SELECT COALESCE(session_started_at, ts) t, turns_reviewed, corrections FROM reviews WHERE status = 'ok' AND instrument = 'corrections' AND COALESCE(session_started_at, ts) >= ?").all(since)) {
         const d = series.get(dayKey(r.t));
         if (d) { d.reviewedTurns += r.turns_reviewed; d.corrections += r.corrections; }
       }
@@ -715,7 +720,7 @@ export function createApi(db) {
       const r = listOf(db, {
         select: `s.id, s.project, s.cwd, s.started_at, s.turns, s.tool_calls, s.tool_fails, s.queue_state,
           (SELECT COUNT(*) FROM events e WHERE e.session_id = s.id AND e.kind = 'recovery') recoveries,
-          (SELECT COALESCE(SUM(corrections),0) FROM reviews r WHERE r.session_id = s.id AND r.status = 'ok') corrections,
+          (SELECT COALESCE(SUM(corrections),0) FROM reviews r WHERE r.session_id = s.id AND r.status = 'ok' AND r.instrument = 'corrections') corrections,
           (SELECT COUNT(*) FROM candidates c WHERE c.session_id = s.id) candidates,
           (SELECT COALESCE(SUM(cost_usd),0) FROM reviews r WHERE r.session_id = s.id) cost`,
         from: 'FROM sessions s', where, args, order: `s.started_at ${dirOf(params)}, s.id`, ...p,

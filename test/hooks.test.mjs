@@ -94,12 +94,16 @@ test('capture: turns, skills, memory writes, recovery and long turns', () => {
 test('SessionEnd runs a background review that writes learnings and leaves a notice', async () => {
   hook('SessionEnd', { reason: 'prompt_input_exit' });
   const d = db();
-  const review = await waitFor(() => d.prepare('SELECT * FROM reviews WHERE session_id = ?').get('s1'));
+  const review = await waitFor(() => d.prepare("SELECT * FROM reviews WHERE session_id = ? AND mode = 'background'").get('s1'));
   assert.equal(review.status, 'ok', review.detail);
-  assert.equal(review.mode, 'background');
   assert.equal(review.turns_reviewed, 2);
   assert.equal(review.corrections, 1);
   assert.equal(review.cost_usd, 0.0042);
+  // The correction rate has its own pass over the whole session; the learning review's count is not part of it.
+  assert.equal(review.instrument, null);
+  const measured = d.prepare("SELECT * FROM reviews WHERE session_id = ? AND mode = 'corrections'").get('s1');
+  assert.deepEqual([measured.status, measured.instrument, measured.turns_reviewed, measured.corrections], ['ok', 'corrections', 2, 1]);
+  assert.equal(d.prepare('SELECT COUNT(*) n FROM corrections WHERE session_id = ?').get('s1').n, 1, 'quotes are listed once, from the instrument');
   const s = await waitFor(() => {
     const row = d.prepare('SELECT queue_state, review_cursor FROM sessions WHERE id = ?').get('s1');
     return row.queue_state === 'done' && row;
@@ -110,7 +114,7 @@ test('SessionEnd runs a background review that writes learnings and leaves a not
   assert.deepEqual(rows.map((r) => r.outcome), ['created', 'queued']);
   assert.equal(path.resolve(rows[1].target), path.join(tmp, 'claude', 'CLAUDE.md'));
   assert.equal(d.prepare('SELECT status FROM changesets WHERE id = ?').get(rows[1].changeset_id).status, 'pending');
-  assert.equal(d.prepare('SELECT learned FROM reviews WHERE session_id = ?').get('s1').learned, 1);
+  assert.equal(d.prepare("SELECT learned FROM reviews WHERE session_id = ? AND mode = 'background'").get('s1').learned, 1);
   d.close();
   assert.ok(fs.existsSync(path.join(tmp, 'claude', 'projects', '-tmp-proj', 'memory', 'use-pnpm.md')));
   assert.equal(fs.existsSync(path.join(tmp, 'ouroboros', 'user.md')), false);
@@ -147,6 +151,8 @@ test('with learning off the end-of-session review only measures', async () => {
   const review = await waitFor(() => d.prepare("SELECT * FROM reviews WHERE session_id = 's4'").get());
   assert.equal(review.mode, 'measure', review.detail);
   assert.equal(review.status, 'ok', review.detail);
+  assert.equal(review.instrument, 'corrections', 'a measure-mode review is the instrument: one call, no second pass');
+  assert.equal(d.prepare("SELECT COUNT(*) n FROM reviews WHERE session_id = 's4'").get().n, 1);
   const c = await waitFor(() => d.prepare("SELECT * FROM candidates WHERE session_id = 's4'").get());
   assert.equal(c.outcome, null);
   d.close();

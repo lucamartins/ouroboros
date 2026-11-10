@@ -242,6 +242,15 @@ const MIGRATIONS = [
   );
   CREATE INDEX observations_session ON observations(session_id, closed_at);
   `,
+  // 11 — v0.17: one instrument for the correction rate
+  `
+  ALTER TABLE reviews ADD COLUMN instrument TEXT;            -- 'corrections': counts toward the correction rate
+  ALTER TABLE sessions ADD COLUMN measure_cursor INTEGER NOT NULL DEFAULT 0;   -- transcript line the instrument has measured up to
+  -- Measure-mode reviews (learning off, measure backfills) read whole sessions with the
+  -- instrument's definition of a correction: they are the baseline.
+  UPDATE reviews SET instrument = 'corrections' WHERE mode = 'measure' AND status = 'ok';
+  UPDATE sessions SET measure_cursor = review_cursor WHERE id IN (SELECT session_id FROM reviews WHERE mode = 'measure' AND status = 'ok');
+  `,
 ];
 
 export function openDb(explicitDir) {

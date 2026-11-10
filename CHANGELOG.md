@@ -2,6 +2,11 @@
 
 All notable changes to Ouroboros. Versions follow [semantic versioning](https://semver.org/) (pre-1.0: a minor version may change behavior). The reasoning behind each change is in [DESIGN.md](DESIGN.md).
 
+## 0.17.0 — 2026-11-10
+
+- The correction rate is counted the same way before and after learning: one corrections-only reading of each whole session, with one definition and one model. Until now "after" mixed Claude's own count in the periodic review with the end-of-session reviewer reading only the last turns, so the comparison with the baseline did not hold. Counts made by the learning reviews are shown apart on the Overview.
+- With learning on, each session end makes one more small model call for this (about the cost of a review, within the monthly budget). Rates shown for sessions before this version reflect only measure-mode reviews.
+
 ## 0.16.0 — 2026-11-10
 
 - One answer to "where does this belong?" for every path: the file that already owns the topic, then a project memory, then a preference file, and the global CLAUDE.md only for what matters in every session.

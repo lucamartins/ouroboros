@@ -895,7 +895,8 @@ async function renderOverview() {
             : h('div', { class: 'figure' }, h('div', { class: 'v' }, fmt.rate(o.correctionRate)), h('div', { class: 'k' }, `n = ${fmt.int(o.reviewed.turns)} reviewed turns`)),
           delta !== null ? h('span', { class: `delta${tone ? '' : ' neutral'}`, title: enough ? null : `Not judged below ${MIN_SAMPLE_TURNS} turns after learning` },
             h('span', { class: `dot ${tone}` }), `${delta > 0 ? '+' : ''}${delta.toFixed(1)}`, enough ? null : h('span', { class: 'delta-note' }, 'small sample')) : null),
-        h('p', { class: 'sentence' }, text)),
+        h('p', { class: 'sentence' }, text),
+        h('p', { class: 'small faint' }, `Counted the same way before and after: one corrections-only reading of each whole session.${v.selfReported?.turns ? ` Not included: what the learning reviews counted themselves (${fmt.rate(v.selfReported.rate)} per 100 on ${fmt.int(v.selfReported.turns)} turns).` : ''}`)),
       h('div', { class: 'stats' },
         stat('Learned', fmt.int(learnedTotal), `${o.learned.memory || 0} memories · ${o.learned.skill || 0} skills${o.learned.patchedNative ? ` · ${o.learned.patchedNative} refined` : ''}`),
         stat('Sessions using a learning', v.sessions ? fmt.pct((v.hits / v.sessions) * 100) : '—', `${fmt.int(v.hits)} of ${fmt.plural(v.sessions, 'session')}`),
@@ -1777,7 +1778,7 @@ const ACTIVITY_LISTS = {
     note: 'In-session reviews run inside your session and use your plan; the others are isolated Haiku calls billed per use.',
     columns: [
       { label: 'When', sort: 'date', render: (r) => fmt.datetime(r.ts) },
-      { label: 'Kind', render: (r) => cellMain(r.mode === 'inloop' ? 'In-session' : r.mode === 'background' ? 'End of session' : r.mode === 'maintenance' ? 'Maintenance' : r.mode, r.trigger) },
+      { label: 'Kind', render: (r) => cellMain(r.mode === 'inloop' ? 'In-session' : r.mode === 'background' ? 'End of session' : r.mode === 'corrections' ? 'Correction count' : r.mode === 'maintenance' ? 'Maintenance' : r.mode, r.trigger) },
       { label: 'Project', render: (r) => projectName(r) },
       { label: 'Status', render: (r) => h('span', { title: r.detail || '' }, reviewState(r.status)) },
       { label: 'Turns', num: true, render: (r) => fmt.int(r.turns_reviewed) },

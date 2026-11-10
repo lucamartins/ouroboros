@@ -71,6 +71,39 @@ export const MEASURE_SCHEMA = {
   },
 };
 
+/**
+ * What counts as a correction: the one definition behind the correction rate. The
+ * instrument (`correctionsPrompt`) and measure-mode reviews use it verbatim, over whole
+ * sessions, so "before learning" and "after" are read with the same ruler.
+ */
+export const CORRECTIONS_RULES = `"corrections": every user turn that pushes back on or redirects something the assistant did, said or assumed.
+   - explicit: "no, use pnpm", "that's wrong", "I already told you…", "stop doing X".
+   - implicit: "hmm, the test broke again", "I prefer the other way", "that's not what I asked".
+   - NOT corrections: new tasks, follow-up requests, answers to the assistant's questions, approvals, extra information the assistant asked for,
+     and standing instructions stated for the first time ("from now on, merge PRs when ready") — those can be candidates, not corrections.
+   Quote the user briefly and give the USER # number.`;
+
+export const CORRECTIONS_ONLY_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['corrections'],
+  properties: { corrections: MEASURE_SCHEMA.properties.corrections },
+};
+
+/** The instrument: count the corrections of a session, and nothing else. */
+export function correctionsPrompt({ digest, part = null }) {
+  return `Review the session digest below and return only:${partNote(part)}
+
+${CORRECTIONS_RULES}
+
+An empty list is a good answer.
+
+Session digest:
+<digest>
+${digest}
+</digest>`;
+}
+
 function partNote(part) {
   return part ? `
 This digest is part ${part.index} of ${part.of} of a long session; USER numbers continue across parts. Judge only what this part shows.
@@ -80,12 +113,7 @@ This digest is part ${part.index} of ${part.of} of a long session; USER numbers 
 export function measurePrompt({ digest, inventory, part = null }) {
   return `Review the session digest below and return:${partNote(part)}
 
-1. "corrections": every user turn that pushes back on or redirects something the assistant did, said or assumed.
-   - explicit: "no, use pnpm", "that's wrong", "I already told you…", "stop doing X".
-   - implicit: "hmm, the test broke again", "I prefer the other way", "that's not what I asked".
-   - NOT corrections: new tasks, follow-up requests, answers to the assistant's questions, approvals, extra information the assistant asked for,
-     and standing instructions stated for the first time ("from now on, merge PRs when ready") — those can be candidates, not corrections.
-   Quote the user briefly and give the USER # number.
+1. ${CORRECTIONS_RULES}
 
 2. "candidates": what would be worth remembering for future sessions (at most 5; an empty list is a good answer).
    - kind "memory": a fact — a user preference or way of working (memory_type user/feedback), a project fact (project), or a pointer to an external resource (reference). memory_type is required for memories.
@@ -257,11 +285,11 @@ export function usageOf(result) {
 
 export function insertReview(db, row) {
   const r = db.prepare(`
-    INSERT INTO reviews (session_id, mode, trigger, model, status, detail, turns_reviewed, corrections,
+    INSERT INTO reviews (session_id, mode, trigger, model, status, detail, instrument, turns_reviewed, corrections,
       input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, duration_ms, session_started_at, ts)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
-    row.sessionId, row.mode, row.trigger, row.model ?? null, row.status, row.detail ?? null,
+    row.sessionId, row.mode, row.trigger, row.model ?? null, row.status, row.detail ?? null, row.instrument ?? null,
     row.turns ?? 0, row.corrections ?? 0,
     row.usage?.input ?? 0, row.usage?.output ?? 0, row.usage?.cacheRead ?? 0, row.usage?.cacheWrite ?? 0,
     row.usage?.cost ?? 0, row.durationMs ?? null, row.sessionStartedAt ?? null, Date.now(),
@@ -308,6 +336,51 @@ async function applyLearnings(db, session, reviewId, items, opts, { notify = tru
   }
 }
 
+/**
+ * The correction-rate instrument: one corrections-only pass over what the session added
+ * since it was last measured (`measure_cursor`), whatever the learning reviews covered.
+ * Reviews that learn also count corrections, but with other prompts, other models (the
+ * in-session one reports on itself) and only on tails; none of that enters the rate.
+ * Never throws: a failed measurement must not stop the learning review.
+ */
+export async function measureCorrections(db, session, entries, opts, trigger) {
+  const from = Math.min(session.measure_cursor || 0, entries.length);
+  const digest = buildDigest(entries, { fromLine: from, contextTurns: CONTEXT_TURNS });
+  // A correction answers something: one turn alone is measured only as the continuation of a measured session.
+  if (digest.humanTurns < 1 || (digest.humanTurns < MIN_HUMAN_TURNS && !from)) return null;
+  const base = { sessionId: session.id, mode: 'corrections', trigger, model: opts.reviewerModel, sessionStartedAt: session.started_at, instrument: 'corrections' };
+  const started = Date.now();
+  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+  const found = [];
+  let reviewed = 0;
+  try {
+    for (let i = 0; i < digest.chunks.length; i++) {
+      if (monthSpend(db) + usage.cost >= opts.monthlyBudgetUsd) break;
+      const part = digest.chunks.length > 1 ? { index: i + 1, of: digest.chunks.length } : null;
+      const result = await runModel({ prompt: correctionsPrompt({ digest: digest.chunks[i], part }), schema: CORRECTIONS_ONLY_SCHEMA, model: opts.reviewerModel });
+      const u = usageOf(result);
+      for (const k of Object.keys(usage)) usage[k] += u[k];
+      found.push(...(result.structured_output.corrections || []));
+      reviewed++;
+    }
+  } catch (err) {
+    logError(db, 'review-worker:corrections', err);
+    if (!reviewed) usage.cost += usageOf(err.result).cost;
+  }
+  // Only a complete reading counts: a partial one would understate the rate.
+  if (reviewed < digest.chunks.length || digest.omitted) {
+    insertReview(db, { ...base, instrument: null, status: reviewed ? 'failed' : 'skipped', detail: reviewed ? `measured ${reviewed} of ${digest.chunks.length} parts; not counted` : 'not measured (budget or model error)', usage, durationMs: Date.now() - started });
+    return null;
+  }
+  const reviewId = insertReview(db, { ...base, status: 'ok', turns: digest.humanTurns, corrections: found.length, usage, durationMs: Date.now() - started });
+  const ts = Date.now();
+  for (const c of found) {
+    db.prepare('INSERT INTO corrections (review_id, session_id, quote, kind, ts) VALUES (?, ?, ?, ?, ?)').run(reviewId, session.id, String(c.quote).slice(0, 500), c.kind, ts);
+  }
+  db.prepare('UPDATE sessions SET measure_cursor = ? WHERE id = ?').run(digest.nextLine, session.id);
+  return { reviewId, turns: digest.humanTurns, corrections: found.length };
+}
+
 /** Review one queued session. Returns a short status string. */
 export async function reviewSession(db, sessionId, trigger, overrides = {}) {
   const now = Date.now();
@@ -337,6 +410,8 @@ export async function reviewSession(db, sessionId, trigger, overrides = {}) {
   }
 
   const entries = readTranscript(session.transcript_path);
+  // With learning on, the correction rate comes from its own pass over the whole session.
+  if (mode === 'background' && !learnBackfill) await measureCorrections(db, session, entries, opts, trigger);
   const fromLine = learnBackfill ? 0 : session.review_cursor || 0;
   const digest = buildDigest(entries, { fromLine, contextTurns: CONTEXT_TURNS });
   const parts = digest.chunks;
@@ -395,6 +470,8 @@ export async function reviewSession(db, sessionId, trigger, overrides = {}) {
     const partial = reviewed < parts.length || digest.omitted;
     reviewId = insertReview(db, {
       ...base,
+      // A measure-mode review reads the session with the instrument's definition: it counts.
+      instrument: mode === 'measure' ? 'corrections' : null,
       status: 'ok',
       turns: learnBackfill ? 0 : digest.humanTurns,
       corrections: learnBackfill ? 0 : out.corrections.length,
@@ -408,7 +485,9 @@ export async function reviewSession(db, sessionId, trigger, overrides = {}) {
       durationMs: Date.now() - started,
     });
     const ts = Date.now();
-    for (const c of learnBackfill ? [] : out.corrections) {
+    // The corrections a learning review counts are its own working notes; the listed
+    // quotes come from the instrument.
+    for (const c of mode === 'measure' ? out.corrections : []) {
       db.prepare('INSERT INTO corrections (review_id, session_id, quote, kind, ts) VALUES (?, ?, ?, ?, ?)')
         .run(reviewId, sessionId, String(c.quote).slice(0, 500), c.kind, ts);
     }
@@ -426,6 +505,7 @@ export async function reviewSession(db, sessionId, trigger, overrides = {}) {
       `).run(reviewId, sessionId, session.project, c.kind, c.scope, c.memory_type ?? null, String(c.title).slice(0, 200),
         String(c.summary).slice(0, 1500), String(c.evidence).slice(0, 800), c.confidence, c.repeats || null, ts);
     }
+    db.prepare('UPDATE sessions SET measure_cursor = ? WHERE id = ?').run(digest.nextLine, sessionId);
     finish(db, sessionId, 'done', digest.nextLine);
     return 'ok';
   } catch (err) {
