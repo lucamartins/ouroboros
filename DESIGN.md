@@ -2,7 +2,7 @@
 
 > A Claude Code plugin that learns from your sessions on its own: it saves memories and creates/refines skills without being asked, in the spirit of Nous Research's Hermes Agent, and shows on a local dashboard what it learned, how much that is being used and what it costs.
 
-Status: v0.14.2 — every phase implemented (§13), plus the learning evaluation (§7.2), the v0.8 mechanism review (§7.4), the inbox reviewed in the conversation (§9.3), a dashboard that scales (§9.1: server-side paging and filters, the inbox grouped by project and file, page state in the URL, one project filter) and a knowledge graph (§9.4, read-only, drawn with a vendored D3 subset since v0.13). Next: measure the loop's value in real use (§7.4). Design decisions are summarized in [§12](#12-decisions).
+Status: v0.15.0 — every phase implemented (§13), plus the learning evaluation (§7.2), the v0.8 mechanism review (§7.4), the inbox reviewed in the conversation (§9.3), a dashboard that scales (§9.1: server-side paging and filters, the inbox grouped by project and file, page state in the URL, one project filter), a knowledge graph (§9.4, read-only, drawn with a vendored D3 subset since v0.13) and a session learning state shared by every review of a session (§6.5, v0.15). Next: one router for where a learning belongs, then measure the loop's value in real use (§7.4). Design decisions are summarized in [§12](#12-decisions).
 
 ---
 
@@ -20,7 +20,7 @@ Hermes solves this with (a) explicit save triggers in its prompt, (b) a periodic
 
 1. **Three separate layers**: *capture* (deterministic hooks, no LLM, cheap, metrics only) → *reflection* (an LLM decides what to learn, on a cadence) → *curation* (deterministic rules decide where to write, dedupe, enforce limits, keep a ledger).
 2. **No guessing user intent with heuristics.** Hooks never try to classify prompts; judging what is worth learning is always done by a model with the conversation in front of it.
-3. **Every transcript segment is reviewed exactly once**: a per-session cursor records how far reviews have gone.
+3. **Every transcript segment is reviewed exactly once, and no review starts from nothing**: a per-session cursor records how far reviews have gone, and the session's learning state (§6.5) carries over what earlier reviews saved, queued and left open.
 4. **Everything reversible**: every write has an origin, a diff and an undo.
 5. **Hard limits** (like Hermes): fixed context budget; consolidate at 80%.
 6. **Measure before learning**: phase 1 only measures, so there is a baseline to prove value against.
@@ -217,8 +217,8 @@ Cost is measured from transcript `usage` between the request and the next `Stop`
 ### 6.3 Reflection B — end-of-session background review
 
 1. **Trigger**: `SessionEnd` (or an orphaned queued session found at the next `SessionStart`).
-2. **Scope**: only the **unreviewed tail** — from the session's cursor to the end. Skipped when the tail has < 2 user turns and no `recovery` events.
-3. **Digest**: `transcript.mjs` reduces the tail to user turns, assistant text, tool names and errors; plus the `recovery` snippets recorded inside subagents (never full subagent transcripts; workflow agents are excluded entirely). A tail over ~80k characters is first shrunk (tool calls, then long assistant text) and then split into parts at user turns, each reviewed by its own call with the USER numbering continued; the results merge into one review. Nothing in the middle of a long session is dropped (past 8 parts, the oldest middle parts are skipped and the review says so).
+2. **Scope**: only the **unreviewed tail** — from the session's cursor to the end. A tail with a single user turn is skipped only when nothing ties it to the rest of the session: no earlier review, no `recovery` since, no open observation (one last turn after a review is often the correction of what that review saw).
+3. **Digest**: `transcript.mjs` reduces the tail to user turns, assistant text, tool names and errors. The prompt adds the `recovery` events recorded since the last review, here or inside subagents (never full subagent transcripts; workflow agents are excluded entirely), and the session's learning state (§6.5). A tail that starts mid-session opens with the last 3 user turns before the cursor and what the assistant said between them, marked EARLIER (context only: not counted, not learned from alone). The assistant text right before a user turn keeps its end as well as its start, since that is where the question the user answers usually is. A tail over ~80k characters is first shrunk (tool calls, then long assistant text) and then split into parts at user turns, each reviewed by its own call with the USER numbering continued; the results merge into one review. Nothing in the middle of a long session is dropped (past 8 parts, the oldest middle parts are skipped and the review says so).
 4. **Inventory**: titles + descriptions of the existing memories/skills in scope (so the model picks `patch` over `create`).
 5. **Call**: `claude -p --safe-mode --model <reviewer_model> --output-format json --json-schema <schema> --tools "" --no-session-persistence --max-budget-usd 0.5 --system-prompt <short>`, `cwd` at `${CLAUDE_PLUGIN_DATA}/reviewer`, `OUROBOROS_REVIEWER=1`. Isolation is essential: a plain `claude -p` loads the user's whole environment (MCP servers, plugins, skills, CLAUDE.md) and a trivial call measured **US$ 0.78**; with `--safe-mode` and a custom system prompt the same call costs **US$ 0.0003**, and real session reviews cost US$ 0.002–0.008. `--safe-mode` also disables hooks, so the reviewer can't trigger the plugin; `--no-session-persistence` keeps its transcripts out of the user's projects.
 6. **Output**: `{corrections, items: [{kind: global|memory|skill, scope?, memory_type?, title, text?, description?, body?, confidence, evidence, repeats?}]}`. Every item is recorded in `candidates` and goes through the **learning evaluation** (§7.2) before anything is written or queued; the reviewer sees only names and descriptions of what exists, so it never writes edits itself. A `duplicate` reinforces the existing learning (+0.1 confidence, max 0.9). `repeats` means "the user had to repeat something already saved" → *miss* metric (§9). If the evaluation fails (model error, budget), nothing is written: the items wait in the queue and the next queue check evaluates them.
@@ -237,6 +237,22 @@ With `learning` off the worker runs in `measure` mode instead. `/ouroboros:backf
 - Always check what exists first; prefer a targeted patch.
 - Memory format identical to native auto memory (frontmatter `name/description/metadata.type` + a line in `MEMORY.md`), plus `metadata.origin/id/confidence`.
 - End with the result line (§6.2).
+
+### 6.5 Session learning state (v0.15)
+
+A review used to see only its own segment. With the periodic review every N turns, the end-of-session reviewer almost always got a short tail out of context: a first line like "1. yes 2. no" answering a question before the cursor, no idea what the review ten turns earlier had saved, and so no way to tell a refinement from a new fact. A learning that spans the boundary (a correction at turn 9, confirmed working at turn 12) was judged twice with half the evidence each time.
+
+The state is what carries over (`scripts/session-state.mjs`), per session, read by every review:
+
+- **What earlier reviews did**: each save (from the ledger, by `session_id`), each proposal waiting, in conflict, dropped, suggested or rejected (from `candidates`), with a ref, the file and the text. Derived from tables that already exist; nothing is stored twice.
+- **Open observations** (`observations` table): something worth keeping that was not settled when a review ran (not verified yet, said once). The in-session review records them through the `learn` skill's apply step (`"open"`, closed with `"resolve"`); every later review of the session sees them, and the session's last review closes them all.
+
+How each review uses it:
+
+- **Periodic review (A)**: the Stop request lists the state and tells Claude to patch what the session already saved instead of creating, and to pass unsettled things in `"open"`. `curator.mjs inventory --session` prints it too, which is what survives a compaction.
+- **End-of-session review (B)**: the prompt carries the state; an item may set `"refines"` to a ref. A refinement the screen keeps goes to the editor of that file (§7.2), which folds it in, instead of becoming a second memory.
+
+Kept on purpose: the cursor and the exactly-once rule (state, not re-reading, is what connects segments), and both triggers.
 
 ## 7. Curation and write policy
 
@@ -381,6 +397,7 @@ candidates (id, review_id, session_id, kind, title, summary, evidence, confidenc
 changesets (id, file, kind, base_hash, edits, corrects, status, note, cost_usd, created_at, decided_at, learning_id, batch)
           -- status: pending | applied | rejected | superseded | stale | reverted
 notices   (id, ts, session_id, project, text, delivered_at)   -- project NULL: any session
+observations (id, session_id, text, ts, closed_at)   -- noticed by a review, not settled yet (§6.5)
 meta      (key, value)   -- markers and the evaluation lease (lease:evaluate)
 ```
 
@@ -506,6 +523,7 @@ Phase 1 is read-only on purpose. Later, the same graph could drive behavior: wri
 | Name | `ouroboros` |
 | Autonomy | Fully automatic (like Hermes); `hybrid`/`queue` available as options |
 | Reflection | Periodic in-loop review every N turns (+ early after a turn that recovered from repeated failures, at most every 5 turns) and an end-of-session background review of the unreviewed tail |
+| Context of a review | The session's learning state (what earlier reviews saved, queued, left open) goes to every review, and a tail gets the turns before its cursor as context; segments are still reviewed once (§6.5) |
 | Prompt classification | None — no regex or per-prompt classifier; corrections are counted by the reviews |
 | Global facts | Additions to the user's global `~/.claude/CLAUDE.md`, with approval; the separate `~/.ouroboros/user.md` profile was retired in v0.12 (§3.2) |
 | Subagents | Full transcripts not reviewed; only `recovery` snippets captured inside subagents; workflow agents excluded |
@@ -532,6 +550,7 @@ Phase 1 is read-only on purpose. Later, the same graph could drive behavior: wri
 | **v0.7 Evaluation** | Screen → ground → edit → validate; changesets per file with diffs in the dashboard; suggested fixes; skill reference files as owners; `eval.mjs` (synthetic + replay) | The same 60 real proposals give fewer, coherent changes, and the synthetic score holds |
 | **v0.8 Mechanism review** | §7.4: insertion-only additions, one validator for both write paths, single-consumer evaluation queue, surgical profile writes, added-text secret check, line-level undo, one memory-dir resolver, ancestor CLAUDE.md files, long sessions in parts, budget guard on every call, notices per project, merges that must land; harder eval cases | 15/15 on the synthetic suite; every finding has a regression test |
 | **v0.9 Inbox in the conversation** | `/ouroboros:inbox`: list, show, preview, approve, reject, edit, resolve, done/dismiss; the dashboard uses the same module; SessionStart says when entries wait | Each kind of entry can be decided and edited in the conversation, with a regression test |
+| **v0.15 Session learning state** | §6.5: every review reads what the session's earlier reviews saved, queued and left open; open observations; tail context and end-preserving clipping; recoveries in the end-of-session prompt; refinements folded into the file they refine | A second review of a session patches what the first one saved, and a one-turn tail after a review is reviewed, each with a regression test |
 | **v0.11 Knowledge graph** | Knowledge › Graph (§9.4): nodes and edges derived from the files and usage, broken links and unconnected items, filters and selection in the URL, an accessible side panel; read-only | The graph of a real setup's knowledge is legible at a glance and every relation it draws can be traced to a file or an event |
 | **v0.12 One global file** | §3.2: global facts go to `~/.claude/CLAUDE.md` through the editor and the inbox; `user.md`, its injection, budgets and consolidation removed; one-time migration of its bullets | Global facts land in the global CLAUDE.md after approval; a fact it already states is not proposed again |
 | **v0.13 Graph drawing** | Knowledge › Graph drawn with a vendored D3 subset: the layout unfolds on screen, drag pulls neighbors along, animated camera on select and Fit, curved colored edges with flow on focus, halos and a pulse on what Ouroboros changed; reduced motion respected | The graph feels alive while staying legible, with the same CSP, offline use and no install step |

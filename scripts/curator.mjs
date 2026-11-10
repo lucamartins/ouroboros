@@ -5,7 +5,7 @@
 //   node curator.mjs apply   [--file proposals.json]   (JSON on stdin otherwise)
 //   node curator.mjs undo    [--id lrn_x | --last]
 //   node curator.mjs forget  --match <id | name | text>
-//   node curator.mjs inventory --cwd <dir> [--memory-dir <dir>]
+//   node curator.mjs inventory --cwd <dir> [--memory-dir <dir>] [--session <id>]
 //   (all accept --data <dir>)
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -17,6 +17,7 @@ import { getMeta, logError, openDb, setMetaOnce } from './db.mjs';
 import { listMemories, listMemoriesIn, listSkills, parseFrontmatter } from './inventory.mjs';
 import { knowledgeKind, PATCHABLE } from './knowledge.mjs';
 import { claudeDir, classifyPath, ensureGlobalInstructions, gitRoot, memoryDirFor, normalize, ouroborosDir, projectKey } from './paths.mjs';
+import { addObservations, closeObservations, sessionStateText } from './session-state.mjs';
 import { ensureSettingsFile, expandHome, loadSettings, routeFor } from './settings.mjs';
 import { addedText, isInsertion, revertChange } from './textdiff.mjs';
 
@@ -959,6 +960,12 @@ async function main() {
       // which call `apply` in-process, act as the user.
       const actor = ['inloop', 'background'].includes(payload.actor) ? payload.actor : 'requested';
       const results = apply(db, payload, { actor, autonomy: options().autonomy });
+      // What the review noticed but could not settle yet waits for the session's next
+      // review; what it settled (saved now, or shown to be a one-off) is closed.
+      const sid = /^[\w-]{8,}$/.test(String(payload.session_id || '')) ? payload.session_id : null;
+      const closed = closeObservations(db, sid, Array.isArray(payload.resolve) ? payload.resolve : []);
+      const opened = addObservations(db, sid, payload.open);
+      if (opened || closed) console.log(`◌ left open for the next review: ${opened}${closed ? `; settled: ${closed}` : ''}`);
       // A queued edit that did not fit with the change already waiting for its file sends
       // both back to the editor: start the evaluation queue in the background.
       if (results.some((r) => r.recompose)) {
@@ -973,6 +980,8 @@ async function main() {
       console.log(JSON.stringify(forget(db, { match: args.match || args._[1] }), null, 2));
     } else if (cmd === 'inventory') {
       console.log(inventoryText(db, { cwd: args.cwd || process.cwd(), memoryDir: args['memory-dir'] }));
+      const state = typeof args.session === 'string' ? sessionStateText(db, args.session, { audience: 'claude' }) : '';
+      if (state) console.log(`\n## This session so far\n${state}`);
     } else if (cmd === 'confirm') {
       console.log(JSON.stringify(confirm(db, args.id), null, 2));
     } else if (cmd === 'approve' || cmd === 'reject') {

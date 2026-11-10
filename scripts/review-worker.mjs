@@ -17,9 +17,12 @@ import { isExcluded } from './hook.mjs';
 import { logError, monthSpend, openDb } from './db.mjs';
 import { inventoryForPrompt } from './inventory.mjs';
 import { claudeDir, dataDir, projectKey } from './paths.mjs';
+import { closeObservations, openObservations, sessionStateText } from './session-state.mjs';
 import { buildDigest, isHumanPrompt, quotesFor, readTranscript } from './transcript.mjs';
 
 const MIN_HUMAN_TURNS = 2;
+/** User turns before the cursor shown to the reviewer as context for an unreviewed tail. */
+const CONTEXT_TURNS = 3;
 const PER_CALL_BUDGET_USD = 0.5;
 const CALL_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -129,13 +132,14 @@ export const LEARN_SCHEMA = {
           confidence: { type: 'number', minimum: 0, maximum: 1 },
           evidence: { type: 'string' },
           repeats: { type: 'string' },
+          refines: { type: 'string' },
         },
       },
     },
   },
 };
 
-export function learnPrompt({ digest, inventory, part = null, lang = options().learningLanguage }) {
+export function learnPrompt({ digest, inventory, part = null, lang = options().learningLanguage, state = '', signals = '' }) {
   const LANG_RULE = lang === 'auto' ? 'Write in the same language the user writes in.' : `Write in ${lang === 'pt-BR' ? 'Brazilian Portuguese' : 'English'}, whatever language the session is in.`;
   return `Review the session digest below. It is the part of the session not reviewed yet.${partNote(part)} Return:
 
@@ -146,6 +150,7 @@ export function learnPrompt({ digest, inventory, part = null, lang = options().l
    - kind "memory": a fact about this project. memory_type "feedback" (how to work here), "project" (decision, convention) or "reference" (pointer to an external resource). Give "title", a one-line "description", and a "body" with the fact plus "**Why:**" and "**How to apply:**" lines.
    - kind "skill": a reusable procedure (multi-step workflow, the working path found after errors, an approach the user corrected). scope "global" if it works anywhere, "project" otherwise. Give "title", a "description" of at most 250 characters that says when to use it, and a "body" in Markdown with steps and pitfalls.
    - Keep an item only if it passes every rule of the rubric below. Proposing nothing is better than proposing noise; a later knowledge check drops what fails.
+   - "refines": when "This session so far" lists an entry this item refines, extends or corrects, its [ref] (for example "lrn_abc" or "c12"); the item then states the whole updated fact, not only the difference.
    - Do not repeat what the inventory already has. If the user had to repeat something the inventory already has, add an item only if it adds information, and set "repeats" to that item's name either way.
    - confidence: 0.3 tentative … 0.9 near-certain. "evidence": the USER # turns or events it comes from.
    - Titles are short and human-readable (never slugs like "feedback-x-y").
@@ -156,7 +161,7 @@ ${rubricText()}
 
 Already saved (inventory):
 ${inventory}
-
+${state ? `\nThis session so far:\n${state}\n` : ''}${signals ? `\nRecorded while the session ran (a command or file that failed, then worked: the working path may be worth a skill or a memory, judged from the digest):\n${signals}\n` : ''}
 Session digest:
 <digest>
 ${digest}
@@ -325,9 +330,23 @@ export async function reviewSession(db, sessionId, trigger, overrides = {}) {
   }
 
   const entries = readTranscript(session.transcript_path);
-  const digest = buildDigest(entries, { fromLine: learnBackfill ? 0 : session.review_cursor || 0 });
+  const fromLine = learnBackfill ? 0 : session.review_cursor || 0;
+  const digest = buildDigest(entries, { fromLine, contextTurns: CONTEXT_TURNS });
   const parts = digest.chunks;
-  if (digest.humanTurns < MIN_HUMAN_TURNS) {
+  // What the tail does not show by itself: what earlier reviews of this session did and
+  // left open, and the failures the session worked through since the last one.
+  const lastReview = learnBackfill ? 0 : db.prepare("SELECT MAX(ts) t FROM reviews WHERE session_id = ? AND status = 'ok' AND mode IN ('inloop', 'background', 'measure')").get(sessionId).t || 0;
+  const recoveries = learnBackfill ? [] : db.prepare("SELECT target, payload FROM events WHERE session_id = ? AND kind = 'recovery' AND ts > ? ORDER BY id DESC LIMIT 8").all(sessionId, lastReview);
+  const state = mode === 'background' && !learnBackfill ? sessionStateText(db, sessionId) : '';
+  const signals = recoveries.map((r) => {
+    let p = {};
+    try { p = JSON.parse(r.payload || '{}'); } catch { /* ignore */ }
+    return `- ${r.target} failed ${p.failures || '?'}x before working${p.first_error ? ` (first error: ${String(p.first_error).split('\n')[0].slice(0, 160)})` : ''}`;
+  }).join('\n');
+  // A short tail is skipped only when nothing ties it to the rest of the session: one
+  // last turn after an earlier review is often the correction of what that review saw.
+  const standsAlone = !recoveries.length && !lastReview && !(mode === 'background' && openObservations(db, sessionId).length);
+  if (digest.humanTurns < 1 || (digest.humanTurns < MIN_HUMAN_TURNS && standsAlone)) {
     insertReview(db, { ...base, status: 'skipped', detail: `only ${digest.humanTurns} user turn(s)`, turns: digest.humanTurns });
     finish(db, sessionId, 'skipped', digest.nextLine);
     return 'short';
@@ -345,7 +364,7 @@ export async function reviewSession(db, sessionId, trigger, overrides = {}) {
     for (let i = 0; i < parts.length; i++) {
       if (i > 0 && monthSpend(db) + usage.cost >= opts.monthlyBudgetUsd) break;
       const part = parts.length > 1 ? { index: i + 1, of: parts.length } : null;
-      const promptArgs = { digest: parts[i], inventory, part };
+      const promptArgs = { digest: parts[i], inventory, part, state, signals };
       let result;
       try {
         result = await runModel({
@@ -388,6 +407,8 @@ export async function reviewSession(db, sessionId, trigger, overrides = {}) {
     }
     if (mode === 'background') {
       await applyLearnings(db, session, reviewId, out.items, opts, { notify: !learnBackfill, userTurns: digest.userTurns });
+      // The session's last review saw every open observation: settled ones came back as items.
+      if (!learnBackfill) closeObservations(db, sessionId);
       finish(db, sessionId, 'done', digest.nextLine);
       return 'ok';
     }

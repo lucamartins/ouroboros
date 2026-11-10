@@ -2,6 +2,12 @@
 
 All notable changes to Ouroboros. Versions follow [semantic versioning](https://semver.org/) (pre-1.0: a minor version may change behavior). The reasoning behind each change is in [DESIGN.md](DESIGN.md).
 
+## 0.15.0 — 2026-11-10
+
+- Reviews of a session no longer start from nothing. Each one is told what the earlier reviews of that session saved, queued or did not save, so it refines an earlier learning instead of repeating it: Claude patches the file in session, and an end-of-session item marked as a refinement is folded into the file it refines.
+- Something noticed but not settled yet (not verified, said once) can be left open by a review and is picked up by the next one, instead of being saved early or lost at the boundary between reviews.
+- The end-of-session review of a tail sees the turns just before it as context, the end of the message the user is answering, and the failures the session worked through; a single last turn after an earlier review is reviewed instead of skipped.
+
 ## 0.14.0 — 2026-11-08
 
 - Knowledge graph legible by default: reference files fold into their skill and open on selection, each project is a region, "similar" and project lines are off until asked for, unconnected items wait in the side panel, overlapping names wait for zoom, and the view survives redraws.

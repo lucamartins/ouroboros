@@ -231,6 +231,17 @@ const MIGRATIONS = [
   `
   ALTER TABLE candidates ADD COLUMN quotes TEXT;      -- JSON [{ n, text }]; resolved from the transcript
   `,
+  // 10 — v0.15: what a review noticed but could not settle, carried to the session's next review
+  `
+  CREATE TABLE observations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    text        TEXT NOT NULL,
+    ts          INTEGER NOT NULL,
+    closed_at   INTEGER                            -- settled by a later review, or the session's last review ran
+  );
+  CREATE INDEX observations_session ON observations(session_id, closed_at);
+  `,
 ];
 
 export function openDb(explicitDir) {

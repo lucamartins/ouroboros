@@ -20,6 +20,7 @@ import { applyChangeset, applyEdits, changesetNeedsApproval, claimsOf, getChange
 import { acquireLease, assertBudget, BudgetError, logError, releaseLease } from './db.mjs';
 import { buildIndex, groundIdentifiers, identifiersIn, knowledgeFiles, knowledgeKind, PATCHABLE, resolveOwner, tokenize } from './knowledge.mjs';
 import { ensureGlobalInstructions } from './paths.mjs';
+import { refFile } from './session-state.mjs';
 import { insertReview, runModel, usageOf } from './review-worker.mjs';
 import { rubricText } from './rubric.mjs';
 import { describe, noteFor, rewriteItem, triage } from './triage.mjs';
@@ -412,7 +413,18 @@ export async function evaluate(db, rows, ctx) {
         creates.push({ row, item: rewriteItem(item, v), note: `kept as new (owner not found: ${v.owner || 'none'})` });
       }
     } else {
-      creates.push({ row, item: rewriteItem(item, v), note: noteFor(v) });
+      // Kept as new, but the reviewer said it refines something this session already
+      // saved or queued for a file: the editor folds it into that file instead.
+      const refined = item.refines ? refFile(db, row.session_id, item.refines) : null;
+      if (refined && fs.existsSync(refined) && PATCHABLE.has(knowledgeKind(refined))) {
+        const next = rewriteItem(item, v);
+        const claim = [next.text, next.description, next.body].filter(Boolean).join('\n') || next.title;
+        report.routed++;
+        db.prepare('UPDATE candidates SET claim = ?, target = ? WHERE id = ?').run(claim, refined, row.id);
+        route(path.resolve(refined), { ...claimFrom({ ...row, claim }), title: row.title });
+      } else {
+        creates.push({ row, item: rewriteItem(item, v), note: noteFor(v) });
+      }
     }
   }
 

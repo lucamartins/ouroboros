@@ -42,6 +42,12 @@ function clip(s, n) {
   return s.length > n ? `${s.slice(0, n)}…` : s;
 }
 
+/** The start and the end of a long text: a message that ends with a question keeps it. */
+function clipEnds(s, head, tail) {
+  s = String(s || '').replace(/\s+/g, ' ').trim();
+  return s.length > head + tail + 5 ? `${s.slice(0, head)} […] ${s.slice(-tail)}` : s;
+}
+
 function describeToolUse(c) {
   const i = c.input || {};
   const arg = i.command || i.file_path || i.pattern || i.skill || i.url || i.query || i.description || i.prompt || '';
@@ -53,17 +59,27 @@ function describeToolUse(c) {
  * more parts of at most ~maxChars each; `text` is the first), `omitted` (parts dropped
  * past `maxParts`), the number of human turns it covers and the line index where the
  * next review should start.
+ *
+ * A tail that starts mid-session (`fromLine` > 0) does not stand on its own: its first
+ * user turn often answers something said before the cursor. `contextTurns` prepends the
+ * last user turns before the cursor, with the assistant's text between them, marked
+ * EARLIER: context only, never counted or learned from by themselves.
  */
-export function buildDigest(entries, { fromLine = 0, maxChars = 80_000, maxParts = 8 } = {}) {
-  const lines = [];
+export function buildDigest(entries, { fromLine = 0, maxChars = 80_000, maxParts = 8, contextTurns = 0 } = {}) {
+  const lines = earlierLines(entries, fromLine, contextTurns);
   const userTurns = [];
   let humanTurns = 0;
+  // The assistant text right before a user turn is what that turn answers: it keeps its
+  // end (where the question or the proposal usually is), not only its start.
+  let lastAssistant = -1;
 
   for (let i = fromLine; i < entries.length; i++) {
     const e = entries[i];
     if (!e || e.isSidechain) continue;
 
     if (isHumanPrompt(e)) {
+      if (lastAssistant >= 0) lines[lastAssistant] = { ...lines[lastAssistant], asked: true, text: `[ASSISTANT] ${clipEnds(lines[lastAssistant].raw, 250, 700)}` };
+      lastAssistant = -1;
       humanTurns++;
       userTurns.push({ n: humanTurns, text: clip(textOf(e.message.content), QUOTE_CHARS), ts: e.timestamp || null });
       lines.push({ kind: 'user', text: `[USER #${humanTurns}] ${clip(textOf(e.message.content), 2000)}` });
@@ -71,7 +87,10 @@ export function buildDigest(entries, { fromLine = 0, maxChars = 80_000, maxParts
     }
     if (e.type === 'assistant' && Array.isArray(e.message?.content)) {
       for (const c of e.message.content) {
-        if (c.type === 'text' && c.text?.trim()) lines.push({ kind: 'assistant', text: `[ASSISTANT] ${clip(c.text, 600)}` });
+        if (c.type === 'text' && c.text?.trim()) {
+          lines.push({ kind: 'assistant', raw: c.text, text: `[ASSISTANT] ${clip(c.text, 600)}` });
+          lastAssistant = lines.length - 1;
+        }
         else if (c.type === 'tool_use') lines.push({ kind: 'tool', text: `[TOOL] ${describeToolUse(c)}` });
       }
       continue;
@@ -91,7 +110,7 @@ export function buildDigest(entries, { fromLine = 0, maxChars = 80_000, maxParts
   // middle of a long session is lost.
   let kept = lines;
   if (render(kept).length > maxChars) kept = kept.filter((l) => l.kind !== 'tool');
-  if (render(kept).length > maxChars) kept = kept.map((l) => (l.kind === 'assistant' ? { ...l, text: clip(l.text, 200) } : l));
+  if (render(kept).length > maxChars) kept = kept.map((l) => (l.kind !== 'assistant' ? l : { ...l, text: l.asked ? `[ASSISTANT] ${clipEnds(l.raw, 80, 300)}` : clip(l.text, 200) }));
   const parts = [];
   let cur = [];
   let size = 0;
@@ -114,6 +133,37 @@ export function buildDigest(entries, { fromLine = 0, maxChars = 80_000, maxParts
   }
   const chunks = parts.map((p) => render(p));
   return { text: chunks[0], chunks, omitted, humanTurns, userTurns, nextLine: entries.length };
+}
+
+const EARLIER_CHARS = 5000;
+
+/** The context lines of a tail: the last `turns` user turns before `fromLine` and what the assistant said between them. */
+function earlierLines(entries, fromLine, turns) {
+  if (!turns || fromLine <= 0) return [];
+  let start = -1;
+  let found = 0;
+  for (let i = Math.min(fromLine, entries.length) - 1; i >= 0 && found < turns; i--) {
+    if (isHumanPrompt(entries[i])) { start = i; found++; }
+  }
+  if (start < 0) return [];
+  let out = [];
+  for (let i = start; i < fromLine; i++) {
+    const e = entries[i];
+    if (!e || e.isSidechain) continue;
+    if (isHumanPrompt(e)) out.push({ kind: 'context', text: `[EARLIER USER] ${clip(textOf(e.message.content), 500)}` });
+    else if (e.type === 'assistant' && Array.isArray(e.message?.content)) {
+      const text = e.message.content.filter((c) => c.type === 'text' && c.text?.trim()).map((c) => c.text).join('\n');
+      if (text) out.push({ kind: 'context', text: `[EARLIER ASSISTANT] ${clipEnds(text, 200, 600)}` });
+    }
+  }
+  // Several assistant messages in a row: the last one before each user turn is enough.
+  out = out.filter((l, i) => !(l.text.startsWith('[EARLIER ASSISTANT]') && out[i + 1]?.text.startsWith('[EARLIER ASSISTANT]')));
+  while (out.length > 1 && out.reduce((n, l) => n + l.text.length, 0) > EARLIER_CHARS) out.shift();
+  return [
+    { kind: 'context', text: '[CONTEXT] The EARLIER lines were reviewed before; they are here only so what follows makes sense. Do not count corrections in them or propose items from them alone.' },
+    ...out,
+    { kind: 'context', text: '[CONTEXT] The part to review starts here.' },
+  ];
 }
 
 const QUOTE_CHARS = 500;

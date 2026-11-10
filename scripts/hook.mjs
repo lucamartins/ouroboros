@@ -9,6 +9,7 @@ import { options } from './config.mjs';
 import { classifyPath, dataDir, projectKey, skillNameFromPath } from './paths.mjs';
 import { retireProfile } from './migrate.mjs';
 import { RUBRIC_SHORT } from './rubric.mjs';
+import { sessionStateText } from './session-state.mjs';
 import { globMatch, loadSettings } from './settings.mjs';
 import { countLines, readTranscript, usageSince } from './transcript.mjs';
 
@@ -102,7 +103,7 @@ export function isExcluded(cwd) {
 export const RESULT_RE = /\[ouroboros\]\s*reviewed=(\d+)\s+corrections=(\d+)\s+learned=(\d+)\s+patched=(\d+)/i;
 
 /** Instructions sent through the Stop hook to ask for a periodic review. */
-export function reviewRequest({ from, to, trigger, recoveries = [] }) {
+export function reviewRequest({ from, to, trigger, recoveries = [], state = '' }) {
   const why = trigger === 'recovery' ? 'after working through failures' : 'periodic';
   const signals = recoveries.map((r) => {
     let p = {};
@@ -113,6 +114,8 @@ export function reviewRequest({ from, to, trigger, recoveries = [] }) {
     `Ouroboros learning review (${why}). Before finishing, review user turns ${from}–${to} of this session — only what happened since the last review.`,
     'Use the `ouroboros:learn` skill if anything passes its filters (corrections of your approach, preferences, conventions, working paths found after errors); be brief and mention each saved item in one line.',
     signals.length ? `Signals recorded in this stretch:\n${signals.join('\n')}` : '',
+    state,
+    'Something worth keeping that is not settled yet (not verified, said once, still being worked out) is not saved and not lost: pass it in "open" when you call the skill\'s apply step, and the next review of this session picks it up.',
     'Count corrections: user turns in that range that redirected your approach, explicit or implicit.',
     'End your message with exactly this line (numbers filled in; learned/patched count only what you saved for this review), even when nothing was saved:',
     '[ouroboros] reviewed=<user turns reviewed> corrections=<n> learned=<items created> patched=<items updated>',
@@ -377,7 +380,10 @@ const handlers = {
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: 'Stop',
-        additionalContext: reviewRequest({ from: s.turns_at_last_review + 1, to: s.turns, trigger, recoveries }),
+        additionalContext: reviewRequest({
+          from: s.turns_at_last_review + 1, to: s.turns, trigger, recoveries,
+          state: sessionStateText(db, input.session_id, { audience: 'claude' }),
+        }),
       },
     }));
   },

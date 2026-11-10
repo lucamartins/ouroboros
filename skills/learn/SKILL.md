@@ -12,8 +12,10 @@ Focus: `$ARGUMENTS` — if empty, review the conversation since the last learnin
 ## 1. See what already exists
 
 ```bash
-node --no-warnings "${CLAUDE_PLUGIN_ROOT}/scripts/curator.mjs" inventory --data "${CLAUDE_PLUGIN_DATA}" --cwd "<current working directory>" --memory-dir "<your auto-memory directory, if your instructions name one>"
+node --no-warnings "${CLAUDE_PLUGIN_ROOT}/scripts/curator.mjs" inventory --data "${CLAUDE_PLUGIN_DATA}" --cwd "<current working directory>" --session "${CLAUDE_SESSION_ID}" --memory-dir "<your auto-memory directory, if your instructions name one>"
 ```
+
+When the session already has reviews behind it, the output ends with **This session so far**: what they saved, queued or did not save, and what they left open. Do not save those again; when the conversation since then refines, extends or contradicts one of them, patch that file instead of creating a new item.
 
 The inventory lists names and descriptions only. Before saving anything, **search the full text** of what the project already documents — CLAUDE.md files, `.claude/rules/`, skill bodies and memories — for the key terms of each item (tool names, commands, identifiers), e.g. `grep -ril "<term>" CLAUDE.md */CLAUDE.md */.claude/rules ~/.claude/skills/*/SKILL.md`. Most lessons from a project end up in its rules or skills; if it is already there, do not save it again, and if the skill that owns the procedure lacks a detail, **patch that skill** instead of creating a memory.
 
@@ -56,6 +58,8 @@ node --no-warnings "${CLAUDE_PLUGIN_ROOT}/scripts/curator.mjs" apply --data "${C
   "memory_dir": "<your auto-memory directory, if known>",
   "trigger": "manual",
   "session_id": "${CLAUDE_SESSION_ID}",
+  "open": ["<optional: something worth keeping that is not settled yet (not verified, said once, still being worked out), one line each>"],
+  "resolve": ["<optional: ids of open observations (o12) this review settled, saved or not>"],
   "actor": "<manual if the user explicitly asked you to remember or learn this (skips the autonomy setting; CLAUDE.md, rule files and corrections still wait); inloop otherwise>",
   "items": [
     { "op": "create", "kind": "global", "section": "<heading of ~/.claude/CLAUDE.md it belongs under>", "text": "Prefers concise answers in Portuguese; files on disk in English.", "confidence": 0.8 },
@@ -94,5 +98,7 @@ When Ouroboros asks for a periodic review (a Stop-hook message naming a range of
 ```
 [ouroboros] reviewed=<user turns reviewed> corrections=<n> learned=<items created> patched=<items updated>
 ```
+
+The request lists what earlier reviews of this session already handled and left open. Something that fails the rubric only because it is not settled yet (it has not been verified, the user said it once) goes in `"open"` (run the apply step with an empty `items` list if nothing else is saved) so the next review can close it; never save it early and never drop it silently.
 
 Corrections are user turns in the range that redirected your approach, explicit ("no, use X") or implicit ("hmm, it broke again", "I prefer the other way").
