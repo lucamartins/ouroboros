@@ -219,3 +219,45 @@ test('a proposal owned by an existing doc becomes a changeset that waits for app
   assert.equal(db.prepare('SELECT status FROM changesets WHERE id = ?').get(cs.id).status, 'applied');
   assert.equal(db.prepare('SELECT outcome FROM candidates WHERE id = ?').get(c.id).outcome, 'patched');
 });
+
+test('a request Claude labels as the user\'s skips the autonomy setting, never the approval rules', () => {
+  const claudeMd = path.join(cwdA, 'CLAUDE.md');
+  const before = fs.readFileSync(claudeMd, 'utf8');
+  const r = curator.apply(db, { cwd: cwdA, items: [
+    { kind: 'memory', memory_type: 'project', title: 'Staging database name', description: 'The staging database is called orders_stg', confidence: 0.4 },
+    { op: 'patch', target: claudeMd, append: 'Never push straight to main.', title: 'No direct pushes' },
+    { op: 'patch', target: claudeMd, old: 'Run pnpm test.', new: 'Run pnpm test:all.', title: 'Test command changed' },
+  ] }, { actor: 'requested', autonomy: 'queue' });
+  assert.deepEqual(r.map((x) => x.status), ['created', 'queued', 'queued']);
+  assert.match(r[1].reason, /CLAUDE\.md and rule files are always confirmed/);
+  assert.match(r[2].reason, /rewrites existing text/);
+  assert.equal(fs.readFileSync(claudeMd, 'utf8'), before);
+
+  // The CLI is what Claude calls from the learn skill: "manual" in its payload is a
+  // request, so a global fact still waits; only the inbox and the dashboard decide.
+  const cli = spawnSync(process.execPath, ['--no-warnings', path.join(root, 'scripts', 'curator.mjs'), 'apply'], {
+    input: JSON.stringify({ cwd: cwdA, actor: 'manual', items: [{ kind: 'global', text: 'Always answers reviews within one working day', confidence: 0.9 }] }),
+    encoding: 'utf8', env: { ...process.env, CLAUDE_PLUGIN_OPTION_AUTONOMY: 'auto' },
+  });
+  assert.equal(cli.status, 0, cli.stderr);
+  assert.equal(JSON.parse(cli.stdout.trim().split('\n').pop())[0].status, 'queued');
+  assert.doesNotMatch(fs.readFileSync(path.join(tmp, 'claude', 'CLAUDE.md'), 'utf8'), /one working day/);
+  for (const c of db.prepare("SELECT id FROM candidates WHERE outcome = 'queued'").all()) curator.decideQueued(db, c.id, false);
+});
+
+test('a proposal the screen gives no verdict for is never written unscreened', async () => {
+  const { tidyQueue } = await import('../scripts/evaluate.mjs');
+  curator.apply(db, { cwd: cwdA, items: [
+    { kind: 'memory', memory_type: 'project', title: 'Unscreened fact', description: 'NOVERDICT the cache lives in Redis', confidence: 0.8 },
+  ] }, { actor: 'background', autonomy: 'queue' });
+  const row = () => db.prepare("SELECT outcome, triaged_at, note FROM candidates WHERE title = 'Unscreened fact'").get();
+  const first = await tidyQueue(db, { autonomy: 'auto' });
+  assert.deepEqual([first.created, first.kept], [0, 0]);
+  assert.equal(row().triaged_at, null, 'screened once more on the next check');
+  await tidyQueue(db, { autonomy: 'auto' });
+  assert.equal(row().outcome, 'queued');
+  assert.ok(row().triaged_at);
+  assert.match(row().note, /no verdict/);
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM learnings WHERE title = 'Unscreened fact'").get().n, 0);
+  assert.equal((await tidyQueue(db, { autonomy: 'auto' })).total, 0);
+});

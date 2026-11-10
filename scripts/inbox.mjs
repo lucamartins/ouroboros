@@ -208,7 +208,7 @@ export function describeFile(file) {
   return 'A knowledge file';
 }
 
-const ORIGIN = { background: 'end-of-session review', session_end: 'end-of-session review', inloop: 'during the session', periodic: 'periodic review in the session', manual: 'you asked', backfill: 'review of a past session' };
+const ORIGIN = { background: 'end-of-session review', session_end: 'end-of-session review', inloop: 'during the session', periodic: 'periodic review in the session', manual: 'you asked', requested: 'you asked', backfill: 'review of a past session' };
 
 function dateOf(ts) {
   if (!ts) return null;

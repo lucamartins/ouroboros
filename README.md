@@ -85,7 +85,7 @@ Set when enabling the plugin, or later in `/config`:
 |---|---|---|
 | `learning` | `true` | Learn from sessions (off = measure only) |
 | `learning_language` | `en` | Language of saved learnings (`en`, `pt-BR` or `auto` = the conversation's) |
-| `autonomy` | `auto` | `auto` writes right away; `hybrid` writes confident facts and queues skills and tentative items; `queue` holds everything for approval. Explicit "remember that…" requests are always written |
+| `autonomy` | `auto` | `auto` writes right away; `hybrid` writes confident facts and queues skills and tentative items; `queue` holds everything for approval. Explicit "remember that…" requests skip this setting, but corrections and changes to CLAUDE.md or rule files always wait for you |
 | `inloop_review` | `true` | Periodic in-session reviews |
 | `review_every_turns` | `10` | User turns between in-session reviews |
 | `background_review` | `true` | End-of-session review |

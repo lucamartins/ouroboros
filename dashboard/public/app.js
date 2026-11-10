@@ -961,7 +961,7 @@ function changeKind(c) {
   return `${fixes ? 'Correction' : 'Addition'} to ${KIND_NAME[l?.kind] || 'a file'}`;
 }
 
-const ORIGIN = { inloop: 'in session', background: 'end-of-session review', manual: 'you asked' };
+const ORIGIN = { inloop: 'in session', background: 'end-of-session review', manual: 'you asked', requested: 'you asked' };
 
 function lifecycleNote(c) {
   const lc = c.lifecycle;

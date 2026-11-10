@@ -33,10 +33,11 @@ process.stdin.on('end', () => {
     structured = { claims: status, edits };
   } else if (schema.includes('"verdicts"')) {
     // Screen: DROPME -> covered, MERGEME -> merged into the first proposal,
-    // ROUTEME:<file> -> routed to that owner, FIXME -> a fix suggestion, else keep.
+    // ROUTEME:<file> -> routed to that owner, FIXME -> a fix suggestion, NOVERDICT -> no
+    // answer for that proposal, else keep.
     const props = [...prompt.matchAll(/<proposal id="(\d+)">([\s\S]*?)<\/proposal>/g)].map((m) => ({ id: Number(m[1]), text: m[2] }));
     structured = {
-      verdicts: props.map((p) => (p.text.includes('DROPME')
+      verdicts: props.filter((p) => !p.text.includes('NOVERDICT')).map((p) => (p.text.includes('DROPME')
         ? { id: p.id, verdict: 'drop', drop_kind: 'covered', reason: 'already documented', covered_by: 'CLAUDE.md' }
         : p.text.includes('ROUTEME:')
           ? { id: p.id, verdict: 'route', reason: 'owner exists', rule: 'owner', owner: /ROUTEME:(\S+)/.exec(p.text)[1],

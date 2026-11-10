@@ -565,8 +565,12 @@ function commitText(db, batch, t, after, item) {
 }
 
 /**
- * Whether an item proposed by Claude or the reviewer must wait for approval.
- * Explicit user requests (actor `manual`) are always written.
+ * Whether an item must wait for approval. Actors:
+ *   manual     the user decided on this very item (inbox, dashboard): always written
+ *   requested  Claude says the user asked for it in the session: skips the autonomy
+ *              setting, never the rules below (the label is Claude's own, so it cannot
+ *              be what lets a change to a CLAUDE.md, a rule file or existing text through)
+ *   inloop | background  proposed by Claude or the reviewer
  */
 export function needsApproval(item, actor, autonomy) {
   if (actor === 'manual') return false;
@@ -574,10 +578,18 @@ export function needsApproval(item, actor, autonomy) {
   // by people, versioned with the project), always wait for the user.
   if (item.corrects) return true;
   if (item.op === 'patch' && item.target && path.isAbsolute(String(item.target)) && ['rules', 'instructions'].includes(knowledgeKind(item.target))) return true;
+  if (actor === 'requested') return false;
   if (autonomy === 'auto') return false;
   if (autonomy === 'queue') return true;
   // hybrid: confident facts go in; skills and tentative items wait.
   return item.kind === 'skill' || item.confidence < 0.7;
+}
+
+/** Why a proposal waits, for the line the session shows. */
+function waitReason(item, actor, autonomy) {
+  if (item.corrects) return 'waiting for approval: it rewrites existing text (/ouroboros:inbox or the dashboard)';
+  if (needsApproval(item, 'requested', 'auto')) return 'waiting for approval: changes to CLAUDE.md and rule files are always confirmed (/ouroboros:inbox or the dashboard)';
+  return `waiting for approval (autonomy: ${autonomy}; /ouroboros:inbox or the dashboard)`;
 }
 
 /**
@@ -711,14 +723,14 @@ export function apply(db, payload, { actor = 'manual', autonomy = 'auto' } = {})
         const q = queueEdit(db, item, payload || {}, actor);
         results.push({
           status: 'queued', title: item.title || path.basename(item.target), candidateId: q.id, changesetId: q.changesetId, recompose: q.recompose || undefined,
-          reason: q.recompose ? 'waiting for approval; composed together with the change already waiting for this file' : `waiting for approval in the dashboard (autonomy: ${autonomy})`,
+          reason: q.recompose ? 'waiting for approval; composed together with the change already waiting for this file' : waitReason(item, actor, autonomy),
         });
         continue;
       }
       const q = enqueue(db, item, payload || {}, actor);
       results.push({
         status: 'queued', title: item.title || item.text, candidateId: q.id, replaced: q.replaced,
-        reason: q.replaced ? 'merged with a similar proposal already waiting for approval' : `waiting for approval in the dashboard (autonomy: ${autonomy})`,
+        reason: q.replaced ? 'merged with a similar proposal already waiting for approval' : waitReason(item, actor, autonomy),
       });
       continue;
     }
@@ -942,7 +954,11 @@ async function main() {
         process.exitCode = 1;
         return;
       }
-      const results = apply(db, payload, { actor: payload.actor || 'manual', autonomy: options().autonomy });
+      // The actor in the payload is Claude's own label. "manual" (the user asked for this
+      // in the session) is a request, not a decision: only the inbox and the dashboard,
+      // which call `apply` in-process, act as the user.
+      const actor = ['inloop', 'background'].includes(payload.actor) ? payload.actor : 'requested';
+      const results = apply(db, payload, { actor, autonomy: options().autonomy });
       // A queued edit that did not fit with the change already waiting for its file sends
       // both back to the editor: start the evaluation queue in the background.
       if (results.some((r) => r.recompose)) {

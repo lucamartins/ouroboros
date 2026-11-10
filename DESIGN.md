@@ -2,7 +2,7 @@
 
 > A Claude Code plugin that learns from your sessions on its own: it saves memories and creates/refines skills without being asked, in the spirit of Nous Research's Hermes Agent, and shows on a local dashboard what it learned, how much that is being used and what it costs.
 
-Status: v0.14.1 — every phase implemented (§13), plus the learning evaluation (§7.2), the v0.8 mechanism review (§7.4), the inbox reviewed in the conversation (§9.3), a dashboard that scales (§9.1: server-side paging and filters, the inbox grouped by project and file, page state in the URL, one project filter) and a knowledge graph (§9.4, read-only, drawn with a vendored D3 subset since v0.13). Next: measure the loop's value in real use (§7.4). Design decisions are summarized in [§12](#12-decisions).
+Status: v0.14.2 — every phase implemented (§13), plus the learning evaluation (§7.2), the v0.8 mechanism review (§7.4), the inbox reviewed in the conversation (§9.3), a dashboard that scales (§9.1: server-side paging and filters, the inbox grouped by project and file, page state in the URL, one project filter) and a knowledge graph (§9.4, read-only, drawn with a vendored D3 subset since v0.13). Next: measure the loop's value in real use (§7.4). Design decisions are summarized in [§12](#12-decisions).
 
 ---
 
@@ -66,7 +66,7 @@ Dashboard (node, 127.0.0.1) ◄── events.db + scan of memories/skills + tran
 | Generic learned skills | `~/.claude/skills/learned-<name>/SKILL.md` | Apply to every project; prefix marks the origin |
 | Project learned skills | target from the routing map (e.g. `**/acme-*` → `~/src/acme-skills/skills`) or the repo's `.claude/skills/` | Don't leak into other projects |
 
-Ouroboros never writes to a CLAUDE.md (global or project) without the user's approval, unless the user asked for that change in the session (§7.3, autonomy).
+Ouroboros never writes to a CLAUDE.md (global or project) without the user's approval, even when the user asked for that change in the session: the request is queued and the user confirms it in the inbox (§7.3, autonomy).
 
 Every memory/skill Ouroboros creates carries in its frontmatter:
 
@@ -280,7 +280,7 @@ These came from reviewing real proposals by hand, item by item, and turning ever
 
 ### 7.2 Learning evaluation
 
-Every proposal from a Claude-less path (end-of-session reviewer, learning backfill, approval queue) is evaluated before it is written or queued (`scripts/evaluate.mjs`). A learning is written only when two independent judgments agree: the **screen** and the **editor**.
+Every proposal from a Claude-less path (end-of-session reviewer, learning backfill, approval queue) is evaluated before it is written or queued (`scripts/evaluate.mjs`). A change to an existing file is written only when two independent judgments agree: the **screen** and the **editor**. A new memory or skill has no file for an editor to read: it is written when the reviewer proposed it, the screen kept it and the curator's checks (dedupe, budgets, approval rules) pass. A proposal the screen returns no verdict for is never written: it is screened once more and then waits for the user (v0.14.2; until then it was treated as kept).
 
 **Why it is built this way.** During development, the first learning backfill (60 proposals from 30 past sessions) and two rounds of hand review showed where single-pass judgment fails: a third of the proposals were already documented; the same fact arrived in two languages, or aimed at two different owners; one-off requests looked like rules; and, most of all, a proposal judged from *excerpts* of a file can repeat what the rest of the file already says, contradict another line of it, or contradict the code. Each proposal was also resolved alone, so two learnings could make conflicting edits to the same file, and an edit computed on one day was applied blindly days later.
 
@@ -328,7 +328,7 @@ How each transition happens (phase 4):
 - **Daily maintenance** (`review-worker.mjs --maintain`, started by `SessionStart` at most every 20 h, results shown as notices):
   - *decay* — archive Ouroboros memories/skills unused for `archiveAfterDaysUnused` days whose confidence is below 0.7 (native items, CLAUDE.md files included, are never touched);
   - *trim* — memory indexes and learned skills past `consolidateAt` archive their weakest items (`confidence × log2(1 + uses)`) down to 70%.
-- **Autonomy** (`auto` | `hybrid` | `queue`): proposals from Claude (`actor: inloop`) or the reviewer (`background`) that need approval are stored as `queued` candidates with their full payload; explicit user requests (`actor: manual`) are always written. `hybrid` writes facts with confidence ≥ 0.7 and queues skills and tentative items. Changes to existing files wait as changesets (§7.2), shown as diffs. Approve/Reject in the dashboard runs the stored proposal through the curator, or applies/rejects the changeset.
+- **Autonomy** (`auto` | `hybrid` | `queue`): proposals from Claude (`actor: inloop`) or the reviewer (`background`) that need approval are stored as `queued` candidates with their full payload; A request Claude labels as the user's (`actor: requested`; the `learn` skill's `"actor": "manual"`) skips the autonomy setting only: corrections and changes to rule files or a CLAUDE.md still wait, because the label is Claude's own and must not be what lets them through (v0.14.2). Only a decision the user makes on an entry (inbox, dashboard: `actor: manual`, set in-process, never from a payload) is always written. `hybrid` writes facts with confidence ≥ 0.7 and queues skills and tentative items. Changes to existing files wait as changesets (§7.2), shown as diffs. Approve/Reject in the dashboard runs the stored proposal through the curator, or applies/rejects the changeset.
 - **Exclusions**: hooks do nothing at all in projects matching `excludeProjects`.
 
 ### 7.4 Mechanism review (v0.8)
@@ -369,7 +369,7 @@ learnings (id, kind, scope, project, path, title, confidence, status,
           -- status: active | archived | reverted
 writes    (id, batch, learning_id, ts, op, actor, session_id, file, before, after, reverted_at, title, why)
           -- title/why: what the batch learned and where it came from (v0.8.2); the learn skill passes the session id
-          -- op: create | patch | archive | revert ; actor: inloop | background | manual | native
+          -- op: create | patch | archive | revert ; actor: inloop | background | requested | manual | native
 reviews   (id, session_id, mode, trigger, model, turns_reviewed, corrections, learned, patched,
            input_tokens, output_tokens, cache_tokens, cost_usd, ts)
           -- mode: inloop | background | measure | manual
@@ -513,7 +513,7 @@ Phase 1 is read-only on purpose. Later, the same graph could drive behavior: wri
 | Skill destination | Automatic routing (global vs project, with a per-repo map) |
 | Repository | Public on GitHub, MIT; every file in English |
 | Runtime | Node ≥ 22.13, zero dependencies |
-| Judging learnings | One rubric everywhere; screen + editor must both agree before anything is written |
+| Judging learnings | One rubric everywhere; screen + editor must both agree before an existing file is changed; a new item needs the screen and the curator; no verdict means nothing is written |
 | Changes to existing files | One changeset per file, composed with every pending learning; the model writes exact-fragment edits, code validates and applies them; re-applied to the current file on approval |
 | Additions vs corrections | Decided by code, not by the model's label: only a pure insertion is an addition; any rewrite is a correction and waits for the user, on both write paths |
 | Reviewing the inbox | Two equal ways over one module (`inbox.mjs`): the dashboard, and `/ouroboros:inbox` in the conversation, one entry at a time, where the user can discuss and edit before approving |

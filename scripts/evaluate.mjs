@@ -10,7 +10,8 @@
 //               writes one coherent set of exact-fragment edits
 //   4. validate (changesets.mjs) edits are applied by code, never by the model, and
 //               only when safe; the result is one changeset per file
-// A learning is written only when the screen and the editor both say so.
+// A change to an existing file is written only when the screen and the editor both say
+// so; a new item needs the screen's verdict and the curator. No verdict, no write.
 import fs from 'node:fs';
 import path from 'node:path';
 import { options } from './config.mjs';
@@ -146,6 +147,8 @@ ELSEWHERE (what other files say on these topics; a "source of truth" excerpt is 
 ${elsewhere.length ? elsewhere.map((e) => `<excerpt file="${e.file}" kind="${e.kind === 'source' ? 'source of truth' : 'knowledge'}"${e.heading ? ` heading="${e.heading}"` : ''}>\n${e.text.slice(0, 700)}\n</excerpt>`).join('\n') : '(nothing related)'}`;
 }
 
+/** Screening calls that may leave a proposal unanswered before it waits for the user. */
+const MAX_SCREEN_MISSES = 2;
 const ELSEWHERE_PER_CLAIM = 2;
 const ELSEWHERE_MAX = 8;
 
@@ -335,7 +338,7 @@ function isGlobalFact(item) {
  * ctx: { cwd, sessionId, sessionStartedAt, actor, autonomy, lang, model, payload }.
  */
 export async function evaluate(db, rows, ctx) {
-  const report = { total: rows.length, kept: 0, created: 0, dropped: 0, merged: 0, routed: 0, suggested: 0, stale: 0, queued: 0, patched: 0, cost: 0, calls: 0, byRule: {}, results: [] };
+  const report = { total: rows.length, kept: 0, created: 0, dropped: 0, merged: 0, routed: 0, suggested: 0, stale: 0, queued: 0, patched: 0, unscreened: 0, cost: 0, calls: 0, byRule: {}, results: [] };
   if (!rows.length) return report;
   const items = new Map(rows.map((r) => {
     let item = {};
@@ -376,7 +379,21 @@ export async function evaluate(db, rows, ctx) {
         report.stale++;
       }
     }
-    if (!v) { creates.push({ row, item }); continue; }
+    if (!v) {
+      // The screen did not answer for this proposal. Nothing is written unscreened: it
+      // is screened once more, and after that it waits for the user.
+      const payload = payloadOf(row);
+      const misses = (Number(payload.screen_misses) || 0) + 1;
+      if (misses < MAX_SCREEN_MISSES) {
+        db.prepare('UPDATE candidates SET payload = ?, triaged_at = NULL WHERE id = ?').run(JSON.stringify({ ...payload, screen_misses: misses }), row.id);
+      } else {
+        report.queued++;
+        setOutcome(db, row.id, 'queued', 'the knowledge check gave no verdict for it; nothing was written, you decide', { changeset_id: null });
+        report.results.push({ status: 'queued', title: row.title, candidateId: row.id });
+      }
+      report.unscreened++;
+      continue;
+    }
     if (v.verdict === 'drop' || v.verdict === 'merge') {
       report[v.verdict === 'drop' ? 'dropped' : 'merged']++;
       setOutcome(db, row.id, v.verdict === 'drop' ? 'dropped' : 'merged', noteFor(v), { changeset_id: null });
