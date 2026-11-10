@@ -10,6 +10,7 @@ All notable changes to Ouroboros. Versions follow [semantic versioning](https://
 - Not for corrections of what a file says, the global CLAUDE.md, or the `queue` setting: those wait as before.
 - 0.22.1: the correction count no longer includes you changing your own mind or adding an exception to what you said; a planning or design conversation no longer leaves "lessons" as memories; having to repeat something already saved is now detected from your own words, not only when the reviewer notices; the dashboard inbox shows when a waiting change is already active as a project memory. `node scripts/eval.mjs --sessions` measures the session-reading prompts on cases from real mistakes.
 - 0.22.2: outside a git repository a project is keyed by its folder exactly as Claude Code names it (the key no longer gains a drive letter on Windows for a path given without one).
+- 0.22.3: from the first real use. The periodic review request shown in the session is a few lines instead of a screenful; it lists only commands that failed repeatedly (not one failed `git show` or a file read retried), says each earlier learning once, and no longer interrupts while background agents are still running.
 
 ## 0.21.0 — 2026-11-10
 

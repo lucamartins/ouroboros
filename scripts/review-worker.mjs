@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { options } from './config.mjs';
 import { destinationsText } from './router.mjs';
 import { rubricText } from './rubric.mjs';
-import { isExcluded } from './hook.mjs';
+import { isExcluded, significantRecoveries } from './hook.mjs';
 import { logError, monthSpend, openDb } from './db.mjs';
 import { inventoryForPrompt, parseFrontmatter } from './inventory.mjs';
 import { tokenize } from './knowledge.mjs';
@@ -517,7 +517,7 @@ export async function reviewSession(db, sessionId, trigger, overrides = {}) {
   // What the tail does not show by itself: what earlier reviews of this session did and
   // left open, and the failures the session worked through since the last one.
   const lastReview = learnBackfill ? 0 : db.prepare("SELECT MAX(ts) t FROM reviews WHERE session_id = ? AND status = 'ok' AND mode IN ('inloop', 'background', 'measure')").get(sessionId).t || 0;
-  const recoveries = learnBackfill ? [] : db.prepare("SELECT target, payload FROM events WHERE session_id = ? AND kind = 'recovery' AND ts > ? ORDER BY id DESC LIMIT 8").all(sessionId, lastReview);
+  const recoveries = learnBackfill ? [] : significantRecoveries(db.prepare("SELECT target, payload FROM events WHERE session_id = ? AND kind = 'recovery' AND ts > ? ORDER BY id DESC LIMIT 30").all(sessionId, lastReview), opts.earlyReviewFailures).slice(0, 8);
   const state = mode === 'background' && !learnBackfill ? sessionStateText(db, sessionId) : '';
   const signals = recoveries.map((r) => {
     let p = {};

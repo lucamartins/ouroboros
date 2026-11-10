@@ -102,7 +102,24 @@ export function isExcluded(cwd) {
 
 export const RESULT_RE = /\[ouroboros\]\s*reviewed=(\d+)\s+corrections=(\d+)\s+learned=(\d+)\s+patched=(\d+)/i;
 
-/** Instructions sent through the Stop hook to ask for a periodic review. */
+/**
+ * The recoveries worth showing to a review: a command that failed at least
+ * `minFailures` times before it worked. One failed try, or an edit or a read retried
+ * until it applied, is everyday mechanics: listing those buried the real ones.
+ */
+export function significantRecoveries(rows, minFailures = 2) {
+  return (rows || []).filter((r) => {
+    if (FILE_TOOL_RE.test(String(r.target || ''))) return false;
+    try { return (JSON.parse(r.payload || '{}').failures || 0) >= minFailures; } catch { return false; }
+  });
+}
+
+/**
+ * Instructions sent through the Stop hook to ask for a periodic review. Claude Code
+ * shows this text to the user every time, so it carries only what changes from one
+ * review to the next (the range, the signals, the session's state, the result line);
+ * how to review lives in the `learn` skill ("Periodic reviews").
+ */
 export function reviewRequest({ from, to, trigger, recoveries = [], state = '' }) {
   const why = trigger === 'recovery' ? 'after working through failures' : 'periodic';
   const signals = recoveries.map((r) => {
@@ -111,14 +128,10 @@ export function reviewRequest({ from, to, trigger, recoveries = [], state = '' }
     return `- \`${r.target}\` failed ${p.failures || '?'}× before working${p.first_error ? ` (first error: ${String(p.first_error).split('\n')[0].slice(0, 120)})` : ''}`;
   });
   return [
-    `Ouroboros learning review (${why}). Before finishing, review user turns ${from}–${to} of this session — only what happened since the last review.`,
-    'Use the `ouroboros:learn` skill if anything passes its filters (corrections of your approach, preferences, conventions, working paths found after errors); be brief and mention each saved item in one line.',
-    signals.length ? `Signals recorded in this stretch:\n${signals.join('\n')}` : '',
+    `Ouroboros learning review (${why}): user turns ${from}–${to} only. Follow "Periodic reviews" in the \`ouroboros:learn\` skill; be brief, and say so in one line when nothing is worth keeping.`,
+    signals.length ? `Worked through failures:\n${signals.join('\n')}` : '',
     state,
-    'Something worth keeping that is not settled yet (not verified, said once, still being worked out) is not saved and not lost: pass it in "open" when you call the skill\'s apply step, and the next review of this session picks it up.',
-    'Count corrections: user turns in that range that redirected your approach, explicit or implicit.',
-    'End your message with exactly this line (numbers filled in; learned/patched count only what you saved for this review), even when nothing was saved:',
-    '[ouroboros] reviewed=<user turns reviewed> corrections=<n> learned=<items created> patched=<items updated>',
+    'End with exactly this line: [ouroboros] reviewed=<user turns reviewed> corrections=<n> learned=<items created> patched=<items updated>',
   ].filter(Boolean).join('\n');
 }
 
@@ -378,6 +391,9 @@ const handlers = {
 
     // 2. Decide whether to ask for a periodic review now.
     if (!opts.learning || !opts.inloopReview || input.stop_hook_active || input.agent_id) return;
+    // Background agents or commands are still running: Claude stopped only to wait for
+    // them, in the middle of the work. The review waits for a stop that ends something.
+    if (Array.isArray(input.background_tasks) && input.background_tasks.length) return;
     const turnsSince = s.turns - s.turns_at_last_review;
     const trigger = turnsSince >= opts.reviewEveryTurns ? 'periodic'
       : recoveredThisTurn(db, input.session_id, opts.earlyReviewFailures) && earlyAllowed(db, input.session_id, s.turns) ? 'recovery'
@@ -390,8 +406,8 @@ const handlers = {
       WHERE id = ?
     `).run(now, line, trigger, input.session_id);
     const since = db.prepare("SELECT MAX(ts) t FROM reviews WHERE session_id = ? AND status = 'ok'").get(input.session_id).t || s.started_at || 0;
-    const recoveries = db.prepare("SELECT target, payload FROM events WHERE session_id = ? AND kind = 'recovery' AND ts > ? ORDER BY id DESC LIMIT 5")
-      .all(input.session_id, since);
+    const recoveries = significantRecoveries(db.prepare("SELECT target, payload FROM events WHERE session_id = ? AND kind = 'recovery' AND ts > ? ORDER BY id DESC LIMIT 20")
+      .all(input.session_id, since), opts.earlyReviewFailures).slice(0, 5);
     addEvent(db, input, now, 'review_requested', trigger, { turns: [s.turns_at_last_review + 1, s.turns] });
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {

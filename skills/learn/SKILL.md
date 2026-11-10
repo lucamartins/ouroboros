@@ -108,12 +108,12 @@ The user can revert any write with `/ouroboros:undo`.
 
 ## Periodic reviews
 
-When Ouroboros asks for a periodic review (a Stop-hook message naming a range of user turns), review only that range, keep it short, and **always** end your message with the result line it asks for — even when nothing was saved:
+When Ouroboros asks for a periodic review (a short Stop-hook message naming a range of user turns), review only that range: what happened since the last review. Use the steps above only if something passes the rubric (a correction of your approach, a preference, a convention, a working path found after errors), mention each saved item in one line, keep the whole thing short, and **always** end your message with the result line it asks for — even when nothing was saved (`learned` and `patched` count only what you saved in this review):
 
 ```
 [ouroboros] reviewed=<user turns reviewed> corrections=<n> learned=<items created> patched=<items updated>
 ```
 
-The request lists what earlier reviews of this session already handled and left open. Something that fails the rubric only because it is not settled yet (it has not been verified, the user said it once) goes in `"open"` (run the apply step with an empty `items` list if nothing else is saved) so the next review can close it; never save it early and never drop it silently.
+The request lists what earlier reviews of this session already handled and left open, and the commands that failed repeatedly before working in this stretch. Do not save again what is listed as handled; when the stretch refines, extends or contradicts one of those, patch that file (or the waiting change) instead of creating a new item. Something that fails the rubric only because it is not settled yet (it has not been verified, the user said it once) goes in `"open"` (run the apply step with an empty `items` list if nothing else is saved) so the next review can close it; never save it early and never drop it silently.
 
 Corrections are user turns in the range that redirected your approach, explicit ("no, use X") or implicit ("hmm, it broke again", "I prefer the other way").

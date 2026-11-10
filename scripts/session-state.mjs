@@ -81,6 +81,21 @@ export function refFile(db, sessionId, ref) {
 }
 
 /**
+ * What an entry says, once: its title, then its text only when that adds something (a
+ * title is often the first words of the text, and printing both read as a stutter).
+ * `brief`: what Claude sees in session, where it already has the conversation: the title
+ * of what was saved is enough; what was not saved keeps a little of its text.
+ */
+function said(l, brief) {
+  const title = oneLine(l.title, 120);
+  const text = oneLine(String(l.text ?? '').replace(/^\s*[-*]\s+/, ''), brief ? 140 : 220);
+  const norm = (x) => x.toLowerCase().replace(/[…\s.]+$/, '');
+  if (!text || norm(text).startsWith(norm(title)) || norm(title).startsWith(norm(text))) return text.length > title.length ? text : title;
+  if (brief && l.status === 'saved') return title;
+  return `${title} — ${text}`;
+}
+
+/**
  * The state as text for a review prompt, or '' when the session has none.
  * `audience`: 'reviewer' (the end-of-session model, which answers with "refines") or
  * 'claude' (the in-session review, which patches the file itself).
@@ -90,24 +105,21 @@ export function sessionStateText(db, sessionId, { audience = 'reviewer' } = {}) 
   const open = openObservations(db, sessionId);
   if (!learned.length && !open.length) return '';
   const LABEL = { saved: 'saved', waiting: 'waiting for approval', conflict: 'conflict, waiting for the user', dropped: 'not saved', suggested: 'suggested as a fix in the project', rejected: 'rejected by the user' };
+  const brief = audience === 'claude';
   const out = [];
   if (learned.length) {
-    out.push('Already handled by earlier reviews of this session:');
+    out.push(brief ? 'Already handled this session (do not save again; if this stretch refines one, patch that file or the waiting change):' : 'Already handled by earlier reviews of this session:');
     for (const l of learned) {
       const where = l.file ? ` → ${path.basename(path.dirname(l.file))}/${path.basename(l.file)}` : '';
       const why = l.status === 'dropped' && l.note ? ` (${oneLine(l.note, 120)})` : '';
-      out.push(`- [${l.ref}] ${LABEL[l.status]}${where}: ${oneLine(l.title, 120)}${l.text ? ` — ${oneLine(l.text, 220)}` : ''}${why}`);
+      out.push(`- [${l.ref}] ${LABEL[l.status]}${where}: ${said(l, brief)}${why}`);
     }
-    out.push(audience === 'reviewer'
-      ? 'Do not propose these again. If this part refines, extends or contradicts one of them, propose ONE item that states the whole updated fact and set "refines" to its [ref]; an item rejected or not saved is proposed again only if this part adds what it lacked.'
-      : 'Do not save these again. If this stretch refines, extends or contradicts one of them, patch that file (or the waiting change) instead of creating a new item.');
+    if (!brief) out.push('Do not propose these again. If this part refines, extends or contradicts one of them, propose ONE item that states the whole updated fact and set "refines" to its [ref]; an item rejected or not saved is proposed again only if this part adds what it lacked.');
   }
   if (open.length) {
-    out.push('', 'Left open by earlier reviews (noticed, not settled yet):');
+    out.push(...(brief ? [] : ['']), brief ? 'Left open (settle or drop them: "resolve" in the apply step):' : 'Left open by earlier reviews (noticed, not settled yet):');
     for (const o of open) out.push(`- [o${o.id}] ${o.text}`);
-    out.push(audience === 'reviewer'
-      ? 'If this part settles one of them (it worked, the user confirmed or repeated it), propose it as an item with the earlier context in mind; if it shows it was wrong or a one-off, leave it out.'
-      : 'If this stretch settles one of them, save it now and list its id in "resolve"; if it shows it was wrong or a one-off, list it in "resolve" without saving.');
+    if (!brief) out.push('If this part settles one of them (it worked, the user confirmed or repeated it), propose it as an item with the earlier context in mind; if it shows it was wrong or a one-off, leave it out.');
   }
   return out.join('\n');
 }

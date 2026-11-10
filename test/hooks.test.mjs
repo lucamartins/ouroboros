@@ -260,6 +260,25 @@ test('a recovery is one turn working through an error; retrying a file edit asks
   assert.equal(hook('Stop', { ...sid, stop_hook_active: false }), '');
 });
 
+test('a review lists only commands that failed repeatedly, and waits while background work is running', async () => {
+  const { significantRecoveries, reviewRequest } = await import('../scripts/hook.mjs');
+  const rows = [
+    { target: 'Bash:git show', payload: JSON.stringify({ failures: 1, first_error: 'Exit code 2' }) },
+    { target: 'Read:C:\\Temp\\big.md', payload: JSON.stringify({ failures: 3, first_error: 'exceeds maximum allowed tokens' }) },
+    { target: 'Bash:pnpm test', payload: JSON.stringify({ failures: 3, first_error: 'DATABASE_URL is not set' }) },
+  ];
+  assert.deepEqual(significantRecoveries(rows, 2).map((r) => r.target), ['Bash:pnpm test']);
+  assert.doesNotMatch(reviewRequest({ from: 1, to: 2, trigger: 'periodic', recoveries: significantRecoveries(rows, 2) }), /git show|big\.md/);
+
+  const sid = { session_id: 's11' };
+  const every1 = { CLAUDE_PLUGIN_OPTION_REVIEW_EVERY_TURNS: '1' };
+  hook('UserPromptSubmit', sid, every1);
+  // Claude stopped only to wait for its background agents: not the moment to review.
+  assert.equal(hook('Stop', { ...sid, stop_hook_active: false, background_tasks: [{ id: 'a1', description: 'Verify docs' }] }, every1), '');
+  // The next stop, with nothing running, asks for it.
+  assert.match(hook('Stop', { ...sid, stop_hook_active: false, background_tasks: [] }, every1), /Ouroboros learning review \(periodic\): user turns 1–1 only/);
+});
+
 test('learning can be turned off; reads of learned items count as uses', () => {
   const off = spawnSync(process.execPath, ['--no-warnings', path.join(root, 'scripts', 'hook.mjs'), 'SessionStart'], {
     input: JSON.stringify({ session_id: 's2', cwd: '/tmp/proj', hook_event_name: 'SessionStart', source: 'startup' }),
