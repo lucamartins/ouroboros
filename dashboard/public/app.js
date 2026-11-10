@@ -735,7 +735,8 @@ function changeCard(c) {
     h('div', { class: 'diffs' }, c.edits.map(editDiff)),
     h('ol', { class: 'claims', 'aria-label': 'Learnings behind this change' }, c.claims.map((l, i) => h('li', {},
       h('span', { class: 'n' }, `${i + 1}.`),
-      h('div', { class: 'claim-text' }, l.claim || l.title, l.note ? h('div', { class: 'small muted' }, reasonOf(l.note)) : null),
+      h('div', { class: 'claim-text' }, l.claim || l.title, l.note ? h('div', { class: 'small muted' }, reasonOf(l.note)) : null,
+        l.meanwhile ? h('div', { class: 'small muted', title: tilde(l.meanwhile) }, 'Already active as a project memory. Approving writes it here and retires that memory; rejecting keeps the memory.') : null),
       c.claims.length > 1
         ? actionButton('Remove', 'reject', String(l.id), { variant: 'quiet', small: true, confirmText: 'Remove it?', title: 'Reject this learning; the rest of the change is composed again without it' })
         : h('span'),

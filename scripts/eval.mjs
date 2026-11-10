@@ -3,6 +3,10 @@
 //   node eval.mjs --synthetic [--model haiku]
 //       Builds the fake project in test/eval/synthetic.json in a temp dir, runs every
 //       proposal through the evaluation and scores each against its known right outcome.
+//   node eval.mjs --sessions [--model haiku] [--runs 2] [--only id,id]
+//       Scores the two calls that read sessions (the corrections instrument and the
+//       end-of-session reviewer) on cases taken from real mistakes; each case runs
+//       several times, because the same call can answer differently.
 //   node eval.mjs --replay [--data <dir>] [--limit 40]
 //       Replays the proposals YOU approved or rejected, on a copy of the database (no
 //       file is written), and reports how often the evaluation agrees with you.
@@ -155,7 +159,84 @@ async function replay({ data, limit }) {
   return { agree, total: decided.length, cost: report.cost };
 }
 
+/**
+ * The two calls that read sessions, scored against cases taken from real mistakes
+ * (test/eval/sessions.json): the corrections instrument (which user turns it counts)
+ * and the end-of-session reviewer (what it proposes). Models vary from run to run, so
+ * each case runs `runs` times and the score is the share of runs that got it right.
+ */
+async function sessionsEval({ model, runs = 2, only = null }) {
+  const spec = JSON.parse(fs.readFileSync(path.join(here, '..', 'test', 'eval', 'sessions.json'), 'utf8'));
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ouroboros-eval-'));
+  process.env.OUROBOROS_REVIEWER_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || '';
+  process.env.CLAUDE_CONFIG_DIR = path.join(tmp, 'claude');
+  process.env.CLAUDE_PLUGIN_DATA = path.join(tmp, 'data');
+  const worker = await import('./review-worker.mjs');
+  const { buildDigest } = await import('./transcript.mjs');
+  const use = model || 'haiku';
+  const digestOf = (c) => {
+    const entries = c.turns.map(([who, text]) => (who === 'u'
+      ? { type: 'user', origin: { kind: 'human' }, message: { content: text } }
+      : { type: 'assistant', message: { content: [{ type: 'text', text }] } }));
+    return buildDigest(entries, { fromLine: c.from || 0, contextTurns: 3 }).text;
+  };
+  const started = Date.now();
+  let cost = 0;
+  let good = 0;
+  let total = 0;
+  const call = async (prompt, schema) => {
+    const r = await worker.runModel({ prompt, schema, model: use });
+    cost += Number(r.total_cost_usd) || 0;
+    return r.structured_output;
+  };
+  const tally = (id, results) => {
+    const ok = results.filter((r) => r.ok).length;
+    good += ok;
+    total += results.length;
+    const miss = results.filter((r) => !r.ok).map((r) => r.why).filter(Boolean);
+    console.log(`${ok === results.length ? 'PASS' : ok ? 'FLAKY' : 'FAIL'}  ${pad(id, 44)} ${ok}/${results.length}${miss.length ? `  ${[...new Set(miss)].join(' | ').slice(0, 200)}` : ''}`);
+  };
+  console.log(`corrections instrument (${use}, ${runs} runs per case)`);
+  for (const c of spec.instrument.filter((x) => !only || only.includes(x.id))) {
+    const results = [];
+    for (let i = 0; i < runs; i++) {
+      const out = await call(worker.correctionsPrompt({ digest: digestOf(c) }), worker.CORRECTIONS_ONLY_SCHEMA);
+      const counted = new Set((out.corrections || []).map((x) => x.user_turn));
+      const missed = c.must.filter((n) => !counted.has(n));
+      const wrong = c.mustNot.filter((n) => counted.has(n));
+      results.push({ ok: !missed.length && !wrong.length, why: [missed.length ? `missed #${missed.join(',#')}` : '', wrong.length ? `counted #${wrong.join(',#')}` : ''].filter(Boolean).join(' ') });
+    }
+    tally(c.id, results);
+  }
+  console.log(`\nend-of-session reviewer (${use}, ${runs} runs per case)`);
+  for (const c of spec.reviewer.filter((x) => !only || only.includes(x.id))) {
+    const results = [];
+    for (let i = 0; i < runs; i++) {
+      const out = await call(worker.learnPrompt({ digest: digestOf(c), inventory: c.inventory || '(nothing saved yet)', state: c.state || '', lang: 'en' }), worker.LEARN_SCHEMA);
+      const items = out.items || [];
+      const textOf = (it) => [it.title, it.text, it.description, it.body].filter(Boolean).join(' ');
+      const e = c.expect;
+      const why = [];
+      if (e.max !== undefined && items.length > e.max) why.push(`proposed ${items.length}: ${items.map((it) => it.title).join('; ').slice(0, 120)}`);
+      for (const s of e.some || []) {
+        const hit = items.find((it) => new RegExp(s.match, 'i').test(textOf(it)) && (!s.kind || it.kind === s.kind) && (!s.refines || it.refines === s.refines));
+        if (!hit) why.push(`no item /${s.match}/${s.kind ? ` as ${s.kind}` : ''}${s.refines ? ` refining ${s.refines}` : ''}`);
+      }
+      for (const n of e.none || []) {
+        const hit = items.find((it) => new RegExp(n, 'i').test(textOf(it)));
+        if (hit) why.push(`proposed /${n}/: ${hit.title}`);
+      }
+      results.push({ ok: !why.length, why: why.join('; ') });
+    }
+    tally(c.id, results);
+  }
+  console.log(`\nscore ${good}/${total} runs right · cost $${cost.toFixed(4)} · ${Math.round((Date.now() - started) / 1000)} s`);
+  fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  return { good, total, cost };
+}
+
 const a = args(process.argv.slice(2));
 if (a.synthetic) await synthetic({ model: typeof a.model === 'string' ? a.model : null, judge: typeof a.judge === 'string' ? a.judge : null });
+else if (a.sessions) await sessionsEval({ model: typeof a.model === 'string' ? a.model : null, runs: Number(a.runs) || 2, only: typeof a.only === 'string' ? a.only.split(',') : null });
 else if (a.replay) await replay({ data: typeof a.data === 'string' ? a.data : undefined, limit: a.limit });
 else console.log('usage: node eval.mjs --synthetic [--model <m>] [--judge <m>] | --replay [--data <dir>] [--limit <n>]');

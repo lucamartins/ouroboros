@@ -277,11 +277,28 @@ test('a saved learning the user had to repeat is counted, and from the second ti
   assert.equal(recordMiss(db, session, `${l.name}.md`), l.id);
   assert.equal(db.prepare("SELECT COUNT(*) n FROM candidates WHERE outcome = 'suggested' AND target = ?").get(l.path).n, 0);
   recordMiss(db, session, l.name);
-  recordMiss(db, session, l.title);
+  assert.equal(db.prepare('SELECT misses FROM learnings WHERE id = ?').get(l.id).misses, 1, 'the same session counts once');
+  recordMiss(db, { ...session, id: 'miss-2' }, l.name);
+  recordMiss(db, { ...session, id: 'miss-3' }, l.title);
   const after = db.prepare('SELECT misses, confidence FROM learnings WHERE id = ?').get(l.id);
   assert.deepEqual([after.misses, after.confidence], [3, l.confidence], 'a miss never lowers confidence');
   const sug = db.prepare("SELECT title, note FROM candidates WHERE outcome = 'suggested' AND target = ?").all(l.path);
   assert.equal(sug.length, 1);
   assert.match(sug[0].title, /^Saved but repeated: Ask before force pushing/);
   assert.match(sug[0].note, /^fix in the project: reword what is saved/);
+});
+
+test('a correction about something saved before the session is a miss even when the reviewer does not name it', async () => {
+  const { missFromQuote } = await import('../scripts/review-worker.mjs');
+  const [m] = curator.apply(db, { cwd: cwdA, items: [{ kind: 'memory', memory_type: 'feedback', title: 'Never commit directly to main', description: 'Every change goes through a pull request; never commit or push directly to main', confidence: 0.8, owner_checked: true }] });
+  assert.equal(m.status, 'created', m.reason);
+  const l = () => db.prepare('SELECT misses, project FROM learnings WHERE id = ?').get(m.id);
+  const session = (id, started) => ({ id, project: l().project, cwd: cwdA, started_at: started });
+  const later = Date.now() + 60_000;
+  assert.equal(missFromQuote(db, session('q1', later), 'again?! I already told you last week: never commit directly to main, always a pull request'), m.id);
+  assert.equal(missFromQuote(db, session('q1', later), 'never commit directly to main, open a pull request'), m.id);
+  assert.equal(l().misses, 1, 'once per session');
+  assert.equal(missFromQuote(db, session('q2', later), 'no, use tabs for indentation in the makefile'), null, 'another subject');
+  assert.equal(missFromQuote(db, session('q3', Date.now() - 3600_000), 'never commit directly to main, always a pull request'), null, 'saved during this session: the correction that taught it is not a miss');
+  assert.equal(l().misses, 1);
 });

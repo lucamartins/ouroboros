@@ -13,7 +13,7 @@ export const RULES = [
   {
     id: 'standing',
     test: 'Is it a standing rule or a lasting fact?',
-    fail: 'Drop instructions given once for one task. A request becomes a rule only when the user says so ("always", "from now on"), repeats it, or records a decision meant to last.',
+    fail: 'Drop instructions given once for one task, including how one conversation should proceed (what to do first, what to fix before what). A request becomes a rule only when the user says so ("always", "from now on"), repeats it, or records a decision meant to last.',
   },
   {
     id: 'not-derivable',
@@ -28,7 +28,7 @@ export const RULES = [
   {
     id: 'durable',
     test: 'Will it still be true and useful in six months?',
-    fail: 'Drop status updates, to-dos (they belong in a task tracker), counts, timings, issue/PR numbers and anything about finished work.',
+    fail: 'Drop status updates, to-dos (they belong in a task tracker), counts, timings, issue/PR numbers and anything about finished work. What was decided while planning or designing the project itself ends up in its code and docs: once written there it is finished work, not a memory.',
   },
   {
     id: 'owner',

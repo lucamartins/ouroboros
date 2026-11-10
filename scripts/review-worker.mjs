@@ -16,7 +16,8 @@ import { destinationsText } from './router.mjs';
 import { rubricText } from './rubric.mjs';
 import { isExcluded } from './hook.mjs';
 import { logError, monthSpend, openDb } from './db.mjs';
-import { inventoryForPrompt } from './inventory.mjs';
+import { inventoryForPrompt, parseFrontmatter } from './inventory.mjs';
+import { tokenize } from './knowledge.mjs';
 import { claudeDir, dataDir, projectIdFor } from './paths.mjs';
 import { closeObservations, openObservations, sessionStateText } from './session-state.mjs';
 import { buildDigest, isHumanPrompt, quotesFor, readTranscript } from './transcript.mjs';
@@ -79,8 +80,11 @@ export const MEASURE_SCHEMA = {
 export const CORRECTIONS_RULES = `"corrections": every user turn that pushes back on or redirects something the assistant did, said or assumed.
    - explicit: "no, use pnpm", "that's wrong", "I already told you…", "stop doing X".
    - implicit: "hmm, the test broke again", "I prefer the other way", "that's not what I asked".
-   - NOT corrections: new tasks, follow-up requests, answers to the assistant's questions, approvals, extra information the assistant asked for,
+   - NOT corrections: new tasks, follow-up requests, questions, approvals, extra information the assistant asked for,
+     answers to something the assistant asked (choosing or turning down an option it offered is an answer),
+     the user changing their own earlier instruction or adding an exception or a detail to it ("actually, for docs it is fine, leave it"),
      and standing instructions stated for the first time ("from now on, merge PRs when ready") — those can be candidates, not corrections.
+   A correction is about what the ASSISTANT did, said or assumed; a turn where the user only revises what the user said before is not one.
    Quote the user briefly and give the USER # number.`;
 
 export const CORRECTIONS_ONLY_SCHEMA = {
@@ -343,7 +347,14 @@ export function recordMiss(db, session, name, reviewId = 0, now = Date.now()) {
   const l = db.prepare(`
     SELECT * FROM learnings WHERE status = 'active' AND (name = ? OR name = ? OR name = ? OR lower(title) = lower(?))
       AND (project IS NULL OR project = ? OR scope = 'global') ORDER BY updated_at DESC`).get(n, bare, `learned-${bare}`, n, session.project);
-  if (!l) return null;
+  return l ? bumpMiss(db, session, l, reviewId, now) : null;
+}
+
+/** Count one miss for a learning, once per session, and suggest a rewording from the second on. */
+function bumpMiss(db, session, l, reviewId, now) {
+  const seen = db.prepare("SELECT 1 FROM events WHERE session_id = ? AND kind = 'miss' AND target = ?").get(session.id, l.id);
+  if (seen) return l.id;
+  db.prepare("INSERT INTO events (session_id, ts, kind, target) VALUES (?, ?, 'miss', ?)").run(session.id, now, l.id);
   db.prepare('UPDATE learnings SET misses = misses + 1, last_missed_at = ? WHERE id = ?').run(now, l.id);
   if (l.misses + 1 >= MISSES_BEFORE_SUGGESTION && !l.miss_flagged_at) {
     db.prepare(`INSERT INTO candidates (review_id, session_id, project, kind, scope, title, summary, confidence, outcome, cwd, target, note, triaged_at, ts)
@@ -354,6 +365,33 @@ export function recordMiss(db, session, name, reviewId = 0, now = Date.now()) {
     db.prepare('UPDATE learnings SET miss_flagged_at = ? WHERE id = ?').run(now, l.id);
   }
   return l.id;
+}
+
+const MISS_MIN_SHARED = 3;
+
+/**
+ * A correction the user made about something that was already saved before the session
+ * began is a miss, whether or not the reviewer notices and names it: compare the
+ * user's own words with what each saved learning says (its title, description and
+ * first lines). A match needs several distinct terms in common and at least half of
+ * the shorter side, so a correction on another subject never counts.
+ */
+export function missFromQuote(db, session, quote, reviewId = 0, now = Date.now()) {
+  const said = new Set(tokenize(quote));
+  if (said.size < MISS_MIN_SHARED) return null;
+  let best = null;
+  for (const l of db.prepare(`
+    SELECT * FROM learnings WHERE status = 'active' AND kind IN ('memory', 'skill', 'rules') AND origin_session IS NOT 'native'
+      AND created_at < ? AND (project IS NULL OR project = ? OR scope = 'global')`).all(session.started_at || now, session.project)) {
+    let text = '';
+    try { text = fs.readFileSync(l.path, 'utf8'); } catch { continue; }
+    const { data, body } = parseFrontmatter(text);
+    const says = new Set(tokenize(`${l.title} ${typeof data.description === 'string' && !/^The user's preferences about/.test(data.description) ? data.description : ''} ${body.split(/\n\s*\*\*Why:\*\*/)[0].slice(0, 600)}`));
+    const shared = [...said].filter((t) => says.has(t)).length;
+    if (shared < MISS_MIN_SHARED || shared < 0.5 * Math.min(said.size, says.size)) continue;
+    if (!best || shared > best.shared) best = { l, shared };
+  }
+  return best ? bumpMiss(db, session, best.l, reviewId, now) : null;
 }
 
 /**
@@ -436,6 +474,8 @@ export async function measureCorrections(db, session, entries, opts, trigger) {
   for (const c of found) {
     db.prepare('INSERT INTO corrections (review_id, session_id, quote, kind, ts) VALUES (?, ?, ?, ?, ?)').run(reviewId, session.id, String(c.quote).slice(0, 500), c.kind, ts);
   }
+  // A correction about something that was already saved is a miss (the reviewer may also name it).
+  for (const c of found) missFromQuote(db, session, c.quote, reviewId, ts);
   db.prepare('UPDATE sessions SET measure_cursor = ? WHERE id = ?').run(digest.nextLine, session.id);
   return { reviewId, turns: digest.humanTurns, corrections: found.length };
 }

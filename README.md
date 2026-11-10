@@ -111,10 +111,11 @@ npm test                           # node --no-warnings --test "test/*.test.mjs"
 claude plugin validate --strict .
 claude --plugin-dir .              # try it without installing
 node scripts/eval.mjs --synthetic  # score the knowledge check with the real model (~US$ 0.01)
+node scripts/eval.mjs --sessions   # score the corrections count and the reviewer on real-mistake cases (~US$ 0.02)
 node scripts/eval.mjs --replay     # agreement with what you approved/rejected (on a DB copy)
 ```
 
-Run both evals before and after changing the rubric or a prompt.
+Run the evals before and after changing the rubric or a prompt.
 
 ## Contributing
 
