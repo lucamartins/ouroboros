@@ -215,9 +215,10 @@ function earlyAllowed(db, sessionId, turns) {
  */
 export function skipInherited(db, sessionId, entries) {
   const s = db.prepare('SELECT started_at FROM sessions WHERE id = ?').get(sessionId);
-  if (!s?.started_at || !entries?.length) return 0;
-  if (!db.prepare("SELECT 1 FROM events WHERE session_id = ? AND kind = 'session_start' AND target = 'fork'").get(sessionId)) return 0;
-  const n = inheritedLines(entries, s.started_at);
+  if (!s || !entries?.length) return 0;
+  // Without a SessionStart that said "fork" (a backfilled session) only the transcript's own marker counts.
+  const forked = !!s.started_at && !!db.prepare("SELECT 1 FROM events WHERE session_id = ? AND kind = 'session_start' AND target = 'fork'").get(sessionId);
+  const n = inheritedLines(entries, forked ? s.started_at : null);
   if (n) {
     db.prepare(`UPDATE sessions SET review_cursor = MAX(review_cursor, :n), measure_cursor = MAX(measure_cursor, :n),
       review_requested_line = MAX(COALESCE(review_requested_line, 0), :n) WHERE id = :id`).run({ n, id: sessionId });
@@ -229,22 +230,47 @@ const LEARN_SKILL_RE = /^(ouroboros:)?learn$/;
 
 /**
  * Whether a step that saves learnings failed or was denied in entries [fromLine, end):
- * an error result for a `Skill` call of the learn skill, or for a shell call that runs
- * `curator.mjs` (the skill's apply step).
+ * an error result for a `Skill` call of the learn skill, for a shell call that runs
+ * `curator.mjs` (the skill's apply step), or for any tool called after the learn skill
+ * (the Write of the payload file, a read it needed).
  */
 export function learnStepFailed(entries, fromLine = 0) {
   const learnCalls = new Set();
+  let learning = false;
   for (let i = fromLine; i < entries.length; i++) {
     const e = entries[i];
     if (!e || e.isSidechain || !Array.isArray(e.message?.content)) continue;
     for (const c of e.message.content) {
       if (e.type === 'assistant' && c?.type === 'tool_use') {
         const ti = c.input || {};
-        if ((c.name === 'Skill' && LEARN_SKILL_RE.test(String(ti.skill || ''))) || (COMMAND_TOOL_RE.test(c.name) && /curator\.mjs/.test(String(ti.command || '')))) learnCalls.add(c.id);
+        if ((c.name === 'Skill' && LEARN_SKILL_RE.test(String(ti.skill || ''))) || (COMMAND_TOOL_RE.test(c.name) && /curator\.mjs/.test(String(ti.command || '')))) learning = true;
+        if (learning) learnCalls.add(c.id);
       } else if (e.type === 'user' && c?.type === 'tool_result' && c.is_error && learnCalls.has(c.tool_use_id)) return true;
     }
   }
   return false;
+}
+
+/**
+ * A review that did not close its stretch (it could not save, or left no result line)
+ * leaves the cursor where it was, so the end-of-session review reads the stretch. A later
+ * in-session review that succeeds moves the cursor to the end of the transcript, so it
+ * has to be asked to cover the stretch too: the first turn not yet saved is kept in an
+ * event, and the next request starts there.
+ */
+function markUnsaved(db, input, now) {
+  const last = db.prepare("SELECT payload FROM events WHERE session_id = ? AND kind = 'review_requested' ORDER BY id DESC LIMIT 1").get(input.session_id);
+  let from = null;
+  try { from = JSON.parse(last?.payload || '{}').turns?.[0] ?? null; } catch { /* ignore */ }
+  if (from) addEvent(db, input, now, 'review_unsaved', null, { from });
+}
+
+/** The first turn an earlier in-session review left unsaved, if no review has succeeded since. */
+function unsavedFrom(db, sessionId) {
+  const u = db.prepare("SELECT ts, payload FROM events WHERE session_id = ? AND kind = 'review_unsaved' ORDER BY id DESC LIMIT 1").get(sessionId);
+  if (!u) return null;
+  if (db.prepare("SELECT 1 FROM reviews WHERE session_id = ? AND mode = 'inloop' AND status = 'ok' AND ts >= ?").get(sessionId, u.ts)) return null;
+  try { return JSON.parse(u.payload || '{}').from || null; } catch { return null; }
 }
 
 /** Record the outcome of a requested in-loop review and move the cursor. */
@@ -268,6 +294,7 @@ function finishInloopReview(db, input, s, now) {
     insert.run(base.session, base.trigger, base.model, 'skipped', 'could not save: the learn step failed or was denied; left to the end-of-session review', 0, 0, 0, 0,
       base.input, base.output, base.cacheRead, base.cacheWrite, now - s.review_requested_at, s.started_at, now);
     db.prepare('UPDATE sessions SET review_requested_at = NULL WHERE id = ?').run(input.session_id);
+    markUnsaved(db, input, now);
   } else if (m) {
     insert.run(base.session, base.trigger, base.model, 'ok', null, Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4]),
       base.input, base.output, base.cacheRead, base.cacheWrite, now - s.review_requested_at, s.started_at, now);
@@ -278,6 +305,7 @@ function finishInloopReview(db, input, s, now) {
     insert.run(base.session, base.trigger, base.model, 'skipped', 'no result line', 0, 0, 0, 0,
       base.input, base.output, base.cacheRead, base.cacheWrite, now - s.review_requested_at, s.started_at, now);
     db.prepare('UPDATE sessions SET review_requested_at = NULL WHERE id = ?').run(input.session_id);
+    markUnsaved(db, input, now);
   }
 }
 
@@ -453,10 +481,15 @@ const handlers = {
         if (state === null) {
           // What SessionEnd would have set, ended at its last event.
           const reason = `no SessionEnd: idle over ${IDLE_AS_ENDED_MS / 3_600_000} h`;
-          db.prepare('UPDATE sessions SET ended_at = last_event_at, end_reason = ?, review_requested_at = NULL WHERE id = ?').run(reason, id);
+          // One statement claims it (two SessionStarts at once sweep the same session);
+          // only the one that changed the row records the end and starts the worker.
+          const claimed = db.prepare(`UPDATE sessions SET ended_at = last_event_at, end_reason = ?, review_requested_at = NULL,
+            queue_state = 'queued', last_event_at = ? WHERE id = ? AND queue_state IS NULL AND ended_at IS NULL`).run(reason, now, id);
+          if (!claimed.changes) continue;
           db.prepare("INSERT INTO events (session_id, ts, kind, target) VALUES (?, ?, 'session_end', ?)").run(id, now, reason);
+        } else {
+          db.prepare("UPDATE sessions SET queue_state = 'queued', last_event_at = ? WHERE id = ?").run(now, id);
         }
-        db.prepare("UPDATE sessions SET queue_state = 'queued', last_event_at = ? WHERE id = ?").run(now, id);
         spawnWorker(['--session', id, '--trigger', 'orphan']);
       }
     }
@@ -607,12 +640,13 @@ const handlers = {
     const since = db.prepare("SELECT MAX(ts) t FROM reviews WHERE session_id = ? AND status = 'ok'").get(input.session_id).t || s.started_at || 0;
     const recoveries = significantRecoveries(db.prepare("SELECT target, payload FROM events WHERE session_id = ? AND kind = 'recovery' AND ts > ? ORDER BY id DESC LIMIT 20")
       .all(input.session_id, since), opts.earlyReviewFailures).slice(0, 5);
-    addEvent(db, input, now, 'review_requested', trigger, { turns: [s.turns_at_last_review + 1, s.turns] });
+    const fromTurn = unsavedFrom(db, input.session_id) || s.turns_at_last_review + 1;
+    addEvent(db, input, now, 'review_requested', trigger, { turns: [fromTurn, s.turns] });
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: 'Stop',
         additionalContext: reviewRequest({
-          from: s.turns_at_last_review + 1, to: s.turns, trigger, recoveries,
+          from: fromTurn, to: s.turns, trigger, recoveries,
           state: sessionStateText(db, input.session_id, { audience: 'claude' }),
         }),
       },

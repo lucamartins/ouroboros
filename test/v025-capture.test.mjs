@@ -2,7 +2,7 @@
 // turns (a compaction summary, a fork's copy of its parent), sessions that never got a
 // SessionEnd, an in-session review that could not save, and auto memory turned off.
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -291,4 +291,133 @@ test('low: a hook takes its options from the environment or the defaults, never 
   // A value that is set still reaches the snapshot.
   hook('SessionStart', { session_id: 'opt-2', cwd: projectDir('opts'), source: 'startup' }, { CLAUDE_PLUGIN_OPTION_AUTONOMY: 'hybrid' });
   assert.equal(JSON.parse(fs.readFileSync(snap, 'utf8')).autonomy, 'hybrid');
+});
+
+// ---- Review III, follow-up ----
+
+test('M1 (follow-up): a later successful in-session review is asked to cover the stretch that could not be saved', () => {
+  const proj = projectDir('later-ok');
+  const every1 = { CLAUDE_PLUGIN_OPTION_REVIEW_EVERY_TURNS: '1' };
+  const t = path.join(tmp, 'later-ok.jsonl');
+  let ts = Date.now();
+  fs.writeFileSync(t, prompt('We always use pnpm here. Remember that from now on.', ts++) + answer('ok', ts++));
+  const sid = { session_id: 'm1-later', cwd: proj, transcript_path: t };
+  const review = (id, isError, result) => {
+    fs.appendFileSync(t, line({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id, name: 'Skill', input: { skill: 'ouroboros:learn' } }] } })
+      + line({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, is_error: isError, content: 'x' }] } })
+      + answer(result, ts++));
+    hook('Stop', { ...sid, stop_hook_active: true, last_assistant_message: result }, every1);
+  };
+  const ask = () => {
+    hook('UserPromptSubmit', sid, every1);
+    return JSON.parse(hook('Stop', { ...sid, stop_hook_active: false }, every1)).hookSpecificOutput.additionalContext;
+  };
+  hook('SessionStart', { ...sid, source: 'startup' }, every1);
+  assert.match(ask(), /user turns 1–1 only/);
+  review('sk1', true, '[ouroboros] reviewed=1 corrections=0 learned=0 patched=0');
+  assert.equal(query('SELECT review_cursor FROM sessions WHERE id = ?', 'm1-later')[0].review_cursor, 0, 'the cursor stays');
+  // Another turn; the next request starts at the turn that was not saved, not after it.
+  fs.appendFileSync(t, prompt('Now add a README section.', ts++) + answer('done', ts++));
+  assert.match(ask(), /user turns 1–2 only/);
+  // That one fails too: the next still starts at turn 1 ...
+  review('sk2', true, '[ouroboros] reviewed=2 corrections=0 learned=0 patched=0');
+  fs.appendFileSync(t, prompt('And the tests.', ts++) + answer('done', ts++));
+  assert.match(ask(), /user turns 1–3 only/);
+  // ... until one succeeds: after it the cursor moves on, and the next request is for new turns only.
+  review('sk3', false, '[ouroboros] reviewed=3 corrections=0 learned=1 patched=0');
+  assert.ok(query('SELECT review_cursor FROM sessions WHERE id = ?', 'm1-later')[0].review_cursor > 0);
+  fs.appendFileSync(t, prompt('One more thing.', ts++) + answer('done', ts++));
+  assert.match(ask(), /user turns 4–4 only/);
+});
+
+test('M1 (follow-up): a denied Write of the payload file is a failed save', () => {
+  const entries = (writeFailed) => [
+    { type: 'assistant', message: { content: [{ type: 'tool_use', id: 's1', name: 'Skill', input: { skill: 'ouroboros:learn' } }] } },
+    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 's1', content: 'Launching skill' }] } },
+    { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'w1', name: 'Write', input: { file_path: '/tmp/payload.json', content: '{}' } }] } },
+    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'w1', is_error: writeFailed, content: writeFailed ? 'Permission to use Write has been denied.' : 'ok' }] } },
+  ];
+  assert.equal(hookApi.learnStepFailed(entries(true)), true);
+  assert.equal(hookApi.learnStepFailed(entries(false)), false);
+  // A tool that failed before the learn skill was called is not the save.
+  const before = entries(false);
+  before.unshift(
+    { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'r0', name: 'Read', input: {} }] } },
+    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'r0', is_error: true, content: 'No such file' }] } });
+  assert.equal(hookApi.learnStepFailed(before), false);
+});
+
+test('M6 (follow-up): the worker alone skips a fork\'s inherited turns when no Stop ever asked for a review', async () => {
+  const proj = projectDir('fork-worker');
+  const t = path.join(tmp, 'fork-worker.jsonl');
+  const parent = Date.now() - HOUR;
+  fs.writeFileSync(t, line({ type: 'queue-operation', operation: 'enqueue', timestamp: new Date(Date.now() + 5).toISOString(), sessionId: 'm6-worker' })
+    + prompt('install the deps', parent) + answer('Running npm install.', parent + 1)
+    + prompt('no, use pnpm', parent + 2) + answer('Done with pnpm.', parent + 3));
+  const sid = { session_id: 'm6-worker', cwd: proj, transcript_path: t };
+  hook('SessionStart', { ...sid, source: 'fork' });
+  const now = Date.now() + 10;
+  fs.appendFileSync(t, prompt('which command runs the tests?', now) + answer('`pnpm test`', now + 1));
+  hook('UserPromptSubmit', sid);
+  // No Stop: nothing but the worker can move the cursors past the copy.
+  assert.equal(query("SELECT review_cursor FROM sessions WHERE id = 'm6-worker'")[0].review_cursor, 0);
+  hook('SessionEnd', { ...sid, reason: 'other' });
+  await waitFor(() => query("SELECT 1 FROM sessions WHERE id = 'm6-worker' AND queue_state IN ('done', 'skipped')").length);
+  assert.deepEqual(query("SELECT turns_reviewed FROM reviews WHERE session_id = 'm6-worker' AND instrument = 'corrections'").map((r) => r.turns_reviewed), [1]);
+  assert.equal(query("SELECT turns_reviewed FROM reviews WHERE session_id = 'm6-worker' AND mode = 'background' AND trigger = 'session_end'")[0].turns_reviewed, 1);
+});
+
+test('M6 (follow-up): the transcript marks a fork\'s copied entries with forkedFrom, which needs no start time', () => {
+  const parent = Date.now() - HOUR;
+  const fork = (o) => ({ ...o, forkedFrom: { sessionId: 'parent-id', messageUuid: 'x' } });
+  const entries = [
+    { type: 'mode', mode: 'normal' },
+    fork(JSON.parse(prompt('install the deps', parent))), fork(JSON.parse(answer('Running npm install.', parent + 1))),
+    JSON.parse(prompt('which command runs the tests?', parent + 2)), JSON.parse(answer('`pnpm test`', parent + 3)),
+  ];
+  // A session Ouroboros never saw start (a backfill): no start time, the marker alone.
+  assert.equal(transcript.inheritedLines(entries, null), 3);
+  assert.equal(transcript.inheritedLines(entries.slice(3), null), 0, 'an ordinary session has no marker');
+  const db = { prepare: (sql) => ({ get: () => (/FROM sessions/.test(sql) ? { started_at: null } : null), run: () => ({ changes: 1 }) }) };
+  assert.equal(hookApi.skipInherited(db, 'backfilled', entries), 3);
+});
+
+test('A1 (follow-up): auto memory under CLAUDE_CODE_REMOTE_MEMORY_DIR, and safe mode turns it off', () => {
+  const proj = projectDir('remote-mem');
+  const had = process.env.CLAUDE_CODE_REMOTE_MEMORY_DIR;
+  const mem = path.join(tmp, 'remote-memory');
+  try {
+    delete process.env.CLAUDE_CODE_REMOTE_MEMORY_DIR;
+    assert.ok(paths.memoryDirFor({ cwd: proj }).startsWith(path.join(paths.claudeDir(), 'projects') + path.sep));
+    process.env.CLAUDE_CODE_REMOTE_MEMORY_DIR = mem;
+    const dir = paths.memoryDirFor({ cwd: proj });
+    assert.ok(dir.startsWith(path.join(mem, 'projects') + path.sep), dir);
+    assert.ok(dir.endsWith(`${path.sep}memory`));
+    // An explicit setting still wins.
+    assert.equal(paths.memoryDirFor({ memoryDir: path.join(tmp, 'elsewhere') }), path.join(tmp, 'elsewhere'));
+  } finally {
+    if (had === undefined) delete process.env.CLAUDE_CODE_REMOTE_MEMORY_DIR; else process.env.CLAUDE_CODE_REMOTE_MEMORY_DIR = had;
+  }
+  assert.match(paths.autoMemoryStatus(proj, { CLAUDE_CODE_SAFE_MODE: '1' }).reason, /safe mode/);
+  assert.equal(paths.autoMemoryStatus(proj, { CLAUDE_CODE_SAFE_MODE: '1', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0' }).on, true);
+});
+
+test('M2 (follow-up): two SessionStarts at once record one session_end for the swept session', async () => {
+  const proj = projectDir('sweep-race');
+  const t = path.join(tmp, 'sweep-race.jsonl');
+  const old = Date.now() - 7 * HOUR;
+  fs.writeFileSync(t, prompt('install the deps', old) + answer('ok', old + 1));
+  const sid = { session_id: 'm2-race', cwd: proj, transcript_path: t };
+  hook('SessionStart', { ...sid, source: 'startup' });
+  hook('UserPromptSubmit', sid);
+  hook('UserPromptSubmit', sid);
+  run("UPDATE sessions SET started_at = ?, last_event_at = ? WHERE id = 'm2-race'", old, old);
+  const start = (id) => new Promise((resolve) => {
+    const c = spawn(process.execPath, ['--no-warnings', path.join(root, 'scripts', 'hook.mjs'), 'SessionStart'], { env, stdio: ['pipe', 'ignore', 'ignore'] });
+    c.on('close', resolve);
+    c.stdin.end(JSON.stringify({ hook_event_name: 'SessionStart', session_id: id, cwd: proj, source: 'startup' }));
+  });
+  await Promise.all([start('m2-race-a'), start('m2-race-b')]);
+  await waitFor(() => query("SELECT 1 FROM sessions WHERE id = 'm2-race' AND queue_state IN ('done', 'skipped')").length);
+  assert.equal(query("SELECT COUNT(*) n FROM events WHERE session_id = 'm2-race' AND kind = 'session_end'")[0].n, 1);
 });

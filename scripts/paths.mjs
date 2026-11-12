@@ -128,7 +128,7 @@ function expandTilde(p) {
 /**
  * The auto-memory directory Claude Code uses for a working directory: the
  * `autoMemoryDirectory` setting (local, then project, then user settings), else
- * `<config>/projects/<project>/memory` where <project> is the repository's main
+ * `<config, or CLAUDE_CODE_REMOTE_MEMORY_DIR when set>/projects/<project>/memory` where <project> is the repository's main
  * checkout (shared by its worktrees and subdirectories), `CLAUDE_CODE_PROJECT_DIR_NAME`
  * when set, or the working directory outside git.
  */
@@ -144,7 +144,9 @@ export function memoryDirFor({ memoryDir, cwd } = {}) {
     if (typeof v === 'string' && v.trim()) return path.resolve(expandTilde(v.trim()));
   }
   const name = process.env.CLAUDE_CODE_PROJECT_DIR_NAME || projectKey(root);
-  return path.join(claudeDir(), 'projects', name, 'memory');
+  // Cloud sessions: Claude Code keeps auto memory under that directory instead of the config dir.
+  const base = process.env.CLAUDE_CODE_REMOTE_MEMORY_DIR || claudeDir();
+  return path.join(base, 'projects', name, 'memory');
 }
 
 const TRUTHY = ['1', 'true', 'yes', 'on'];
@@ -164,6 +166,7 @@ export function autoMemoryStatus(cwd, env = process.env) {
   if (TRUTHY.includes(flag)) return { on: false, reason: 'CLAUDE_CODE_DISABLE_AUTO_MEMORY is set' };
   if (FALSY.includes(flag)) return { on: true, reason: null };
   if (env.CLAUDE_CODE_SIMPLE) return { on: false, reason: 'the session runs with --bare' };
+  if (env.CLAUDE_CODE_SAFE_MODE) return { on: false, reason: 'the session runs in safe mode' };
   if (env.CLAUDE_CODE_REMOTE && !env.CLAUDE_CODE_REMOTE_MEMORY_DIR && !env.CLAUDE_COWORK_MEMORY_PATH_OVERRIDE) {
     return { on: false, reason: 'a cloud session: CLAUDE_CODE_REMOTE is set without CLAUDE_CODE_REMOTE_MEMORY_DIR' };
   }
