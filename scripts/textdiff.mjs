@@ -48,8 +48,10 @@ const OWN_BLOCK = /^\s*(?:[-*+]\s|\d+[.)]\s|#{1,6}\s|```|~~~|\||>|<!--)/;
  * New sections, new items at the end of an ordinary list and sub-items with their own
  * marker remain additions. Other cases are not seen (stated limits, DESIGN §7.6): a
  * word on its own line above a sentence, a heading above an existing list, a new parent
- * item above existing sub-items, an unindented line right under a sentence or item,
- * an indented continuation after a blank line.
+ * item above existing sub-items, an unindented line right under a sentence or item
+ * (a new line in a plain-text file; markdown reads it as a lazy continuation, which
+ * `appendToSection` avoids by starting a paragraph), an indented continuation after a
+ * blank line, a lead-in that does not end in a colon ("Rules to follow").
  */
 function joinsExisting(b, kept) {
   const indent = (l) => /^\s*/.exec(l)[0].length;
@@ -69,8 +71,9 @@ function joinsExisting(b, kept) {
     if (kept[i] || !b[i].trim()) continue;
     if (!OWN_BLOCK.test(b[i])) {
       // An indented continuation: the text block it joins starts at an existing line.
-      // (An unindented line under a sentence reads as a new line in a plain-text file
-      // and stays an addition: a stated limit.)
+      // (An unindented line under a sentence or item reads as a new line in a plain-text
+      // file and stays an addition: a stated limit. The append path does not produce one
+      // under a list item: `appendToSection` starts a paragraph of its own there.)
       if (!/^\s/.test(b[i])) continue;
       for (let k = i - 1; k >= 0 && b[k].trim(); k--) {
         if (kept[k] && !/^\s*(?:#{1,6}\s|```|~~~|\||<!--)/.test(b[k])) return true;
@@ -84,7 +87,8 @@ function joinsExisting(b, kept) {
         if (!l.trim()) continue;
         if (LIST_ITEM.test(l) && indent(l) >= own) continue;
         if (!LIST_ITEM.test(l) && indent(l) > own) continue; // a continuation line of an item above
-        if (kept[k] && !/^\s*#{1,6}\s/.test(l) && l.trimEnd().endsWith(':')) return true;
+        // "Never:", "**Never:**", "_Never:_", "`Never:`": the colon may sit inside the emphasis.
+        if (kept[k] && !/^\s*#{1,6}\s/.test(l) && l.replace(/[\s*_`]+$/, '').endsWith(':')) return true;
         break;
       }
     }
