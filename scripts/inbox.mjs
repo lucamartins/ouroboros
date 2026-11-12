@@ -408,9 +408,20 @@ export function approve(db, key) {
   if (!k) return { status: 'not_found', reason: `unknown key ${key}` };
   if (k.type === 'cs') {
     if (getChangeset(db, k.id)?.status === 'stale') return { status: 'stale', reason: 'the file changed since this was composed: edit it against the current file, or let the editor compose it again' };
+    if (getChangeset(db, k.id)?.status === 'pending' && !claimsOf(db, k.id).length) {
+      // Every learning of it was decided elsewhere: writing would save lines nobody approved.
+      rejectChangeset(db, k.id);
+      return { status: 'invalid', reason: 'no learning of this change is waiting any more: it was closed without writing' };
+    }
     return applyChangeset(db, k.id, { actor: 'manual' });
   }
-  if (k.type === 'it') return decideQueued(db, k.id, true);
+  if (k.type === 'it') {
+    // A learning folded into a change since it was shown: approving the key must not
+    // approve the whole change. Say where it went; the user looks at the change.
+    const c = db.prepare("SELECT changeset_id FROM candidates WHERE id = ? AND outcome = 'queued'").get(k.id);
+    if (c?.changeset_id) return { status: 'changed', key: `cs:${c.changeset_id}`, changeset: c.changeset_id, reason: `this learning is now part of change cs:${c.changeset_id}: look at that change and approve it as a whole` };
+    return decideQueued(db, k.id, true);
+  }
   if (k.type === 'cf') return { status: 'invalid', reason: 'a conflict is settled with resolve (keep or new)' };
   return { status: 'invalid', reason: 'a suggested fix is made in the project, then marked done or dismissed' };
 }
@@ -468,11 +479,12 @@ export function editAndApprove(db, key, { edits, drop = [], item, replace = fals
     if (t.error) return { status: 'invalid', reason: t.error };
     const now = Date.now();
     const dropped = new Set(drop.map(Number));
+    // Validate before changing anything: a refused call leaves the change as it was.
+    if (!claimsOf(db, k.id).some((c) => !dropped.has(c.id))) return { status: 'invalid', reason: 'every learning of this change was dropped: reject it instead' };
     for (const c of claimsOf(db, k.id)) {
       if (!dropped.has(c.id)) continue;
       db.prepare("UPDATE candidates SET outcome = 'rejected_by_user', decided_at = ? WHERE id = ?").run(now, c.id);
     }
-    if (!claimsOf(db, k.id).length) return { status: 'invalid', reason: 'every learning of this change was dropped: reject it instead' };
     for (const c of claimsOf(db, k.id)) note(db, c.id, reason || 'edited before approving');
     db.prepare("UPDATE changesets SET edits = ?, base_hash = ?, corrects = ?, status = 'pending', note = ? WHERE id = ?")
       .run(JSON.stringify(t.applied), hashText(t.current), t.applied.some((e) => e.corrects) ? 1 : 0, 'edited by you before approving', k.id);
@@ -505,7 +517,9 @@ export function resolveConflict(db, key, choice, { edits, reason } = {}) {
   const k = parseKey(key);
   const c = k?.type === 'cf' || k?.type === 'it' ? db.prepare("SELECT * FROM candidates WHERE id = ? AND outcome = 'conflict'").get(k.id) : null;
   if (!c) return { status: 'not_found', reason: 'no conflict waiting with that id' };
-  if (choice !== 'new') {
+  const pick = String(choice ?? '').trim().toLowerCase();
+  if (pick !== 'new' && pick !== 'keep') return { status: 'invalid', reason: 'the choice is "new" or "keep"' };
+  if (pick === 'keep') {
     note(db, c.id, reason);
     db.prepare("UPDATE candidates SET outcome = 'rejected_by_user', decided_at = ? WHERE id = ?").run(Date.now(), c.id);
     return { status: 'rejected_by_user', title: c.title };
