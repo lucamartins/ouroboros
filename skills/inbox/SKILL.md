@@ -1,6 +1,7 @@
 ---
 name: inbox
-description: Go through the Ouroboros inbox in the conversation, one item at a time - learnings waiting for approval, changes to skills and rules, conflicts with a written rule, suggested fixes - discussing each and approving, rejecting or editing it. Use when the user asks to review the inbox, pending learnings, approvals or conflicts, or says items are waiting for them.
+description: Go through the Ouroboros inbox in the conversation, one item at a time - learnings waiting for approval, changes to skills and rules, conflicts with a written rule, suggested fixes - discussing each and approving, rejecting or editing it. Opens only when the user types /ouroboros:inbox: the model never starts it, since it can approve.
+disable-model-invocation: true
 argument-hint: "[empty for everything | 'this project' | an entry key like cs:22]"
 allowed-tools:
   - Bash(node --no-warnings *scripts/inbox.mjs* *)
