@@ -241,11 +241,14 @@ export function buildIndex(cwd, { extra = [] } = {}) {
   const N = docs.length;
   return {
     size: N,
-    search(query, k = 3, { kinds } = {}) {
+    /** `exclude`: files (paths) whose chunks are left out, e.g. the stand-in memory of the claim searched for. */
+    search(query, k = 3, { kinds, exclude } = {}) {
       const q = [...new Set(tokenize(query))];
+      const skip = exclude?.length ? new Set(exclude.map((f) => path.resolve(f).toLowerCase())) : null;
       const scored = [];
       for (const d of docs) {
         if (kinds && !kinds.includes(d.kind)) continue;
+        if (skip && skip.has(path.resolve(d.file).toLowerCase())) continue;
         let s = 0;
         for (const t of q) {
           const f = d.tf.get(t);
@@ -319,6 +322,44 @@ export function resolveOwner(owner, cwd) {
   return hits.length === 1 ? hits[0] : null;
 }
 
+/**
+ * Resolve the owner a screen's `route` verdict names, for a proposal from project `cwd`.
+ * Returns { file } or { reason } (the learning then waits for the user, nothing is created).
+ *  - Only a file of that project's knowledge set (`knowledgeFiles(cwd)`: its CLAUDE.md files,
+ *    rules, skills, memory directory, plus the user's own global files) can be an owner,
+ *    whatever its path looks like: another project's memory, a vendored `skills/` folder or a
+ *    CLAUDE.md elsewhere on disk are refused, written as an absolute path or not.
+ *  - A name that matches several files ("CLAUDE.md" with a global and a project file) is
+ *    resolved by one rule: the files inside the project's own root win over the others, and
+ *    if several of those remain, the one directly at the root. Anything still ambiguous is not
+ *    guessed.
+ */
+export function resolveRouteOwner(owner, cwd) {
+  const raw = String(owner || '').trim();
+  if (!raw) return { reason: 'the screen named no owner file' };
+  const norm = (p) => p.replace(/\\/g, '/').toLowerCase();
+  const files = knowledgeFiles(cwd);
+  let hits;
+  if (path.isAbsolute(raw)) {
+    const want = norm(path.resolve(raw));
+    hits = files.filter((f) => norm(path.resolve(f)) === want);
+    if (!hits.length) return { reason: `${raw} is not one of this project's knowledge files or yours` };
+    return { file: hits[0] };
+  }
+  const want = norm(raw).replace(/^\.?\//, '');
+  hits = files.filter((f) => norm(f).endsWith(`/${want}`) || norm(f) === want);
+  if (!hits.length) return { reason: `no knowledge file of this project or yours is named ${raw}` };
+  if (hits.length === 1) return { file: hits[0] };
+  const root = projectRoots(cwd)[0];
+  if (root) {
+    const inside = hits.filter((f) => norm(path.resolve(f)).startsWith(`${norm(path.resolve(root))}/`));
+    if (inside.length === 1) return { file: inside[0] };
+    const top = inside.filter((f) => norm(path.dirname(path.resolve(f))) === norm(path.resolve(root)));
+    if (top.length === 1) return { file: top[0] };
+  }
+  return { reason: `${raw} matches ${hits.length} files (${hits.slice(0, 3).map((f) => path.resolve(f)).join(', ')}${hits.length > 3 ? ', …' : ''}) and no rule picks one` };
+}
+
 // ---------- grounding: what the project itself says about a claim ----------
 
 const MAX_IDENTIFIERS = 10;
@@ -358,13 +399,21 @@ export function identifiersIn(text) {
 
 /**
  * Look the identifiers up in the project's git repos (tracked files, respecting
- * .gitignore). Returns [{ id, hits: [{ file, line, text }], exists }]; a path that is
- * found nowhere is reported too, since that is evidence against the claim.
+ * .gitignore). Returns [{ id, hits: [{ file, line, text }], exists, checked }]. A name
+ * that was looked up and found nowhere is evidence against the claim (`checked` true, no
+ * hit); when the lookup could not be made (the project is not a git repository, git is
+ * missing, the search timed out or overflowed) `checked` is false: that says nothing about
+ * the claim either way.
  */
 export function groundIdentifiers(ids, cwd) {
-  const out = ids.map((id) => ({ id, hits: [], exists: false }));
+  const out = ids.map((id) => ({ id, hits: [], exists: false, checked: false }));
   if (!ids.length || !cwd) return out;
   const roots = projectRoots(cwd).filter((r) => fs.existsSync(path.join(r, '.git')));
+  const failed = new Set();
+  // A file that is on disk exists, tracked by git or not.
+  for (const root of projectRoots(cwd)) {
+    for (const o of out) if (/[\\/]/.test(o.id) && !path.isAbsolute(o.id) && isFile(path.join(root, o.id))) o.exists = true;
+  }
   for (const root of roots) {
     const pending = out.filter((o) => o.hits.length < HITS_PER_IDENTIFIER);
     if (!pending.length) break;
@@ -373,6 +422,13 @@ export function groundIdentifiers(ids, cwd) {
     }
     const args = ['-C', root, 'grep', '-n', '-I', '-F', '--max-count=2', ...pending.flatMap((o) => ['-e', o.id]), '--', '.', ':!*.lock', ':!*lock.json', ':!*lock.yaml', ':!*.min.*', ':!*.md'];
     const r = spawnSync('git', args, { encoding: 'utf8', timeout: GREP_TIMEOUT_MS, windowsHide: true, maxBuffer: 4 * 1024 * 1024 });
+    // git grep exits 0 with matches and 1 without any: both are a completed search. Anything
+    // else (git missing, a timeout, an overflowed buffer, a broken repository) is not.
+    if (r.error || (r.status !== 0 && r.status !== 1)) {
+      for (const o of pending) failed.add(o.id);
+      continue;
+    }
+    for (const o of pending) o.checked = true;
     if (r.status !== 0 || !r.stdout) continue;
     for (const line of r.stdout.split(/\r?\n/)) {
       const m = /^([^:]+):(\d+):(.*)$/.exec(line);
@@ -384,5 +440,7 @@ export function groundIdentifiers(ids, cwd) {
       }
     }
   }
+  // A search that failed in any repository leaves "found nowhere" unproven.
+  for (const o of out) if (failed.has(o.id) && !o.exists) o.checked = false;
   return out;
 }

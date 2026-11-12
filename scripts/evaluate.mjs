@@ -18,7 +18,7 @@ import { options } from './config.mjs';
 import { apply as curatorApply, DUPLICATE_THRESHOLD, interimOf, learnMeanwhile, retireInterim, similarity } from './curator.mjs';
 import { applyChangeset, applyEdits, changesetNeedsApproval, claimsOf, fileDisplayName, getChangeset, hashText, pendingChangeset, saveChangeset } from './changesets.mjs';
 import { acquireLease, assertBudget, BudgetError, logError, releaseLease, renewLease } from './db.mjs';
-import { buildIndex, groundIdentifiers, identifiersIn, knowledgeFiles, knowledgeKind, PATCHABLE, resolveOwner, tokenize } from './knowledge.mjs';
+import { buildIndex, groundIdentifiers, identifiersIn, knowledgeFiles, knowledgeKind, PATCHABLE, resolveOwner, resolveRouteOwner, tokenize } from './knowledge.mjs';
 import { globalInstructionsFile, readKnowledgeFile } from './paths.mjs';
 import { refFile } from './session-state.mjs';
 import { insertReview, runModel, usageOf } from './review-worker.mjs';
@@ -141,10 +141,10 @@ ${view.text}
 CLAIMS:
 ${claims.map((c) => `<claim id="${c.id}"${c.when ? ` session="${c.when}"` : ''}${c.confidence ? ` confidence="${c.confidence}"` : ''}${c.corrects ? ' reported_stale="yes"' : ''}${c.confirmed ? ' confirmed_by_user="yes"' : ''}>\n${c.claim}${c.evidence ? `\nevidence: ${c.evidence}` : ''}\n</claim>`).join('\n')}
 
-PROJECT EVIDENCE (where the project's tracked code and config mention what the claims name; "not found" means no tracked file mentions it. That refutes a claim only when the claim is about what those files contain: a path, a script, a setting. Environment variables, error messages, external services, branch names and habits are normally not in tracked files, and a claim the user stated or an outcome observed in the session is never "contradicted" by their absence):
+PROJECT EVIDENCE (where the project's tracked code and config mention what the claims name; "not found" means the lookup was made and no tracked file mentions it; "could not check" means the lookup could not be made (not a git repository, git missing, a timeout): that is no evidence either way and never refutes a claim. "Not found" refutes a claim only when the claim is about what those files contain: a path, a script, a setting. Environment variables, error messages, external services, branch names and habits are normally not in tracked files, and a claim the user stated or an outcome observed in the session is never "contradicted" by their absence):
 ${grounding.length ? grounding.map((g) => (g.hits.length
     ? `- \`${g.id}\`:\n${g.hits.map((h) => `    ${h.file}:${h.line}: ${h.text}`).join('\n')}`
-    : `- \`${g.id}\`: ${g.exists ? 'exists' : 'not found'}`)).join('\n') : '(nothing to look up)'}
+    : `- \`${g.id}\`: ${g.exists ? 'exists' : g.checked === false ? 'could not check' : 'not found'}`)).join('\n') : '(nothing to look up)'}
 
 ELSEWHERE (what other files say on these topics; a "source of truth" excerpt is project evidence, the others are knowledge the assistant already reads):
 ${elsewhere.length ? elsewhere.map((e) => `<excerpt file="${e.file}" kind="${e.kind === 'source' ? 'source of truth' : 'knowledge'}"${e.heading ? ` heading="${e.heading}"` : ''}>\n${e.text.slice(0, 700)}\n</excerpt>`).join('\n') : '(nothing related)'}`;
@@ -340,7 +340,8 @@ export async function composeRoutes(db, routes, ctx) {
     } catch (err) {
       if (err instanceof BudgetError || err instanceof LeaseLost) {
         // Leave them waiting: the next queue check (or the lease's new holder) tries again.
-        for (const c of fresh) setOutcome(db, c.id, 'queued', `could not compose the change to ${file} yet`, { triaged_at: null, target: file });
+        // A row the user decided while the call ran stays as the user left it.
+        for (const c of fresh) if (rowState(db, c.id) === taken.get(c.id)) setOutcome(db, c.id, 'queued', `could not compose the change to ${file} yet`, { triaged_at: null, target: file });
         continue;
       }
       logError(db, 'evaluate:editor', err);
@@ -351,6 +352,9 @@ export async function composeRoutes(db, routes, ctx) {
       // wait in it.
       const staleIds = new Set(stale);
       for (const c of claims) {
+        // The call took a while: a row the user decided meanwhile (rejected in the inbox,
+        // say) is neither counted nor brought back to the queue.
+        if (rowState(db, c.id) !== taken.get(c.id)) continue;
         const isFresh = fresh.some((f) => f.id === c.id);
         if (!isFresh && !staleIds.has(db.prepare('SELECT changeset_id FROM candidates WHERE id = ?').get(c.id)?.changeset_id)) continue;
         const misses = countMiss(db, c.id, 'editor_misses');
@@ -372,6 +376,10 @@ export async function composeRoutes(db, routes, ctx) {
     report.calls++;
     report.cost += composed.usage.cost;
     insertReview(db, { sessionId: ctx.sessionId || 'maintenance', mode: ctx.sessionId ? 'background' : 'maintenance', trigger: 'editor', model: ctx.model, status: 'ok', usage: composed.usage, sessionStartedAt: ctx.sessionStartedAt });
+    // The call is recorded first (the money is spent), then the lease is checked: if it
+    // passed to another process while the editor ran, nothing of this result is saved and
+    // the rows stay as they are for the new holder.
+    ctx.tick?.();
 
     // What the editor returned is saved under the write lock, and only if nothing it was
     // composed from moved while it ran: the user decided a learning or a change to this
@@ -421,6 +429,16 @@ export async function composeRoutes(db, routes, ctx) {
           report.results.push({ status: 'conflict', title: c.title });
           // Never dropped silently: the user decides (dashboard → Conflicts).
           setOutcome(db, c.id, 'conflict', `conflict${s.conflicts_with ? ` with #${s.conflicts_with}` : ''}: ${s.reason}`, { target: file, changeset_id: null, claim: c.claim });
+        } else if (!appliedFor(c.id) && c.confirmed) {
+          // The user settled this conflict ("it is a new rule") and the editor's edit did not
+          // apply: it is never dropped. It comes back as the conflict it was, with the reason,
+          // and the user decides again.
+          report.conflicts++;
+          report.results.push({ status: 'conflict', title: c.title });
+          const payload = payloadOf(db.prepare('SELECT payload FROM candidates WHERE id = ?').get(c.id) || {});
+          delete payload.confirmed;
+          db.prepare('UPDATE candidates SET payload = ? WHERE id = ?').run(JSON.stringify(payload), c.id);
+          setOutcome(db, c.id, 'conflict', `conflict: you said it is a new rule, but it could not be written to ${where} (${rejectedFor(c.id).join('; ') || 'no edit was given'}); decide again`, { target: file, changeset_id: null, claim: c.claim });
         } else if (!appliedFor(c.id)) {
           report.unwritten++;
           setOutcome(db, c.id, 'dropped', `not written to ${where}: ${rejectedFor(c.id).join('; ') || 'no edit was given'}`, { target: file, changeset_id: null });
@@ -536,7 +554,7 @@ export async function evaluate(db, rows, ctx) {
     if (v?.rule) report.byRule[v.rule] = (report.byRule[v.rule] || 0) + 1;
     if (v?.stale) {
       // The screen saw documentation a source of truth contradicts: a correction claim.
-      const owner = resolveOwner(v.stale.file, ctx.cwd);
+      const owner = resolveRouteOwner(v.stale.file, ctx.cwd).file;
       // Only a real source of truth (workflow, manifest, config) can flag a file as outdated.
       const source = staleSource(v.stale.source, ctx.cwd);
       if (owner && source && PATCHABLE.has(knowledgeKind(owner))) {
@@ -565,14 +583,19 @@ export async function evaluate(db, rows, ctx) {
       report.unscreened++;
       continue;
     }
-    if (v.verdict === 'drop' || v.verdict === 'merge') {
+    if (payloadOf(row).restored && ['drop', 'merge', 'fix'].includes(v.verdict)) {
+      // The user restored it (dashboard): that decision is final the way a confirmed conflict
+      // is, and the screen does not drop it again. It goes on as a new item (the curator's
+      // checks and the autonomy setting still apply); an owner the screen finds is still used.
+      creates.push({ row, item, note: `restored by you, so it is not dropped again (the knowledge check said: ${noteFor(v)})` });
+    } else if (v.verdict === 'drop' || v.verdict === 'merge') {
       report[v.verdict === 'drop' ? 'dropped' : 'merged']++;
       setOutcome(db, row.id, v.verdict === 'drop' ? 'dropped' : 'merged', noteFor(v), { changeset_id: null });
     } else if (v.verdict === 'fix') {
       report.suggested++;
       setOutcome(db, row.id, 'suggested', noteFor(v), { changeset_id: null });
     } else if (v.verdict === 'route') {
-      const owner = resolveOwner(v.owner, ctx.cwd);
+      const { file: owner, reason } = resolveRouteOwner(v.owner, ctx.cwd);
       const kind = owner && knowledgeKind(owner);
       const claim = v.claim || describe(item);
       if (owner && PATCHABLE.has(kind)) {
@@ -580,7 +603,12 @@ export async function evaluate(db, rows, ctx) {
         db.prepare('UPDATE candidates SET claim = ?, target = ? WHERE id = ?').run(claim, owner, row.id);
         route(owner, { ...claimFrom({ ...row, claim }), title: row.title });
       } else {
-        creates.push({ row, item: rewriteItem(item, v), note: `kept as new (owner not found: ${v.owner || 'none'})` });
+        // The topic has an owner but it cannot be told which file (or the file is not one
+        // this project may change): creating it as new would duplicate what that file says,
+        // so nothing is created and the user decides.
+        report.queued++;
+        setOutcome(db, row.id, 'queued', `the knowledge check sent it to ${v.owner || 'an owner file'}, ${owner ? `which is not a file Ouroboros may change (${path.basename(owner)})` : reason}; nothing was created, you decide`, { changeset_id: null, claim });
+        report.results.push({ status: 'queued', title: row.title, candidateId: row.id });
       }
     } else {
       // Kept as new, but the reviewer said it refines something this session already
