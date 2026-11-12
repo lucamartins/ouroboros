@@ -107,8 +107,7 @@
               "--no-warnings",
               "${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs",
               "SessionEnd"
-            ],
-            "timeout": 5
+            ]
           }
         ]
       }

@@ -5,13 +5,13 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { options } from './config.mjs';
-import { classifyPath, dataDir, projectIdFor, skillNameFromPath } from './paths.mjs';
+import { options, optionsFromEnvOnly } from './config.mjs';
+import { autoMemoryStatus, classifyPath, dataDir, memoryDirFor, normalize, projectIdFor, skillNameFromPath } from './paths.mjs';
 import { rekeyProjects, retireProfile } from './migrate.mjs';
 import { RUBRIC_SHORT } from './rubric.mjs';
 import { sessionStateText } from './session-state.mjs';
 import { globMatch, loadSettings } from './settings.mjs';
-import { contextTokens, countLines, isHumanPrompt, readTranscript, usageSince } from './transcript.mjs';
+import { contextTokens, countLines, inheritedLines, isHumanPrompt, readTranscript, usageSince } from './transcript.mjs';
 
 const MIN_NODE = [22, 13];
 /** Tool calls that make a turn "long" (recorded as a metric only). */
@@ -21,6 +21,10 @@ export const EARLY_REVIEW_MIN_TURNS = 5;
 export const MAINTENANCE_EVERY_MS = 20 * 60 * 60 * 1000;
 /** A review left to finish later is tried again after this long. */
 const RETRY_AFTER_MS = 30 * 60 * 1000;
+/** A session with no event for this long and no SessionEnd is taken as ended. */
+export const IDLE_AS_ENDED_MS = 6 * 60 * 60 * 1000;
+/** ...unless its last event is older than this: then it is left to a backfill. */
+const IDLE_AS_ENDED_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const here = path.dirname(fileURLToPath(import.meta.url));
 // db.mjs needs node:sqlite, so it is loaded only after the Node version check.
 let dbApi;
@@ -39,8 +43,14 @@ export function targetOf(toolName, input = {}) {
     // or flags: "cd api && dotnet test --filter X" -> "dotnet test".
     let line = input.command.split('\n').find((l) => l.trim()) || '';
     line = line.replace(/^\s*(cd|Set-Location|pushd)\s+[^;&|]+(&&|;)\s*/i, '');
-    const words = line.trim().split(/\s+/).filter((w) => !/^[A-Z_][A-Z0-9_]*=/.test(w));
-    const cmd = words.filter((w) => !w.startsWith('-')).slice(0, 2).join(' ');
+    // The first command ends at a shell operator or a redirection: "ls -la && grep x" is "ls".
+    const words = [];
+    for (const w of line.trim().split(/\s+/)) {
+      if (/^(&&|\|\|?|;|&|\d*[<>])/.test(w)) break;
+      if (!/^[A-Z_][A-Z0-9_]*=/.test(w)) words.push(w.replace(/;+$/, ''));
+      if (w.endsWith(';')) break;
+    }
+    const cmd = words.filter((w) => w && !w.startsWith('-')).slice(0, 2).join(' ');
     return `${toolName}:${cmd}`;
   }
   return toolName;
@@ -196,6 +206,47 @@ function earlyAllowed(db, sessionId, turns) {
   return turns - at >= EARLY_REVIEW_MIN_TURNS;
 }
 
+/**
+ * A forked session (SessionStart `source: "fork"`) starts with a copy of its parent's
+ * transcript under a new id, so its cursors at 0 would review and measure the parent's
+ * turns a second time. Moves them past the copy (`inheritedLines`); returns that line.
+ * Done when the transcript is read, not at SessionStart, so it does not matter whether
+ * the copy is on disk yet when that hook runs.
+ */
+export function skipInherited(db, sessionId, entries) {
+  const s = db.prepare('SELECT started_at FROM sessions WHERE id = ?').get(sessionId);
+  if (!s?.started_at || !entries?.length) return 0;
+  if (!db.prepare("SELECT 1 FROM events WHERE session_id = ? AND kind = 'session_start' AND target = 'fork'").get(sessionId)) return 0;
+  const n = inheritedLines(entries, s.started_at);
+  if (n) {
+    db.prepare(`UPDATE sessions SET review_cursor = MAX(review_cursor, :n), measure_cursor = MAX(measure_cursor, :n),
+      review_requested_line = MAX(COALESCE(review_requested_line, 0), :n) WHERE id = :id`).run({ n, id: sessionId });
+  }
+  return n;
+}
+
+const LEARN_SKILL_RE = /^(ouroboros:)?learn$/;
+
+/**
+ * Whether a step that saves learnings failed or was denied in entries [fromLine, end):
+ * an error result for a `Skill` call of the learn skill, or for a shell call that runs
+ * `curator.mjs` (the skill's apply step).
+ */
+export function learnStepFailed(entries, fromLine = 0) {
+  const learnCalls = new Set();
+  for (let i = fromLine; i < entries.length; i++) {
+    const e = entries[i];
+    if (!e || e.isSidechain || !Array.isArray(e.message?.content)) continue;
+    for (const c of e.message.content) {
+      if (e.type === 'assistant' && c?.type === 'tool_use') {
+        const ti = c.input || {};
+        if ((c.name === 'Skill' && LEARN_SKILL_RE.test(String(ti.skill || ''))) || (COMMAND_TOOL_RE.test(c.name) && /curator\.mjs/.test(String(ti.command || '')))) learnCalls.add(c.id);
+      } else if (e.type === 'user' && c?.type === 'tool_result' && c.is_error && learnCalls.has(c.tool_use_id)) return true;
+    }
+  }
+  return false;
+}
+
 /** Record the outcome of a requested in-loop review and move the cursor. */
 function finishInloopReview(db, input, s, now) {
   const m = RESULT_RE.exec(String(input.last_assistant_message || ''));
@@ -210,7 +261,14 @@ function finishInloopReview(db, input, s, now) {
     INSERT INTO reviews (session_id, mode, trigger, model, status, detail, turns_reviewed, corrections, learned, patched,
       input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, duration_ms, session_started_at, ts)
     VALUES (?, 'inloop', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`);
-  if (m) {
+  if (m && !Number(m[3]) && !Number(m[4]) && entries && learnStepFailed(entries, s.review_requested_line || 0)) {
+    // "learned=0" because saving failed (the skill was denied, the curator errored), not
+    // because nothing was worth keeping: the cursor stays and the end-of-session review
+    // reads the stretch. Until v0.25 an explicit "remember that" was lost this way.
+    insert.run(base.session, base.trigger, base.model, 'skipped', 'could not save: the learn step failed or was denied; left to the end-of-session review', 0, 0, 0, 0,
+      base.input, base.output, base.cacheRead, base.cacheWrite, now - s.review_requested_at, s.started_at, now);
+    db.prepare('UPDATE sessions SET review_requested_at = NULL WHERE id = ?').run(input.session_id);
+  } else if (m) {
     insert.run(base.session, base.trigger, base.model, 'ok', null, Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4]),
       base.input, base.output, base.cacheRead, base.cacheWrite, now - s.review_requested_at, s.started_at, now);
     db.prepare('UPDATE sessions SET review_cursor = ?, review_requested_at = NULL WHERE id = ?')
@@ -224,15 +282,46 @@ function finishInloopReview(db, input, s, now) {
 }
 
 /** Context injected at session start: the learning protocol (global facts live in ~/.claude/CLAUDE.md, which Claude Code loads itself). */
-export function sessionContext(learnedSinceLastSession = '') {
+export function sessionContext(learnedSinceLastSession = '', memories = null) {
   const lang = options().learningLanguage;
   return [
     '<ouroboros>',
     PROTOCOL,
     lang === 'auto' ? '' : `Write learnings in ${lang === 'pt-BR' ? 'Brazilian Portuguese' : 'English'}.`,
     learnedSinceLastSession ? `\nLearned by the end-of-session review since the last session (already saved):\n${learnedSinceLastSession}` : '',
+    memories?.lines.length
+      ? `\nAuto memory is off in this session, so Claude Code did not load the project memories Ouroboros saved. Their MEMORY.md lines (files in ${memories.dir}; read one when it applies):\n${memories.lines.join('\n')}${memories.more ? `\n(${memories.more} more in ${path.join(memories.dir, 'MEMORY.md')})` : ''}`
+      : '',
     '</ouroboros>',
   ].filter(Boolean).join('\n');
+}
+
+const MEMORY_INDEX_MAX_LINES = 40;
+const MEMORY_INDEX_MAX_CHARS = 4000;
+
+/**
+ * The MEMORY.md lines of the active project memories Ouroboros saved for `cwd` (newest
+ * first, capped in lines and characters), for a session where Claude Code loads no auto
+ * memory. Native memories are left out: they were never Ouroboros's to load.
+ */
+export function learnedMemoryIndex(db, cwd) {
+  const dir = memoryDirFor({ cwd });
+  const mine = db.prepare("SELECT title, path FROM learnings WHERE kind = 'memory' AND status = 'active' AND origin_session IS NOT 'native' ORDER BY updated_at DESC").all()
+    .filter((l) => normalize(path.dirname(path.resolve(l.path))) === normalize(dir));
+  if (!mine.length) return null;
+  let index = '';
+  try { index = fs.readFileSync(path.join(dir, 'MEMORY.md'), 'utf8'); } catch { /* no index: the titles stand in */ }
+  const indexLines = index.split(/\r?\n/);
+  const lines = [];
+  let chars = 0;
+  for (const l of mine) {
+    const name = path.basename(l.path);
+    const line = (indexLines.find((x) => x.includes(`](${name})`)) || `- [${l.title}](${name})`).trim();
+    if (lines.length >= MEMORY_INDEX_MAX_LINES || chars + line.length > MEMORY_INDEX_MAX_CHARS) break;
+    lines.push(line);
+    chars += line.length + 1;
+  }
+  return { dir, lines, more: mine.length - lines.length };
 }
 
 export function spawnWorker(args, env = process.env) {
@@ -275,8 +364,14 @@ const handlers = {
     const control = isControl(input.cwd);
     db.prepare('UPDATE sessions SET control = ? WHERE id = ?').run(control ? 1 : 0, input.session_id);
     addEvent(db, input, now, 'session_start', input.source || null);
-    // The dashboard runs outside hooks and can't see plugin options; leave a snapshot.
-    fs.writeFileSync(path.join(dataDir(), 'options.json'), JSON.stringify({ ...options(), updatedAt: now }));
+    // Without auto memory Claude Code loads no MEMORY.md: what Ouroboros saves as project
+    // memories would be saved, announced and never read.
+    const autoMemory = autoMemoryStatus(input.cwd);
+    // The dashboard runs outside hooks and can't see plugin options; leave a snapshot
+    // (of this hook's own options: the environment or the defaults, never the old snapshot).
+    fs.writeFileSync(path.join(dataDir(), 'options.json'), JSON.stringify({
+      ...options(), autoMemory: { ...autoMemory, project: projectIdFor(input.cwd) }, updatedAt: now,
+    }));
     if (options().learning && !control) {
       // Files deleted outside Ouroboros (by the user, or by Claude Code tidying its
       // memory): the records follow, and the notice below says so.
@@ -300,14 +395,24 @@ const handlers = {
       const remind = waiting && (learnedText || now - (Number(dbApi.getMeta(db, 'inbox_hint_at')) || 0) > 20 * 60 * 60 * 1000);
       if (remind) dbApi.setMeta(db, 'inbox_hint_at', now);
       const inboxLine = remind ? `${waiting} waiting for your decision: /ouroboros:inbox (or the dashboard)` : '';
+      // Auto memory off: said once per project (again only after it was seen on in
+      // between), and the memories Ouroboros saved here go into the context instead.
+      const memoryKey = `auto_memory:${projectIdFor(input.cwd)}`;
+      const wasOff = dbApi.getMeta(db, memoryKey) === 'off';
+      dbApi.setMeta(db, memoryKey, autoMemory.on ? 'on' : 'off');
+      const memoryLine = !autoMemory.on && !wasOff
+        ? `Ouroboros: Claude Code does not load auto memory here (${autoMemory.reason}), so the project memories Ouroboros saves are not loaded by Claude Code in this project. Ouroboros adds the ones it saved to the session context instead.`
+        : '';
+      const memories = autoMemory.on ? null : learnedMemoryIndex(db, input.cwd);
       const message = [
         learnedText ? `Ouroboros, since your last session:\n${learnedText}\n(/ouroboros:undo or /ouroboros:forget to revert)` : '',
         inboxLine ? `${learnedText ? '' : 'Ouroboros: '}${inboxLine}` : '',
+        memoryLine,
       ].filter(Boolean).join('\n');
       // Synchronous hook: stdout becomes session context; systemMessage is shown to the user.
       process.stdout.write(JSON.stringify({
         ...(message ? { systemMessage: message } : {}),
-        hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: sessionContext(learnedText) },
+        hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: sessionContext(learnedText, memories) },
       }));
     }
     // Sessions whose SessionEnd never ran a worker (crash, killed terminal) or whose
@@ -316,15 +421,21 @@ const handlers = {
     // Also reviews left to finish later (a part of a long session failed, the model
     // call failed, the month's budget ran out): tried again once there is budget.
     const canSpend = dbApi.monthSpend(db) < options().monthlyBudgetUsd;
+    // And sessions whose SessionEnd never ran at all (a crash, a killed terminal, the hook
+    // cut short): nothing queued them, so they were never reviewed or measured. Long idle
+    // is taken as the end; if one goes on later, its cursors make the next review read
+    // only the new part. Older ones are left alone: learning from them now, with nobody
+    // watching, is what `/ouroboros:backfill learn` asks for approval for.
     const orphans = db.prepare(`
-      SELECT id FROM sessions
+      SELECT id, queue_state FROM sessions
       WHERE id != ? AND (
         (queue_state = 'queued' AND COALESCE(ended_at, last_event_at) < ?) OR
         (queue_state = 'running' AND last_event_at < ?) OR
-        (queue_state = 'waiting' AND ? AND COALESCE(reviewed_at, last_event_at) < ?)
+        (queue_state = 'waiting' AND ? AND COALESCE(reviewed_at, last_event_at) < ?) OR
+        (queue_state IS NULL AND ended_at IS NULL AND turns >= 2 AND last_event_at < ? AND last_event_at >= ?)
       )
       ORDER BY started_at DESC LIMIT 3
-    `).all(input.session_id, stale, stale, canSpend ? 1 : 0, now - RETRY_AFTER_MS);
+    `).all(input.session_id, stale, stale, canSpend ? 1 : 0, now - RETRY_AFTER_MS, now - IDLE_AS_ENDED_MS, now - IDLE_AS_ENDED_MAX_AGE_MS);
     // v0.12: the old global profile becomes proposals for the global CLAUDE.md.
     try {
       if (retireProfile(db, now) && options().learning) spawnWorker(['--drain']);
@@ -338,7 +449,13 @@ const handlers = {
       spawnWorker(['--maintain']);
     }
     if (orphans.length && options().backgroundReview) {
-      for (const { id } of orphans) {
+      for (const { id, queue_state: state } of orphans) {
+        if (state === null) {
+          // What SessionEnd would have set, ended at its last event.
+          const reason = `no SessionEnd: idle over ${IDLE_AS_ENDED_MS / 3_600_000} h`;
+          db.prepare('UPDATE sessions SET ended_at = last_event_at, end_reason = ?, review_requested_at = NULL WHERE id = ?').run(reason, id);
+          db.prepare("INSERT INTO events (session_id, ts, kind, target) VALUES (?, ?, 'session_end', ?)").run(id, now, reason);
+        }
         db.prepare("UPDATE sessions SET queue_state = 'queued', last_event_at = ? WHERE id = ?").run(now, id);
         spawnWorker(['--session', id, '--trigger', 'orphan']);
       }
@@ -456,7 +573,8 @@ const handlers = {
       // background subagent reporting back, a message from another session), so the
       // counter runs ahead in agentic sessions. The cadence is in turns the user typed,
       // read the same way the reviews read them.
-      const from = Math.min(s.review_requested_line || 0, entries.length);
+      // A fork's copy of its parent's turns is not this session's.
+      const from = Math.min(Math.max(s.review_requested_line || 0, skipInherited(db, input.session_id, entries)), entries.length);
       const typed = entries.slice(from >= entries.length ? 0 : from).filter(isHumanPrompt).length;
       if (typed < opts.reviewEveryTurns) {
         periodic = false;
@@ -538,6 +656,7 @@ async function main() {
     return;
   }
 
+  optionsFromEnvOnly();
   dbApi = await import('./db.mjs');
   const { openDb, logError } = dbApi;
   let db;
