@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { options } from './config.mjs';
 import { apply as curatorApply, DUPLICATE_THRESHOLD, interimOf, learnMeanwhile, retireInterim, similarity } from './curator.mjs';
-import { applyChangeset, applyEdits, changesetNeedsApproval, claimsOf, fileDisplayName, getChangeset, pendingChangeset, saveChangeset } from './changesets.mjs';
+import { applyChangeset, applyEdits, changesetNeedsApproval, claimsOf, fileDisplayName, getChangeset, hashText, pendingChangeset, saveChangeset } from './changesets.mjs';
 import { acquireLease, assertBudget, BudgetError, logError, releaseLease, renewLease } from './db.mjs';
 import { buildIndex, groundIdentifiers, identifiersIn, knowledgeFiles, knowledgeKind, PATCHABLE, resolveOwner, tokenize } from './knowledge.mjs';
 import { globalInstructionsFile, readKnowledgeFile } from './paths.mjs';
@@ -152,8 +152,20 @@ ${elsewhere.length ? elsewhere.map((e) => `<excerpt file="${e.file}" kind="${e.k
 
 /** Screening calls that may leave a proposal unanswered before it waits for the user. */
 const MAX_SCREEN_MISSES = 2;
+/** Editor calls that may fail or leave a learning unanswered before it waits for the user. */
+const MAX_EDITOR_MISSES = 2;
+/** Autonomy settings, from the one that lets most through to the one that holds everything. */
+const STRICTNESS = ['auto', 'hybrid', 'queue'];
 const ELSEWHERE_PER_CLAIM = 2;
 const ELSEWHERE_MAX = 8;
+
+/** The evaluation's lease passed to another process: stop, and leave the rows to the holder. */
+export class LeaseLost extends Error {
+  constructor() {
+    super('another process took over the evaluation queue; it picks up the rest');
+    this.name = 'LeaseLost';
+  }
+}
 
 /**
  * What OTHER knowledge files say about the claims (the assistant reads those too): a
@@ -236,6 +248,37 @@ function setOutcome(db, id, outcome, note, extra = {}) {
   db.prepare(`UPDATE candidates SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE id = ?`).run(...keys.map((k) => fields[k]), id);
 }
 
+/**
+ * The state a candidate was taken in. A model call takes a while and the user (inbox,
+ * dashboard) or a live session may act on the row meanwhile: what the call returns is
+ * applied only to rows still in the state they were taken in.
+ */
+function rowState(db, id) {
+  const r = db.prepare('SELECT outcome, changeset_id FROM candidates WHERE id = ?').get(id);
+  return r ? `${r.outcome}|${r.changeset_id ?? ''}` : 'gone';
+}
+
+/** Count one more failed attempt at a candidate (in its payload); returns the count. */
+function countMiss(db, id, key) {
+  const p = payloadOf(db.prepare('SELECT payload FROM candidates WHERE id = ?').get(id) || {});
+  const n = (Number(p[key]) || 0) + 1;
+  db.prepare('UPDATE candidates SET payload = ? WHERE id = ?').run(JSON.stringify({ ...p, [key]: n }), id);
+  return n;
+}
+
+/** Run `fn` under the database's write lock: nobody else writes between its reads and its writes. */
+function locked(db, fn) {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const r = fn();
+    db.exec('COMMIT');
+    return r;
+  } catch (err) {
+    try { db.exec('ROLLBACK'); } catch { /* not in a transaction */ }
+    throw err;
+  }
+}
+
 function when(row) {
   // Date and time: two sessions on the same day are common, and "the more recent one"
   // decides between claims that disagree.
@@ -250,14 +293,14 @@ function claimFrom(row, overrides = {}) {
   const text = row.claim || item.append || item.new || [item.description, item.text, item.body].filter(Boolean).join('\n') || row.summary || row.title;
   return {
     id: row.id, title: row.title, claim: String(text).slice(0, 2000), evidence: row.evidence, when: when(row), confidence: row.confidence,
-    confirmed: !!payload.confirmed || undefined, ...overrides,
+    confirmed: !!payload.confirmed || undefined, autonomy: payload.autonomy, ...overrides,
   };
 }
 
 /**
  * Compose the changes for each owner file. `routes`: Map(file -> [claim]). Claims
  * already pending for a file are judged again together with the new ones, and the
- * file's previous pending changeset is replaced.
+ * file's previous pending changeset is replaced (kept, when the result is the same).
  */
 export async function composeRoutes(db, routes, ctx) {
   const report = { changesets: 0, applied: 0, queued: 0, covered: 0, contradicted: 0, conflicts: 0, unwritten: 0, cost: 0, calls: 0, results: [] };
@@ -278,7 +321,14 @@ export async function composeRoutes(db, routes, ctx) {
     const previous = [pending?.id, ...stale].filter(Boolean);
     const carried = previous.flatMap((id) => claimsOf(db, id)).filter((c) => !fresh.some((f) => f.id === c.id)).map((c) => claimFrom(c));
     const claims = [...carried, ...fresh];
-    if (!claims.length) continue;
+    if (!claims.length) {
+      // A change no learning waits in any more (each was decided on its own) has nothing
+      // to compose: it is closed, or the queue would never be empty.
+      for (const id of previous) db.prepare("UPDATE changesets SET status = 'superseded', note = 'no learning is left in it', decided_at = ? WHERE id = ? AND status IN ('pending', 'stale')").run(Date.now(), id);
+      continue;
+    }
+    const taken = new Map(claims.map((c) => [c.id, rowState(db, c.id)]));
+    const statusBefore = new Map(previous.map((id) => [id, getChangeset(db, id)?.status]));
     let composed;
     try {
       assertBudget(db, options().monthlyBudgetUsd);
@@ -288,62 +338,120 @@ export async function composeRoutes(db, routes, ctx) {
       const standIns = claims.map((c) => interimOf(db, c.id)?.path).filter(Boolean);
       composed = await composeFile({ file, claims, cwd: ctx.cwd, model: ctx.model, exclude: standIns });
     } catch (err) {
-      if (!(err instanceof BudgetError)) logError(db, 'evaluate:editor', err);
-      // Leave them waiting: the next queue check tries again.
-      for (const c of fresh) setOutcome(db, c.id, 'queued', `could not compose the change to ${file} yet`, { triaged_at: null, target: file });
+      if (err instanceof BudgetError || err instanceof LeaseLost) {
+        // Leave them waiting: the next queue check (or the lease's new holder) tries again.
+        for (const c of fresh) setOutcome(db, c.id, 'queued', `could not compose the change to ${file} yet`, { triaged_at: null, target: file });
+        continue;
+      }
+      logError(db, 'evaluate:editor', err);
+      // A failed call is tried again at the next queue check, not in this one, and a
+      // bounded number of times: then the learning waits for the user with the reason
+      // (as a proposal the screen never answers for). The learnings of a stale change are
+      // counted too (it would be composed again forever); those of a pending one still
+      // wait in it.
+      const staleIds = new Set(stale);
+      for (const c of claims) {
+        const isFresh = fresh.some((f) => f.id === c.id);
+        if (!isFresh && !staleIds.has(db.prepare('SELECT changeset_id FROM candidates WHERE id = ?').get(c.id)?.changeset_id)) continue;
+        const misses = countMiss(db, c.id, 'editor_misses');
+        if (misses >= MAX_EDITOR_MISSES) {
+          report.queued++;
+          setOutcome(db, c.id, 'queued', `the change to ${fileDisplayName(file)} could not be composed (${misses} attempts failed); nothing was written, you decide`, { target: file, changeset_id: null });
+          if (isFresh) report.results.push({ status: 'queued', title: c.title, candidateId: c.id });
+        } else if (isFresh) {
+          setOutcome(db, c.id, 'queued', `could not compose the change to ${file} yet`, { triaged_at: null, target: file });
+        }
+        ctx.skip?.add(c.id);
+      }
+      for (const id of stale) {
+        ctx.skip?.add(`cs:${id}`);
+        if (!claimsOf(db, id).length) db.prepare("UPDATE changesets SET status = 'superseded', note = 'no learning is left in it', decided_at = ? WHERE id = ? AND status = 'stale'").run(Date.now(), id);
+      }
       continue;
     }
     report.calls++;
     report.cost += composed.usage.cost;
     insertReview(db, { sessionId: ctx.sessionId || 'maintenance', mode: ctx.sessionId ? 'background' : 'maintenance', trigger: 'editor', model: ctx.model, status: 'ok', usage: composed.usage, sessionStartedAt: ctx.sessionStartedAt });
 
-    // The editor ran for a while: if the user approved or rejected a change to this file
-    // meanwhile (dashboard), this composition is out of date. Compose again next round.
-    const moved = previous.some((id) => !['pending', 'stale'].includes(getChangeset(db, id)?.status))
-      || carried.some((c) => db.prepare('SELECT outcome FROM candidates WHERE id = ?').get(c.id)?.outcome !== 'queued');
-    if (moved) {
-      for (const c of fresh) setOutcome(db, c.id, 'queued', null, { triaged_at: null, target: file, changeset_id: null });
-      continue;
-    }
-
+    // What the editor returned is saved under the write lock, and only if nothing it was
+    // composed from moved while it ran: the user decided a learning or a change to this
+    // file (inbox, dashboard), a live session queued or attached a patch for it, or the
+    // file itself changed. Otherwise this composition is out of date: the new learnings
+    // are composed again next round with what is there now, and a row someone else
+    // decided is never touched.
+    const retire = [];
     const appliedFor = (id) => composed.applied.some((e) => e.claims.includes(id));
     const rejectedFor = (id) => composed.rejected.filter((r) => r.edit.claims?.includes(id)).map((r) => r.reason);
     const inChangeset = [];
-    for (const c of claims) {
-      const s = composed.status.get(c.id);
-      const where = path.basename(file);
-      if (!s) { setOutcome(db, c.id, 'queued', null, { triaged_at: null, target: file, changeset_id: null }); continue; }
-      if (s.status === 'covered') {
-        report.covered++;
-        setOutcome(db, c.id, c.duplicateOf ? 'duplicate' : 'dropped', `covered [editor]: ${s.reason} (${file})`, { target: file, changeset_id: null });
-      } else if (s.status === 'contradicted') {
-        report.contradicted++;
-        setOutcome(db, c.id, 'dropped', `unverified [editor]: ${s.reason}`, { target: file, changeset_id: null });
-        retireInterim(db, c.id); // the project says otherwise: its stand-in memory goes too
-      } else if (s.status === 'conflict') {
-        report.conflicts++;
-        report.results.push({ status: 'conflict', title: c.title });
-        // Never dropped silently: the user decides (dashboard → Conflicts).
-        setOutcome(db, c.id, 'conflict', `conflict${s.conflicts_with ? ` with #${s.conflicts_with}` : ''}: ${s.reason}`, { target: file, changeset_id: null, claim: c.claim });
-      } else if (!appliedFor(c.id)) {
-        report.unwritten++;
-        setOutcome(db, c.id, 'dropped', `not written to ${where}: ${rejectedFor(c.id).join('; ') || 'no edit was given'}`, { target: file, changeset_id: null });
-      } else {
-        inChangeset.push(c.id);
-        // An "adds" whose edit rewrites existing text is a correction: it waits for the user.
-        const rewrites = s.status !== 'corrects' && composed.applied.some((e) => e.rewrites && e.claims.includes(c.id));
-        const label = s.status === 'corrects' ? `✎ corrects ${file}` : rewrites ? `✎ rewrites text in ${file}` : `adds to ${file}`;
-        db.prepare('UPDATE candidates SET note = ?, claim = ?, target = ?, triaged_at = ? WHERE id = ?')
-          .run(`${label}: ${s.reason}`, c.claim, file, Date.now(), c.id);
+    const csId = locked(db, () => {
+      const current = pendingChangeset(db, file);
+      const moved = claims.some((c) => rowState(db, c.id) !== taken.get(c.id))
+        || previous.some((id) => getChangeset(db, id)?.status !== statusBefore.get(id))
+        || previous.some((id) => claimsOf(db, id).some((c) => !taken.has(c.id)))
+        || (current && !previous.includes(current.id))
+        || readKnowledgeFile(file) !== composed.base;
+      if (moved) {
+        for (const c of fresh) if (rowState(db, c.id) === taken.get(c.id)) setOutcome(db, c.id, 'queued', null, { triaged_at: null, target: file, changeset_id: null });
+        return null;
       }
-    }
-    for (const id of previous) db.prepare("UPDATE changesets SET status = 'superseded', decided_at = ? WHERE id = ? AND status IN ('pending', 'stale')").run(Date.now(), id);
-    if (!inChangeset.length) continue;
-    const note = composed.rejected.length ? `left out: ${composed.rejected.map((r) => r.reason).join('; ')}` : null;
-    const csId = saveChangeset(db, { file, cwd: ctx.cwd, base: composed.base, edits: composed.applied, claimIds: inChangeset, note, cost: composed.usage.cost });
+      for (const c of claims) {
+        const s = composed.status.get(c.id);
+        const where = path.basename(file);
+        if (!s) {
+          // The editor did not answer for it: composed again, a bounded number of times,
+          // then it waits for the user (as a proposal the screen never answers for).
+          if (countMiss(db, c.id, 'editor_misses') >= MAX_EDITOR_MISSES) {
+            report.queued++;
+            setOutcome(db, c.id, 'queued', `the editor of ${fileDisplayName(file)} gave no verdict for it; nothing was written, you decide`, { target: file, changeset_id: null });
+            if (fresh.some((f) => f.id === c.id)) report.results.push({ status: 'queued', title: c.title, candidateId: c.id });
+          } else {
+            setOutcome(db, c.id, 'queued', null, { triaged_at: null, target: file, changeset_id: null });
+          }
+          continue;
+        }
+        if (s.status === 'covered') {
+          report.covered++;
+          setOutcome(db, c.id, c.duplicateOf ? 'duplicate' : 'dropped', `covered [editor]: ${s.reason} (${file})`, { target: file, changeset_id: null });
+        } else if (s.status === 'contradicted') {
+          report.contradicted++;
+          setOutcome(db, c.id, 'dropped', `unverified [editor]: ${s.reason}`, { target: file, changeset_id: null });
+          retire.push(c.id); // the project says otherwise: its stand-in memory goes too (after the lock: it writes)
+        } else if (s.status === 'conflict') {
+          report.conflicts++;
+          report.results.push({ status: 'conflict', title: c.title });
+          // Never dropped silently: the user decides (dashboard → Conflicts).
+          setOutcome(db, c.id, 'conflict', `conflict${s.conflicts_with ? ` with #${s.conflicts_with}` : ''}: ${s.reason}`, { target: file, changeset_id: null, claim: c.claim });
+        } else if (!appliedFor(c.id)) {
+          report.unwritten++;
+          setOutcome(db, c.id, 'dropped', `not written to ${where}: ${rejectedFor(c.id).join('; ') || 'no edit was given'}`, { target: file, changeset_id: null });
+        } else {
+          inChangeset.push(c.id);
+          // An "adds" whose edit rewrites existing text is a correction: it waits for the user.
+          const rewrites = s.status !== 'corrects' && composed.applied.some((e) => e.rewrites && e.claims.includes(c.id));
+          const label = s.status === 'corrects' ? `✎ corrects ${file}` : rewrites ? `✎ rewrites text in ${file}` : `adds to ${file}`;
+          db.prepare('UPDATE candidates SET note = ?, claim = ?, target = ?, triaged_at = ? WHERE id = ?')
+            .run(`${label}: ${s.reason}`, c.claim, file, Date.now(), c.id);
+        }
+      }
+      // The same change as the one already waiting (same text, same edits, same
+      // learnings): it keeps its id, so the inbox entry the user may be reading stays.
+      const same = current && current.base_hash === hashText(composed.base) && current.edits === JSON.stringify(composed.applied)
+        && [...inChangeset].sort().join() === claimsOf(db, current.id).map((c) => c.id).sort().join();
+      for (const id of previous) if (!(same && id === current.id)) db.prepare("UPDATE changesets SET status = 'superseded', decided_at = ? WHERE id = ? AND status IN ('pending', 'stale')").run(Date.now(), id);
+      if (!inChangeset.length || same) return null;
+      const note = composed.rejected.length ? `left out: ${composed.rejected.map((r) => r.reason).join('; ')}` : null;
+      return saveChangeset(db, { file, cwd: ctx.cwd, base: composed.base, edits: composed.applied, claimIds: inChangeset, note, cost: composed.usage.cost });
+    });
+    for (const id of retire) retireInterim(db, id);
+    if (!csId) continue;
     report.changesets++;
     const cs = getChangeset(db, csId);
-    if (!changesetNeedsApproval(db, cs, ctx.actor, ctx.autonomy)) {
+    // A learning held for the user (it cites no user turn, it comes from a learning
+    // backfill) holds the whole change it is part of: the change takes the strictest
+    // autonomy among its learnings, not that of whatever arrived last for the file.
+    const autonomyOf = (c) => (STRICTNESS.includes(c.autonomy) ? c.autonomy : ctx.autonomy);
+    const autonomy = claims.filter((c) => inChangeset.includes(c.id)).map(autonomyOf).reduce((a, b) => (STRICTNESS.indexOf(b) > STRICTNESS.indexOf(a) ? b : a), ctx.autonomy);
+    if (!changesetNeedsApproval(db, cs, ctx.actor, autonomy)) {
       const r = applyChangeset(db, csId, { actor: ctx.actor });
       if (r.status === 'patched') {
         report.applied++;
@@ -364,7 +472,7 @@ export async function composeRoutes(db, routes, ctx) {
       const rewrites = composed.applied.some((e) => (e.corrects || e.rewrites) && e.claims.includes(c.id));
       const row = db.prepare('SELECT session_id FROM candidates WHERE id = ?').get(c.id);
       const saved = s?.status === 'adds' && !rewrites
-        && learnMeanwhile(db, { candidateId: c.id, file, title: c.title, claim: c.claim, evidence: c.evidence, cwd: ctx.cwd, confidence: c.confidence, sessionId: row?.session_id, actor: ctx.actor, autonomy: ctx.autonomy });
+        && learnMeanwhile(db, { candidateId: c.id, file, title: c.title, claim: c.claim, evidence: c.evidence, cwd: ctx.cwd, confidence: c.confidence, sessionId: row?.session_id, actor: ctx.actor, autonomy: autonomyOf(c) });
       if (saved) report.results.push({ status: 'created', title: `${c.title} (a project memory for now; proposed for ${fileDisplayName(file)})`, candidateId: c.id });
       else if (isFresh && c.title) waitingTitles.push(c.title);
     }
@@ -393,11 +501,28 @@ export async function evaluate(db, rows, ctx) {
   const proposals = rows.map((r) => ({ id: r.id, ...items.get(r.id), claim: r.claim || undefined, target: r.target || undefined, evidence: r.evidence, when: when(r) }));
   // Each screening call is recorded as it happens, so the budget check before the next
   // call (and the month's spend) always counts it.
-  const record = (usage) => { ctx.tick?.(); return recordUsage(usage); };
+  // The call is recorded before the lease is renewed: a lost lease stops what follows,
+  // not the record of what was spent.
+  const record = (usage) => { const r = recordUsage(usage); ctx.tick?.(); return r; };
   const recordUsage = (usage) => insertReview(db, { sessionId: ctx.sessionId || 'maintenance', mode: ctx.sessionId ? 'background' : 'maintenance', trigger: 'triage', model: ctx.model, status: 'ok', usage, sessionStartedAt: ctx.sessionStartedAt });
-  const screen = await triage(proposals, { cwd: ctx.cwd, db, lang: ctx.lang, model: ctx.model, exclude: rows.map((r) => r.id), record });
+  let screen;
+  try {
+    screen = await triage(proposals, { cwd: ctx.cwd, db, lang: ctx.lang, model: ctx.model, exclude: rows.map((r) => r.id), record });
+  } catch (err) {
+    if (err instanceof BudgetError || err instanceof LeaseLost) throw err;
+    // The screen failed for these proposals (a model error): nothing is written. It
+    // counts as a screen that gave no verdict, so it is tried again a bounded number of
+    // times, at the next queue check rather than in this one, and the other projects'
+    // proposals go on.
+    logError(db, 'evaluate:screen', err);
+    for (const r of rows) ctx.skip?.add(r.id);
+    screen = { verdicts: new Map(), cost: 0, calls: 0, failed: true };
+  }
   report.cost += screen.cost;
   report.calls += screen.calls;
+  // The screen ran for a while: a proposal the user decided meanwhile (rejected in the
+  // inbox, say) is left as the user left it.
+  rows = rows.filter((r) => rowState(db, r.id) === `${r.outcome}|${r.changeset_id ?? ''}`);
 
   const routes = new Map();
   const route = (file, claim) => {
@@ -434,7 +559,7 @@ export async function evaluate(db, rows, ctx) {
         db.prepare('UPDATE candidates SET payload = ?, triaged_at = NULL WHERE id = ?').run(JSON.stringify({ ...payload, screen_misses: misses }), row.id);
       } else {
         report.queued++;
-        setOutcome(db, row.id, 'queued', 'the knowledge check gave no verdict for it; nothing was written, you decide', { changeset_id: null });
+        setOutcome(db, row.id, 'queued', `the knowledge check ${screen.failed ? 'failed' : 'gave no verdict'} for it; nothing was written, you decide`, { changeset_id: null });
         report.results.push({ status: 'queued', title: row.title, candidateId: row.id });
       }
       report.unscreened++;
@@ -539,10 +664,17 @@ function payloadOf(row) {
   try { return JSON.parse(row.payload || '{}'); } catch { return {}; }
 }
 
-/** Whether anything waits for the evaluation. */
-export function queueHasWork(db) {
-  return !!db.prepare("SELECT 1 FROM candidates WHERE outcome IN ('pending', 'queued') AND changeset_id IS NULL AND triaged_at IS NULL LIMIT 1").get()
-    || !!db.prepare("SELECT 1 FROM changesets WHERE status = 'stale' LIMIT 1").get();
+/**
+ * Whether anything waits for the evaluation. `skip`: what failed in this drain (candidate
+ * ids, `cs:<id>` for a stale changeset), which waits for the next one.
+ */
+export function queueHasWork(db, skip = null) {
+  if (!skip?.size) {
+    return !!db.prepare("SELECT 1 FROM candidates WHERE outcome IN ('pending', 'queued') AND changeset_id IS NULL AND triaged_at IS NULL LIMIT 1").get()
+      || !!db.prepare("SELECT 1 FROM changesets WHERE status = 'stale' LIMIT 1").get();
+  }
+  return db.prepare("SELECT id FROM candidates WHERE outcome IN ('pending', 'queued') AND changeset_id IS NULL AND triaged_at IS NULL").all().some((r) => !skip.has(r.id))
+    || db.prepare("SELECT id FROM changesets WHERE status = 'stale'").all().some((c) => !skip.has(`cs:${c.id}`));
 }
 
 /** The notice lines for what an evaluation did, as the next session shows them. */
@@ -564,17 +696,18 @@ export function noticeLines(results) {
  * so its notice can say what happened. Call through `drainQueue`, which makes sure only
  * one process evaluates at a time.
  */
-export async function tidyQueue(db, { force = false, autonomy = 'queue', tick = null } = {}) {
+export async function tidyQueue(db, { force = false, autonomy = 'queue', tick = null, skip = new Set() } = {}) {
   const opts = options();
   if (force) {
     db.prepare("UPDATE changesets SET status = 'superseded', decided_at = ? WHERE status IN ('pending', 'stale')").run(Date.now());
     db.prepare("UPDATE candidates SET changeset_id = NULL, triaged_at = NULL WHERE outcome = 'queued'").run();
   }
-  const rows = db.prepare(WAITING_SQL).all();
+  // What failed in this drain waits for the next one (`skip`).
+  const rows = db.prepare(WAITING_SQL).all().filter((r) => !skip.has(r.id));
   // A conflict the user settled ("it's a new rule") goes straight to its file's editor.
   const confirmed = rows.filter((r) => r.target && payloadOf(r).confirmed);
   const fresh = rows.filter((r) => !confirmed.includes(r));
-  const staleSets = db.prepare("SELECT * FROM changesets WHERE status = 'stale'").all();
+  const staleSets = db.prepare("SELECT * FROM changesets WHERE status = 'stale'").all().filter((cs) => !skip.has(`cs:${cs.id}`));
   const report = { total: fresh.length, recomposed: 0, kept: 0, created: 0, dropped: 0, merged: 0, routed: 0, suggested: 0, stale: 0, queued: 0, patched: 0, cost: 0, byRule: {} };
   if (!fresh.length && !staleSets.length && !confirmed.length) return report;
 
@@ -600,40 +733,54 @@ export async function tidyQueue(db, { force = false, autonomy = 'queue', tick = 
     assertBudget(db, opts.monthlyBudgetUsd);
     tick?.();
     const ctx = {
-      tick,
+      tick, skip,
       cwd: g.cwd || undefined, actor: 'background', autonomy: g.autonomy, lang: opts.learningLanguage, model: opts.judgeModel,
       sessionId: g.sessionId || undefined, sessionStartedAt: g.sessionStartedAt, payload: { trigger: g.trigger || 'session_end' },
     };
-    const results = [];
-    if (g.rows.length) {
-      const r = await evaluate(db, g.rows, ctx);
-      for (const k of ['kept', 'created', 'dropped', 'merged', 'routed', 'suggested', 'stale', 'queued', 'patched', 'cost']) report[k] += r[k] || 0;
-      for (const [rule, n] of Object.entries(r.byRule)) report.byRule[rule] = (report.byRule[rule] || 0) + n;
-      results.push(...r.results);
-      if (g.reviewId) db.prepare('UPDATE reviews SET learned = learned + ?, patched = patched + ? WHERE id = ?').run(r.created || 0, r.patched || 0, g.reviewId);
-    }
-    if (g.stale.length || g.confirmed.length) {
-      const routes = new Map();
-      for (const cs of g.stale) if (!routes.has(cs.file)) routes.set(cs.file, []);
-      for (const r of g.confirmed) {
-        if (!routes.has(r.target)) routes.set(r.target, []);
-        routes.get(r.target).push(claimFrom(r));
-      }
-      const r = await composeRoutes(db, routes, ctx);
-      report.recomposed += g.stale.length;
-      report.cost += r.cost;
-      report.queued += r.queued;
-      report.patched += r.applied;
-    }
-    const lines = noticeLines(results);
-    if (g.notify && lines.length) {
-      const project = db.prepare('SELECT project FROM sessions WHERE id = ?').get(g.sessionId)?.project ?? null;
-      db.prepare('INSERT INTO notices (ts, session_id, project, text) VALUES (?, ?, ?, ?)').run(Date.now(), g.sessionId, project, lines.join('\n'));
+    try {
+      await tidyGroup(db, g, ctx, report);
+    } catch (err) {
+      // The budget and a lost lease stop the whole evaluation; anything else stops only
+      // this group, which waits for the next queue check while the others go on.
+      if (err instanceof BudgetError || err instanceof LeaseLost) throw err;
+      logError(db, 'evaluate:queue', err);
+      for (const r of [...g.rows, ...g.confirmed]) skip.add(r.id);
+      for (const cs of g.stale) skip.add(`cs:${cs.id}`);
     }
   }
   db.prepare("INSERT INTO reviews (session_id, mode, trigger, model, status, detail, cost_usd, ts) VALUES ('maintenance', 'maintenance', 'triage-summary', ?, 'ok', ?, 0, ?)")
     .run(opts.judgeModel, JSON.stringify(report), Date.now());
   return report;
+}
+
+/** Evaluate one group of the queue (one project, one autonomy, one live session). */
+async function tidyGroup(db, g, ctx, report) {
+  const results = [];
+  if (g.rows.length) {
+    const r = await evaluate(db, g.rows, ctx);
+    for (const k of ['kept', 'created', 'dropped', 'merged', 'routed', 'suggested', 'stale', 'queued', 'patched', 'cost']) report[k] += r[k] || 0;
+    for (const [rule, n] of Object.entries(r.byRule)) report.byRule[rule] = (report.byRule[rule] || 0) + n;
+    results.push(...r.results);
+    if (g.reviewId) db.prepare('UPDATE reviews SET learned = learned + ?, patched = patched + ? WHERE id = ?').run(r.created || 0, r.patched || 0, g.reviewId);
+  }
+  if (g.stale.length || g.confirmed.length) {
+    const routes = new Map();
+    for (const cs of g.stale) if (!routes.has(cs.file)) routes.set(cs.file, []);
+    for (const r of g.confirmed) {
+      if (!routes.has(r.target)) routes.set(r.target, []);
+      routes.get(r.target).push(claimFrom(r));
+    }
+    const r = await composeRoutes(db, routes, ctx);
+    report.recomposed += g.stale.length;
+    report.cost += r.cost;
+    report.queued += r.queued;
+    report.patched += r.applied;
+  }
+  const lines = noticeLines(results);
+  if (g.notify && lines.length) {
+    const project = db.prepare('SELECT project FROM sessions WHERE id = ?').get(g.sessionId)?.project ?? null;
+    db.prepare('INSERT INTO notices (ts, session_id, project, text) VALUES (?, ?, ?, ?)').run(Date.now(), g.sessionId, project, lines.join('\n'));
+  }
 }
 
 const LEASE = 'evaluate';
@@ -647,15 +794,24 @@ const MAX_ROUNDS = 4;
  */
 export async function drainQueue(db, { force = false, autonomy = 'queue' } = {}) {
   const total = { status: 'done', rounds: 0, cost: 0, reports: [] };
+  // What failed in this drain (a model error for one group or file) is tried again by
+  // the next drain, not round after round in this one.
+  const skip = new Set();
   let first = true;
   for (;;) {
     let token = acquireLease(db, LEASE);
     // Renewed before each model call: a long drain never loses the lease while it runs.
-    const tick = () => { token = renewLease(db, LEASE, token) || token; };
+    // If it was lost anyway (the process was suspended past its expiry and another took
+    // it), this one stops and leaves the rest to the new holder.
+    const tick = () => {
+      const next = renewLease(db, LEASE, token);
+      if (!next) throw new LeaseLost();
+      token = next;
+    };
     if (!token) return first ? { status: 'busy', reason: 'another process is evaluating the queue; it will pick this up' } : total;
     try {
-      while (total.rounds < MAX_ROUNDS && ((first && force) || queueHasWork(db))) {
-        const r = await tidyQueue(db, { force: first && force, autonomy, tick });
+      while (total.rounds < MAX_ROUNDS && ((first && force) || queueHasWork(db, skip))) {
+        const r = await tidyQueue(db, { force: first && force, autonomy, tick, skip });
         first = false;
         total.rounds++;
         total.cost += r.cost || 0;
@@ -663,6 +819,7 @@ export async function drainQueue(db, { force = false, autonomy = 'queue' } = {})
       }
     } catch (err) {
       if (err instanceof BudgetError) return { ...total, status: 'budget', reason: err.message };
+      if (err instanceof LeaseLost) return { ...total, status: 'busy', reason: err.message };
       throw err;
     } finally {
       releaseLease(db, LEASE, token);
@@ -670,6 +827,6 @@ export async function drainQueue(db, { force = false, autonomy = 'queue' } = {})
     first = false;
     // Work queued by another process just before the lease was released would wait for
     // the next drain: look once more now that the lease is free.
-    if (total.rounds >= MAX_ROUNDS || !queueHasWork(db)) return total;
+    if (total.rounds >= MAX_ROUNDS || !queueHasWork(db, skip)) return total;
   }
 }
