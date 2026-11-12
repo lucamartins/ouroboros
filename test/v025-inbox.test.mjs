@@ -112,3 +112,73 @@ test('the inbox skill is not opened by the model', () => {
   const head = read(path.join(root, 'skills', 'inbox', 'SKILL.md')).split(/^---$/m)[1];
   assert.match(head, /^disable-model-invocation: true$/m);
 });
+
+// ---- review III follow-up ----
+
+function queuedItem(note, payload = {}) {
+  const item = { kind: 'memory', memory_type: 'feedback', title: 'Follow-up item', body: 'Body.', description: 'd', project_dir: cwd };
+  return Number(db.prepare(`INSERT INTO candidates (review_id, session_id, project, kind, title, claim, summary, confidence, outcome, cwd, note, payload, ts)
+    VALUES (0, 'sess-1', 'p', 'memory', 'Follow-up item', 'x', 'x', 0.8, 'queued', ?, ?, ?, ?)`).run(cwd, note, JSON.stringify({ item, autonomy: 'auto', ...payload }), Date.now()).lastInsertRowid);
+}
+
+test('approve it:<id> of a learning whose change is closed does not point at a card that does not exist', () => {
+  for (const status of ['rejected', 'superseded', 'applied']) {
+    fs.writeFileSync(rules, RULES);
+    const q = queue('- Closed change.', `Closed ${status}`);
+    const id = cs.claimsOf(db, q.changesetId)[0].id;
+    db.prepare('UPDATE changesets SET status = ? WHERE id = ?').run(status, q.changesetId);
+    const r = inbox.approve(db, `it:${id}`);
+    assert.equal(r.status, 'not_found', status);
+    assert.equal(r.key, undefined);
+    assert.equal(read(rules), RULES);
+    assert.equal(inbox.reject(db, `it:${id}`).status, 'rejected_by_user', 'the user can still clear it');
+  }
+});
+
+test('edit with a drop that is not a list is invalid and changes nothing', () => {
+  fs.writeFileSync(rules, RULES);
+  const q = queue('- Drop shape.', 'Drop shape');
+  const before = writes();
+  for (const bad of ['5', 5, { a: 1 }, null]) {
+    const r = inbox.editAndApprove(db, `cs:${q.changesetId}`, { edits: JSON.parse(cs.getChangeset(db, q.changesetId).edits), drop: bad });
+    assert.equal(r.status, 'invalid');
+  }
+  assert.deepEqual(outcomes(q.changesetId), ['queued']);
+  assert.equal(cs.getChangeset(db, q.changesetId).status, 'pending');
+  assert.equal(read(rules), RULES);
+  assert.equal(writes(), before);
+  inbox.reject(db, `cs:${q.changesetId}`);
+});
+
+test('the card of a queued item names its stand-in project memories and what approving or rejecting does', () => {
+  const mem = (title) => {
+    const [r] = curator.apply(db, { cwd, session_id: 'sess-1', items: [{ kind: 'memory', memory_type: 'feedback', title, description: 'd', body: 'Body.', project_dir: cwd }] }, { actor: 'background', autonomy: 'auto' });
+    assert.equal(r.status, 'created', r.reason);
+    return r;
+  };
+  const a = mem('Stand-in one');
+  const b = mem('Stand-in two');
+  const one = queuedItem(null, { interim: a.id });
+  const t1 = inbox.showEntry(db, `it:${one}`).text;
+  assert.match(t1, /Meanwhile: already active as a project memory \(/);
+  assert.match(t1, /Approving writes the line here and retires it; rejecting keeps the memory/);
+  const two = queuedItem(null, { interim: a.id, interims: [b.id] });
+  const t2 = inbox.showEntry(db, `it:${two}`).text;
+  assert.match(t2, /retires them; rejecting keeps them/);
+  assert.equal(t2.match(/Meanwhile:[^(]*\(([^)]*)\)/)[1].split(',').length, 2, 'both paths named');
+  assert.doesNotMatch(inbox.showEntry(db, `it:${queuedItem(null)}`).text, /Meanwhile/);
+});
+
+test('the card says why a learning the editor or the knowledge check could not handle waited', () => {
+  const cases = [
+    ['the editor of CLAUDE.md gave no verdict for it; nothing was written, you decide', /the editor of its file gave no verdict/],
+    ['the change to CLAUDE.md could not be composed (3 attempts failed); nothing was written, you decide', /could not be composed/],
+    ['the knowledge check failed for it; nothing was written, you decide', /knowledge check could not be completed/],
+  ];
+  for (const [note, re] of cases) {
+    const line = inbox.showEntry(db, `it:${queuedItem(note, { autonomy: 'queue' })}`).text.match(/Waited because: [^\n]*/)[0];
+    assert.match(line, re);
+    assert.doesNotMatch(line, /autonomy/);
+  }
+  assert.match(inbox.showEntry(db, `it:${queuedItem(null, { autonomy: 'queue' })}`).text, /Waited because: your autonomy setting is "queue"/);
+});

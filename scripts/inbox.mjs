@@ -269,6 +269,15 @@ function waitedBecause({ corrects, file, kind, confidence, autonomy, backfill })
   return `your autonomy setting (${autonomy || 'auto'})`;
 }
 
+/** A learning the editor or the knowledge check could not handle waits for that reason, whatever the autonomy. */
+function unhandledReason(note) {
+  const n = String(note || '').trim();
+  if (/^the editor of .* gave no verdict/i.test(n)) return 'the editor of its file gave no verdict, so nothing was written and you decide';
+  if (/^the change to .* could not be composed/i.test(n)) return 'the change to its file could not be composed, so nothing was written and you decide';
+  if (/^the knowledge check (failed|gave no verdict)/i.test(n)) return 'the knowledge check could not be completed, so nothing was written and you decide';
+  return null;
+}
+
 function editorNote(note) {
   // "adds to C:\x\SKILL.md: reason" -> "reason" (a drive letter's colon is not the separator)
   return note ? oneLine(String(note)
@@ -373,6 +382,8 @@ export function showEntry(db, key, { project } = {}) {
     : item.kind === 'preference' ? `a preference about "${item.topic || ''}"${item.paths?.length ? ` (loaded with ${[].concat(item.paths).join(', ')})` : ' (loaded when the topic comes up)'}`
       : item.kind === 'skill' ? `a new ${item.scope === 'global' ? 'global ' : ''}skill${item.name ? ` "${item.name}"` : ''}${item.scope === 'global' ? '' : ` of project ${path.basename(projectDir || '')}`}`
       : `a new ${item.memory_type ? `${item.memory_type} ` : ''}memory of project ${path.basename(projectDir || '')} (${shortPath(memoryDirFor({ cwd: projectDir }))})`;
+  const standIns = [p.interim, ...(Array.isArray(p.interims) ? p.interims : [])].filter(Boolean)
+    .map((id) => db.prepare("SELECT * FROM learnings WHERE id = ? AND status = 'active'").get(id)).filter(Boolean);
   const content = [
     item.name ? `name: ${item.name}` : null,
     `title: ${item.title || c.title}`,
@@ -386,7 +397,8 @@ export function showEntry(db, key, { project } = {}) {
     `Lands in: ${lands}`,
     `From: ${originOf(c)}`,
     ...evidence,
-    `Waited because: ${waitedBecause({ corrects: item.corrects, file: item.op === 'patch' ? item.target : null, kind: item.kind, confidence: c.confidence ?? item.confidence, autonomy: p.autonomy || currentAutonomy(), backfill: fromBackfill(db, c) })}`,
+    `Waited because: ${unhandledReason(c.note) || waitedBecause({ corrects: item.corrects, file: item.op === 'patch' ? item.target : null, kind: item.kind, confidence: c.confidence ?? item.confidence, autonomy: p.autonomy || currentAutonomy(), backfill: fromBackfill(db, c) })}`,
+    standIns.length ? `Meanwhile: already active as a project memory (${standIns.map((l) => shortPath(l.path)).join(', ')}). Approving writes the line here and retires ${standIns.length > 1 ? 'them' : 'it'}; rejecting keeps ${standIns.length > 1 ? 'them' : 'the memory'}.` : null,
     c.triaged_at ? null : 'Not checked against existing knowledge yet: look for duplicates before approving.',
     c.note ? `Note: ${oneLine(c.note, 400)}` : null,
     '',
@@ -419,6 +431,8 @@ export function approve(db, key) {
     // A learning folded into a change since it was shown: approving the key must not
     // approve the whole change. Say where it went; the user looks at the change.
     const c = db.prepare("SELECT changeset_id FROM candidates WHERE id = ? AND outcome = 'queued'").get(k.id);
+    // A change that is closed has no card to look at: pointing there would be a dead end.
+    if (c?.changeset_id && !['pending', 'stale'].includes(getChangeset(db, c.changeset_id)?.status)) return { status: 'not_found', reason: `the change cs:${c.changeset_id} this learning belonged to is closed, so there is nothing to approve: reject the learning to clear it` };
     if (c?.changeset_id) return { status: 'changed', key: `cs:${c.changeset_id}`, changeset: c.changeset_id, reason: `this learning is now part of change cs:${c.changeset_id}: look at that change and approve it as a whole` };
     return decideQueued(db, k.id, true);
   }
@@ -475,6 +489,7 @@ export function editAndApprove(db, key, { edits, drop = [], item, replace = fals
   if (k.type === 'cs') {
     const cs = getChangeset(db, k.id);
     if (!cs || !['pending', 'stale'].includes(cs.status)) return { status: 'not_found', reason: 'no pending change with that id' };
+    if (!Array.isArray(drop)) return { status: 'invalid', reason: 'drop must be a list of learning ids' };
     const t = tryEdits(cs.file, edits);
     if (t.error) return { status: 'invalid', reason: t.error };
     const now = Date.now();
