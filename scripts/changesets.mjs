@@ -97,6 +97,9 @@ export function applyEdits(text, edits) {
       if (!String(e.append || '').trim()) { reject('empty addition'); continue; }
       next = appendToSection(cur, e.section, e.append);
       added = String(e.append);
+      // Whole lines at the end of a section, but they can still join what is there: a
+      // continuation of the section's last rule, an item under its "Never:" (isInsertion).
+      if (!e.corrects && !isInsertion(cur, next)) edit = { ...e, corrects: true, rewrites: true };
     } else {
       const old = String(e.old ?? '');
       const repl = String(e.new ?? '');

@@ -92,7 +92,7 @@ The file:
 }
 ```
 
-Fields: `topic` (preferences: one or two words naming what it is about; preferences on the same topic share one file), `paths` (preferences: globs, only when it matters just for those files), `title` (short; for a patch, what the patch teaches, not the file's name), `why` (one line: what happened in the session that taught it — the user shows it in the dashboard next to the change), `description` (one line; ≤ 250 chars for skills — say *when to use it*), `body` (memories: the fact plus **Why** / **How to apply**; skills: steps and pitfalls), `confidence` 0.3 tentative … 0.9 near-certain, `project_dir` (the repo the item is about; defaults to `cwd`). Write learnings in the language your Ouroboros session context asks for (English by default), with short human-readable titles.
+Fields: `topic` (preferences: one or two words naming what it is about; preferences on the same topic share one file), `paths` (preferences: globs, only when it matters just for those files), `title` (short; for a patch, what the patch teaches, not the file's name), `why` (one line: what happened in the session that taught it — the user shows it in the dashboard next to the change), `description` (one line; ≤ 250 chars for skills — say *when to use it*), `body` (memories: the fact plus **Why** / **How to apply**; skills: steps and pitfalls), `confidence` 0.3 tentative … 0.9 near-certain, `project_dir` (the repo the item is about; defaults to `cwd`), `memory_dir` (only the auto-memory directory your instructions name; any other directory is ignored and the result says so). Write learnings in the language your Ouroboros session context asks for (English by default), with short human-readable titles.
 
 ## 5. Handle the results
 
