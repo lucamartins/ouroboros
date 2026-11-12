@@ -92,17 +92,95 @@ function knownCwds(db) {
   return db.prepare('SELECT cwd, MAX(started_at) last FROM sessions WHERE cwd IS NOT NULL GROUP BY cwd ORDER BY last DESC').all().map((r) => r.cwd);
 }
 
-function rangeStart(params, fallback = 30) {
-  const days = Math.min(Math.max(Number(params.get('days')) || fallback, 1), 365);
-  const start = new Date(Date.now() - (days - 1) * DAY);
-  start.setHours(0, 0, 0, 0);
-  return { days, since: start.getTime() };
+/** Local midnight `back` calendar days ago. Calendar arithmetic, not 24-hour steps: a day is 23 or 25 hours long twice a year. */
+function dayStart(back) {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() - back);
+  return d.getTime();
 }
 
+function rangeStart(params, fallback = 30) {
+  const days = Math.min(Math.max(Number(params.get('days')) || fallback, 1), 365);
+  return { days, since: dayStart(days - 1) };
+}
+
+/** One bucket per local calendar day from `since` to today. */
 function emptySeries(since, make) {
   const m = new Map();
-  for (let t = since; t <= Date.now(); t += DAY) m.set(dayKey(t), { day: dayKey(t), ...make() });
+  const d = new Date(since);
+  for (let n = 0; d.getTime() <= Date.now() && n < 800; n++) {
+    m.set(dayKey(d.getTime()), { day: dayKey(d.getTime()), ...make() });
+    d.setDate(d.getDate() + 1);
+  }
   return m;
+}
+
+/** Corrections-per-100-turns comparisons need this many reviewed turns on each side (§9.2). */
+export const MIN_SAMPLE_TURNS = 200;
+
+const per100 = (x) => `${x > 0 ? '+' : x < 0 ? '−' : ''}${Math.abs(x).toFixed(1)}`;
+
+/**
+ * Compare two arms (`{ turns, corrections }`): the difference b − a in corrections per 100
+ * turns with its 95% interval, and a verdict that is "lower" or "higher" only when the whole
+ * interval lies on one side of zero. The interval treats every turn as independent; corrections
+ * cluster by session, so the real one is wider: it is approximate.
+ */
+export function compareArms(a, b) {
+  const short = [];
+  if (a.turns < MIN_SAMPLE_TURNS) short.push('a');
+  if (b.turns < MIN_SAMPLE_TURNS) short.push('b');
+  if (short.length) return { state: 'short', short, min: MIN_SAMPLE_TURNS };
+  const p1 = a.corrections / a.turns;
+  const p2 = b.corrections / b.turns;
+  const se = Math.sqrt((p1 * (1 - p1)) / a.turns + (p2 * (1 - p2)) / b.turns);
+  const diff = (p2 - p1) * 100;
+  const low = (p2 - p1 - 1.96 * se) * 100;
+  const high = (p2 - p1 + 1.96 * se) * 100;
+  return { state: high < 0 ? 'lower' : low > 0 ? 'higher' : 'unclear', diff, low, high, min: MIN_SAMPLE_TURNS };
+}
+
+/** The sentence the Overview shows for the before/after comparison; the page only draws it. */
+function beforeAfterVerdict(enabledAt, before, after) {
+  const n = (x) => x.toLocaleString('en-US');
+  const none = (state, text) => ({ state, text });
+  if (!enabledAt) return none('baseline', 'Nothing has been learned yet, so this is the baseline: how often you corrected Claude before learning.');
+  if (!after.turns) return none('waiting', 'Learning is on, but no session after it has been reviewed yet.');
+  if (!before.turns) {
+    return none('no-baseline', 'There is no baseline: no session was reviewed before learning turned on, so there is nothing to compare with. Measure past sessions with /ouroboros:backfill measure, or list a project in controlProjects to get a control group.');
+  }
+  const c = compareArms(before, after);
+  const range = (r) => `${per100(r.low)} to ${per100(r.high)}`;
+  if (c.state === 'short') {
+    const parts = [];
+    if (c.short.includes('a')) parts.push(`the baseline has ${n(before.turns)} reviewed turns`);
+    if (c.short.includes('b')) parts.push(`${n(after.turns)} turns were reviewed since learning turned on`);
+    return { ...c, text: `Too early to tell: ${parts.join(' and ')}; each side needs at least ${n(MIN_SAMPLE_TURNS)}.` };
+  }
+  const text = c.state === 'lower' ? `You correct Claude ${Math.abs(c.diff).toFixed(1)} fewer times per 100 turns than before learning turned on (95% interval ${range(c)}).`
+    : c.state === 'higher' ? `You correct Claude ${c.diff.toFixed(1)} more times per 100 turns than before learning turned on (95% interval ${range(c)}). Check Misses: repeated corrections mean a learning is not being used.`
+      : `No difference can be told yet: ${per100(c.diff)} per 100 turns, 95% interval ${range(c)}, which includes zero. More sessions narrow it.`;
+  return { ...c, text };
+}
+
+/** The same, learning projects against control projects over the same days. */
+function controlVerdict(concurrent) {
+  if (!concurrent) return null;
+  const { learning, control } = concurrent;
+  const n = (x) => x.toLocaleString('en-US');
+  const c = compareArms(control, learning);
+  if (c.state === 'short') {
+    const parts = [];
+    if (c.short.includes('a')) parts.push(`control projects have ${n(control.turns)} reviewed turns`);
+    if (c.short.includes('b')) parts.push(`learning projects have ${n(learning.turns)}`);
+    return { ...c, text: `Too few turns to compare with the control group: ${parts.join(' and ')}; each side needs at least ${n(MIN_SAMPLE_TURNS)}.` };
+  }
+  const range = `${per100(c.low)} to ${per100(c.high)}`;
+  const text = c.state === 'lower' ? `Learning projects have ${Math.abs(c.diff).toFixed(1)} fewer corrections per 100 turns than control projects over the same days (95% interval ${range}).`
+    : c.state === 'higher' ? `Learning projects have ${c.diff.toFixed(1)} more corrections per 100 turns than control projects over the same days (95% interval ${range}).`
+      : `No difference from the control group can be told yet: ${per100(c.diff)} per 100 turns, 95% interval ${range}, which includes zero.`;
+  return { ...c, text };
 }
 
 /** A path as the user reads it: the home directory as `~`, forward slashes. */
@@ -161,7 +239,7 @@ const HITS_SQL = `
   JOIN learnings l ON l.status = 'active' AND l.origin_session IS NOT 'native' AND (
     (e.kind = 'skill_used' AND l.kind = 'skill' AND (e.target = l.name OR e.target LIKE '%:' || l.name)) OR
     (e.kind = 'memory_read' AND lower(e.target) = lower(l.path)))
-  WHERE e.ts >= ? GROUP BY e.session_id`;
+  WHERE e.ts >= ? AND e.session_id NOT IN (SELECT id FROM sessions WHERE control = 1) GROUP BY e.session_id`;
 
 const GROUP_LABEL = { 'new:memory': 'New memories', 'new:skill': 'New skills', 'new:preference': 'New preferences', fixes: 'Suggested fixes' };
 
@@ -563,7 +641,7 @@ export function createApi(db) {
         const d = series.get(dayKey(r.t));
         if (d) d.misses++;
       }
-      for (const r of db.prepare('SELECT started_at t FROM sessions WHERE started_at >= ?').all(since)) {
+      for (const r of db.prepare('SELECT started_at t FROM sessions WHERE started_at >= ? AND control IS NOT 1').all(since)) {
         const d = series.get(dayKey(r.t));
         if (d) d.sessions++;
       }
@@ -572,11 +650,13 @@ export function createApi(db) {
         const d = series.get(dayKey(r.ts));
         if (d) d.hits++;
       }
-      const sessions = db.prepare('SELECT COUNT(*) n FROM sessions WHERE started_at >= ?').get(since).n;
+      const sessions = db.prepare('SELECT COUNT(*) n FROM sessions WHERE started_at >= ? AND control IS NOT 1').get(since).n;
       const top = db.prepare(`
         SELECT id, kind, title, uses, last_used_at, confidence FROM learnings
         WHERE status = 'active' AND origin_session IS NOT 'native' ORDER BY uses DESC, updated_at DESC LIMIT 10`).all();
-      return { days, enabledAt, before: phase('before'), after: phase('after'), concurrent, selfReported: { ...other, rate: other.turns ? (other.corrections / other.turns) * 100 : null }, series: [...series.values()], hits: hits.length, sessions, top };
+      const before = phase('before');
+      const afterPhase = phase('after');
+      return { days, enabledAt, before, after: afterPhase, minTurns: MIN_SAMPLE_TURNS, verdict: beforeAfterVerdict(enabledAt, before, afterPhase), concurrent: concurrent && { ...concurrent, verdict: controlVerdict(concurrent) }, selfReported: { ...other, rate: other.turns ? (other.corrections / other.turns) * 100 : null }, series: [...series.values()], hits: hits.length, sessions, top };
     },
 
     cost(params) {
@@ -596,12 +676,30 @@ export function createApi(db) {
         FROM reviews WHERE ts >= ? GROUP BY mode`).all(since);
       const sessions = db.prepare('SELECT COUNT(*) n FROM sessions WHERE started_at >= ?').get(since).n;
       const hits = db.prepare(HITS_SQL).all(since).length;
+      // What the periodic in-session reviews yield: each one reads the whole context again.
+      const inloopRows = db.prepare("SELECT status, detail, learned, patched, input_tokens + cache_read_tokens + cache_write_tokens read FROM reviews WHERE mode = 'inloop' AND ts >= ?").all(since);
+      const finished = inloopRows.filter((r) => r.status === 'ok');
+      const skippedWhy = {};
+      for (const r of inloopRows.filter((x) => x.status === 'skipped')) {
+        // The numbers differ per review; the reason does not.
+        const why = String(r.detail || 'no reason recorded').replace(/\d[\d,]*/g, 'N');
+        skippedWhy[why] = (skippedWhy[why] || 0) + 1;
+      }
+      const inloop = {
+        reviews: inloopRows.length,
+        finished: finished.length,
+        failed: inloopRows.filter((r) => r.status === 'failed').length,
+        saved: finished.filter((r) => r.learned + r.patched > 0).length,
+        skipped: Object.entries(skippedWhy).map(([detail, n]) => ({ detail, n })).sort((a, b) => b.n - a.n),
+        avgTokensRead: finished.length ? Math.round(finished.reduce((n, r) => n + r.read, 0) / finished.length) : null,
+      };
       const contextChars = opts?.learning === false ? 0 : (overheadChars() || 0);
       return {
         days,
         month: { usd: monthSpend(db), budget: opts?.monthlyBudgetUsd ?? null },
         byMode,
         series: [...series.values()],
+        inloop,
         overhead: { charsPerSession: contextChars, tokensPerSession: Math.round(contextChars / 4), sessions, tokens: Math.round((contextChars / 4) * sessions) },
         hits,
       };
@@ -609,18 +707,18 @@ export function createApi(db) {
 
     overview(params) {
       const days = Math.min(Math.max(Number(params.get('days')) || 30, 1), 365);
-      const now = Date.now();
-      const start = new Date(now - (days - 1) * DAY);
-      start.setHours(0, 0, 0, 0);
-      const since = start.getTime();
+      const since = dayStart(days - 1);
+      // The control group is measured apart (`value`): none of its sessions is in a figure
+      // or a chart of the learning arm.
+      const learningSessions = 'session_id NOT IN (SELECT id FROM sessions WHERE control = 1)';
 
       const totals = db.prepare(`
         SELECT COUNT(*) sessions, COALESCE(SUM(turns),0) turns, COALESCE(SUM(tool_calls),0) tool_calls,
                COALESCE(SUM(tool_fails),0) tool_fails
-        FROM sessions WHERE started_at >= ?`).get(since);
+        FROM sessions WHERE started_at >= ? AND control = 0`).get(since);
       const reviewed = db.prepare(`
         SELECT COUNT(*) n, COALESCE(SUM(turns_reviewed),0) turns, COALESCE(SUM(corrections),0) corrections
-        FROM reviews WHERE status = 'ok' AND instrument = 'corrections' AND COALESCE(session_started_at, ts) >= ?`).get(since);
+        FROM reviews WHERE status = 'ok' AND instrument = 'corrections' AND COALESCE(session_started_at, ts) >= ? AND ${learningSessions}`).get(since);
       const candidates = db.prepare(`
         SELECT kind, COUNT(*) n FROM candidates c JOIN sessions s ON s.id = c.session_id
         WHERE s.started_at >= ? GROUP BY kind`).all(since);
@@ -634,21 +732,33 @@ export function createApi(db) {
       const patchedNative = db.prepare("SELECT COUNT(*) n FROM learnings WHERE origin_session = 'native' AND status = 'active'").get().n;
       const enabledAt = Number(getMeta(db, 'learning_enabled_at')) || null;
 
-      // Daily series, attributed to the day the session started.
-      const series = new Map();
-      for (let t = since; t <= now; t += DAY) series.set(dayKey(t), { day: dayKey(t), sessions: 0, turns: 0, reviewedTurns: 0, corrections: 0, cost: 0 });
-      for (const r of db.prepare('SELECT started_at, turns FROM sessions WHERE started_at >= ?').all(since)) {
+      // Daily series, attributed to the day the session started. It starts WINDOW - 1 days
+      // early so the first day of the period already has a full 7-day window.
+      const WINDOW = 7;
+      const first = dayStart(days - 1 + WINDOW - 1);
+      const series = emptySeries(first, () => ({ sessions: 0, turns: 0, reviewedTurns: 0, corrections: 0, cost: 0 }));
+      for (const r of db.prepare('SELECT started_at, turns FROM sessions WHERE started_at >= ? AND control = 0').all(first)) {
         const d = series.get(dayKey(r.started_at));
         if (d) { d.sessions++; d.turns += r.turns; }
       }
-      for (const r of db.prepare("SELECT COALESCE(session_started_at, ts) t, turns_reviewed, corrections FROM reviews WHERE status = 'ok' AND instrument = 'corrections' AND COALESCE(session_started_at, ts) >= ?").all(since)) {
+      for (const r of db.prepare(`SELECT COALESCE(session_started_at, ts) t, turns_reviewed, corrections FROM reviews WHERE status = 'ok' AND instrument = 'corrections' AND COALESCE(session_started_at, ts) >= ? AND ${learningSessions}`).all(first)) {
         const d = series.get(dayKey(r.t));
         if (d) { d.reviewedTurns += r.turns_reviewed; d.corrections += r.corrections; }
       }
-      for (const r of db.prepare('SELECT ts, cost_usd FROM reviews WHERE ts >= ?').all(since)) {
+      for (const r of db.prepare('SELECT ts, cost_usd FROM reviews WHERE ts >= ?').all(first)) {
         const d = series.get(dayKey(r.ts));
         if (d) d.cost += r.cost_usd;
       }
+      // The correction rate is a 7-day moving average (§9.2): the pooled rate of the day and
+      // the six before it (sum of corrections over sum of turns), not each day's own ratio,
+      // so a 2-turn day cannot stand as a bar at 50 among days at 2.
+      const all = [...series.values()];
+      const daily = all.slice(WINDOW - 1).map((d, i) => {
+        const win = all.slice(i, i + WINDOW);
+        const turns7 = win.reduce((n, x) => n + x.reviewedTurns, 0);
+        const corrections7 = win.reduce((n, x) => n + x.corrections, 0);
+        return { ...d, turns7, corrections7, rate7: turns7 ? (corrections7 / turns7) * 100 : null };
+      });
 
       return {
         days,
@@ -661,7 +771,7 @@ export function createApi(db) {
         maintenance: db.prepare('SELECT ts, archived, merged, cost_usd FROM maintenance ORDER BY id DESC LIMIT 1').get() || null,
         cost: { month: monthSpend(db), budget: opts?.monthlyBudgetUsd ?? null, monthStart: monthStart() },
         options: opts,
-        series: [...series.values()],
+        series: daily,
       };
     },
 
