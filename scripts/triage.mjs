@@ -184,6 +184,20 @@ export function rejectionDocs(db, { exclude = [] } = {}) {
 }
 
 /**
+ * The stand-in memories of a candidate (payload `interim`, and `interims` for a promoted
+ * rule): files that exist only until the change they stand in for is decided. They say
+ * what the claim says, so the claim's own screen must not read them as existing knowledge
+ * ("covered") and drop the claim while its stand-in stays active.
+ */
+export function standInsOf(db, candidateId) {
+  if (!db) return [];
+  let payload = {};
+  try { payload = JSON.parse(db.prepare('SELECT payload FROM candidates WHERE id = ?').get(candidateId)?.payload || '{}'); } catch { /* ignore */ }
+  return [payload.interim, ...(payload.interims || [])].filter(Boolean)
+    .map((id) => db.prepare('SELECT path FROM learnings WHERE id = ?').get(id)?.path).filter(Boolean);
+}
+
+/**
  * Screen proposals ({id, kind, title, description, text, body, claim, ...}) for one
  * project dir. Returns { verdicts: Map(id -> verdict), cost, calls }.
  */
@@ -209,9 +223,12 @@ export async function triage(proposals, { cwd, db = null, lang = options().learn
       seen.add(key);
       excerpts.push(hit);
     };
+    // The excerpts of a batch are shared by all its proposals, so the stand-ins of every
+    // one of them stay out (none is existing knowledge before its change is decided).
+    const standIns = batch.flatMap((p) => standInsOf(db, p.id));
     for (const p of batch) {
       const query = [p.title, p.claim, p.description, p.text, p.body, p.target, p.append].filter(Boolean).join(' ');
-      for (const hit of index.search(query, EXCERPTS_PER_PROPOSAL)) take(hit);
+      for (const hit of index.search(query, EXCERPTS_PER_PROPOSAL, { exclude: standIns })) take(hit);
       // Always look at the best source of truth and past rejection, even if they rank lower.
       for (const hit of index.search(query, 1, { kinds: ['source'] })) take(hit);
       for (const hit of index.search(query, 1, { kinds: ['rejected'] })) if (hit.score > 4) take(hit);

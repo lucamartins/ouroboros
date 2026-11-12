@@ -219,3 +219,83 @@ test('a drain whose lease another process took stops and leaves the rows to it',
   assert.equal(db.prepare("SELECT value FROM meta WHERE key = 'lease:evaluate'").get()?.value, fs.readFileSync(`${once}.token`, 'utf8'), 'the new holder keeps it');
   assert.equal(db.prepare("SELECT COUNT(*) n FROM reviews WHERE trigger = 'triage'").get().n, 1, 'the call made is still recorded');
 });
+
+test('M10: an entry the user rejects while a failing editor call runs stays rejected and is not counted', async () => {
+  const { db, proj, rules } = sandbox('m10-fail');
+  const id = pending(proj, 'Fails', 'EDITORFAIL tag the release.', rules);
+  race({ during: 'editor', do: 'sql', sql: `UPDATE candidates SET outcome = 'rejected_by_user', decided_at = 1, triaged_at = 1 WHERE id = ${id}` });
+  await ev.drainQueue(db);
+  const r = row(id);
+  assert.deepEqual([r.outcome, r.triaged_at], ['rejected_by_user', 1], 'left as the user left it');
+  assert.equal(JSON.parse(r.payload).editor_misses, undefined, 'no failed attempt counted for it');
+  assert.equal(ev.queueHasWork(db), false);
+});
+
+test('one failing group does not block the others in the drain', async () => {
+  const { db, proj, tmp } = sandbox('group');
+  const other = path.join(tmp, 'work', 'q');
+  fs.mkdirSync(other, { recursive: true });
+  const bad = pending(proj, 'Bad', 'DROPME something already documented.', null, { autonomy: 'auto' });
+  const good = pending(other, 'Use pnpm', 'Use pnpm in project q.', null, { autonomy: 'auto' });
+  // Writing the first group's verdict fails (a database error outside any model call).
+  db.exec(`CREATE TRIGGER boom BEFORE UPDATE ON candidates WHEN NEW.id = ${bad} BEGIN SELECT RAISE(ABORT, 'boom'); END`);
+  const r = await ev.drainQueue(db);
+  assert.equal(r.status, 'done', 'the drain itself does not fail');
+  assert.equal(row(good).outcome, 'created', 'the other project was evaluated');
+  assert.equal(row(bad).outcome, 'pending', 'the failing one waits for the next drain');
+  assert.equal(calls().filter((k) => k === 'screen').length, 2, 'one screen per group, no retry in the same drain');
+  assert.match(db.prepare("SELECT message FROM errors WHERE source = 'evaluate:queue'").get().message, /boom/);
+});
+
+test('a carried learning the user rejects while the editor runs is not put back in the change', async () => {
+  const { db, proj, rules } = sandbox('post-row');
+  const a = pending(proj, 'Tag', 'Tag the release after deploying.', rules);
+  await ev.drainQueue(db);
+  assert.equal(row(a).changeset_id, cs.pendingChangeset(db, rules).id);
+  const b = pending(proj, 'Announce', 'Announce the deploy in the channel.', rules);
+  race({ during: 'editor', do: 'sql', sql: `UPDATE candidates SET outcome = 'rejected_by_user', decided_at = 1 WHERE id = ${a}` });
+  await ev.drainQueue(db);
+  assert.equal(row(a).outcome, 'rejected_by_user');
+  const open = cs.pendingChangeset(db, rules);
+  assert.deepEqual(cs.claimsOf(db, open.id, { all: true }).map((c) => c.id), [b], 'the change holds only what is still waiting');
+  assert.doesNotMatch(open.edits, /Tag the release/);
+  assert.equal(calls().filter((k) => k === 'editor').length, 3, 'composed again without it');
+});
+
+test('a change whose status moved while the editor ran is not composed on top of', async () => {
+  const { db, proj, rules } = sandbox('post-status');
+  const a = pending(proj, 'Tag', 'Tag the release after deploying.', rules);
+  await ev.drainQueue(db);
+  const first = cs.pendingChangeset(db, rules);
+  const b = pending(proj, 'Announce', 'Announce the deploy in the channel.', rules);
+  race({ during: 'editor', do: 'sql', sql: `UPDATE changesets SET status = 'superseded' WHERE id = ${first.id}` });
+  await ev.drainQueue(db);
+  assert.equal(cs.getChangeset(db, first.id).status, 'superseded');
+  const open = cs.pendingChangeset(db, rules);
+  assert.deepEqual(cs.claimsOf(db, open.id, { all: true }).map((c) => c.id), [b], 'the first learning is not pulled into a new change');
+  assert.equal(row(a).changeset_id, first.id);
+});
+
+test('a file that changed while the editor ran is composed again on its new text', async () => {
+  const { db, proj, rules } = sandbox('post-file');
+  const a = pending(proj, 'Tag', 'Tag the release after deploying.', rules);
+  race({ during: 'editor', do: 'write', file: rules, text: '- Never deploy on Fridays.\n' });
+  await ev.drainQueue(db);
+  const open = cs.pendingChangeset(db, rules);
+  assert.equal(open.base_hash, cs.hashText(fs.readFileSync(rules, 'utf8')), 'composed against what the file says now');
+  assert.equal(calls().filter((k) => k === 'editor').length, 2);
+  assert.equal(row(a).changeset_id, open.id);
+});
+
+test('a lease lost while the editor ran stops the drain before anything is saved', async () => {
+  const { db, proj, rules } = sandbox('lease-editor');
+  const id = pending(proj, 'Tag', 'Tag the release after deploying.', rules);
+  const once = race({ during: 'editor', do: 'steal-lease' });
+  const r = await ev.drainQueue(db);
+  assert.equal(r.status, 'busy');
+  assert.deepEqual(calls(), ['screen', 'editor']);
+  assert.deepEqual([row(id).outcome, row(id).triaged_at, row(id).changeset_id], ['pending', null, null], 'left to the new holder');
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM changesets').get().n, 0);
+  assert.equal(db.prepare("SELECT value FROM meta WHERE key = 'lease:evaluate'").get()?.value, fs.readFileSync(`${once}.token`, 'utf8'));
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM reviews WHERE trigger = 'editor'").get().n, 1, 'the call made is still recorded');
+});

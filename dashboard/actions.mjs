@@ -33,9 +33,15 @@ export async function runAction(db, action, id, api) {
       return r.status === 'done' ? { status: 'done', ...summed(r) } : r;
     }
     case 'restore': {
+      // The restore is remembered in the payload: the next queue check must not screen the
+      // proposal away again (it is treated like a confirmed conflict).
+      const row = db.prepare("SELECT payload FROM candidates WHERE id = ? AND outcome IN ('dropped', 'merged', 'suggested', 'duplicate')").get(Number(id));
+      if (!row) return { status: 'not_found' };
+      let payload = {};
+      try { payload = JSON.parse(row.payload || '{}'); } catch { /* ignore */ }
       const r = db.prepare(`
-        UPDATE candidates SET outcome = 'queued', decided_at = NULL, triaged_at = NULL, changeset_id = NULL, note = COALESCE(note, '') || ' (restored by you)'
-        WHERE id = ? AND outcome IN ('dropped', 'merged', 'suggested', 'duplicate')`).run(Number(id));
+        UPDATE candidates SET outcome = 'queued', decided_at = NULL, triaged_at = NULL, changeset_id = NULL, note = COALESCE(note, '') || ' (restored by you)', payload = ?
+        WHERE id = ? AND outcome IN ('dropped', 'merged', 'suggested', 'duplicate')`).run(JSON.stringify({ ...payload, restored: true }), Number(id));
       return r.changes ? { status: 'restored' } : { status: 'not_found' };
     }
     case 'resolve_conflict': {
