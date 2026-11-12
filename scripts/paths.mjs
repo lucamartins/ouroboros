@@ -147,6 +147,38 @@ export function memoryDirFor({ memoryDir, cwd } = {}) {
   return path.join(claudeDir(), 'projects', name, 'memory');
 }
 
+const TRUTHY = ['1', 'true', 'yes', 'on'];
+const FALSY = ['0', 'false', 'no', 'off'];
+
+/**
+ * Whether Claude Code loads auto memory (MEMORY.md and the files it points to) in a
+ * session in `cwd`, and if not, why. The same order as Claude Code 2.1: the
+ * `CLAUDE_CODE_DISABLE_AUTO_MEMORY` variable decides when set (a falsy value forces it
+ * on); then `--bare` (`CLAUDE_CODE_SIMPLE`) and cloud sessions without a memory
+ * directory (`CLAUDE_CODE_REMOTE`) turn it off; then the `autoMemoryEnabled` setting
+ * (local, then project, then user settings). Hook processes inherit the session's
+ * environment, so a hook sees what the session sees. Managed policy settings are not read.
+ */
+export function autoMemoryStatus(cwd, env = process.env) {
+  const flag = String(env.CLAUDE_CODE_DISABLE_AUTO_MEMORY ?? '').trim().toLowerCase();
+  if (TRUTHY.includes(flag)) return { on: false, reason: 'CLAUDE_CODE_DISABLE_AUTO_MEMORY is set' };
+  if (FALSY.includes(flag)) return { on: true, reason: null };
+  if (env.CLAUDE_CODE_SIMPLE) return { on: false, reason: 'the session runs with --bare' };
+  if (env.CLAUDE_CODE_REMOTE && !env.CLAUDE_CODE_REMOTE_MEMORY_DIR && !env.CLAUDE_COWORK_MEMORY_PATH_OVERRIDE) {
+    return { on: false, reason: 'a cloud session: CLAUDE_CODE_REMOTE is set without CLAUDE_CODE_REMOTE_MEMORY_DIR' };
+  }
+  const root = repoRoot(cwd) || cwd || process.cwd();
+  for (const file of [
+    path.join(root, '.claude', 'settings.local.json'),
+    path.join(root, '.claude', 'settings.json'),
+    path.join(claudeDir(), 'settings.json'),
+  ]) {
+    const v = settingsValue(file, 'autoMemoryEnabled');
+    if (typeof v === 'boolean') return v ? { on: true, reason: null } : { on: false, reason: `autoMemoryEnabled is false in ${file}` };
+  }
+  return { on: true, reason: null };
+}
+
 /** Forward slashes, lowercase on Windows, for path matching. */
 export function normalize(p) {
   const s = String(p || '').replace(/\\/g, '/');
