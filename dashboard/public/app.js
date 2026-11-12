@@ -24,8 +24,7 @@ const tabsEl = document.querySelector('.tabs');
 /** Rows per page of a list, and per group of the inbox before "Load more". */
 const PAGE = 50;
 const INBOX_PER_GROUP = 20;
-/** Below this many reviewed turns after learning turned on, the before/after delta is not judged. */
-const MIN_SAMPLE_TURNS = 200;
+const INTERVAL_NOTE = 'The 95% interval is approximate: it treats every turn as independent, but corrections cluster by session, so the true interval is wider.';
 /** Relative times ("3 h ago") up to this age; older ones show the date. */
 const RELATIVE_FOR_MS = 7 * 86_400_000;
 const SEARCH_DEBOUNCE_MS = 200;
@@ -878,15 +877,11 @@ async function renderOverview() {
   if (failed(v)) verdict = sectionError(v, 'the before/after comparison');
   else {
     const delta = v.before.rate !== null && v.after.rate !== null ? v.after.rate - v.before.rate : null;
-    // A delta on a few dozen turns is noise: it stays neutral until the sample is big enough.
-    const enough = v.after.turns >= MIN_SAMPLE_TURNS;
-    let text;
-    if (!v.enabledAt) text = 'Nothing has been learned yet, so this is the baseline: how often you corrected Claude before learning.';
-    else if (v.after.rate === null) text = 'Learning is on, but no session after it has been reviewed yet.';
-    else if (!enough) text = `Too early to tell: ${fmt.plural(v.after.turns, 'turn')} reviewed since learning turned on; the comparison needs at least ${fmt.int(MIN_SAMPLE_TURNS)}.`;
-    else if (delta < 0) text = `You correct Claude ${fmt.rate(Math.abs(delta))} fewer times per 100 turns than before learning turned on.`;
-    else text = 'Not lower yet. Give it more sessions, and check Misses: repeated corrections mean a learning is not being used.';
-    const tone = !enough || delta === null ? '' : delta < 0 ? 'good' : 'warn';
+    // What to tell the user is decided in the API (usable baseline, 95% interval); this only draws it.
+    const vd = v.verdict;
+    const judged = vd.state === 'lower' || vd.state === 'higher';
+    const tone = vd.state === 'lower' ? 'good' : vd.state === 'higher' ? 'warn' : '';
+    const text = vd.text;
     verdict = h('div', { class: 'panel verdict' },
       h('div', { class: 'verdict-main' },
         h('div', { class: 'label' }, 'Corrections per 100 turns'),
@@ -894,9 +889,10 @@ async function renderOverview() {
           v.enabledAt ? h('div', { class: 'figure before' }, h('div', { class: 'v' }, fmt.rate(v.before.rate)), h('div', { class: 'k' }, `before · n = ${fmt.int(v.before.turns)} turns`)) : null,
           v.enabledAt ? h('div', { class: 'figure' }, h('div', { class: 'v' }, fmt.rate(v.after.rate)), h('div', { class: 'k' }, `since ${fmt.date(v.enabledAt)} · n = ${fmt.int(v.after.turns)} turns`))
             : h('div', { class: 'figure' }, h('div', { class: 'v' }, fmt.rate(o.correctionRate)), h('div', { class: 'k' }, `n = ${fmt.int(o.reviewed.turns)} reviewed turns`)),
-          delta !== null ? h('span', { class: `delta${tone ? '' : ' neutral'}`, title: enough ? null : `Not judged below ${MIN_SAMPLE_TURNS} turns after learning` },
-            h('span', { class: `dot ${tone}` }), `${delta > 0 ? '+' : ''}${delta.toFixed(1)}`, enough ? null : h('span', { class: 'delta-note' }, 'small sample')) : null),
+          delta !== null ? h('span', { class: `delta${tone ? '' : ' neutral'}`, title: judged ? INTERVAL_NOTE : vd.state === 'short' ? `Not judged below ${vd.min} reviewed turns on each side` : INTERVAL_NOTE },
+            h('span', { class: `dot ${tone}` }), `${delta > 0 ? '+' : ''}${delta.toFixed(1)}`, vd.state === 'short' ? h('span', { class: 'delta-note' }, 'small sample') : vd.state === 'unclear' ? h('span', { class: 'delta-note' }, 'within noise') : null) : null),
         h('p', { class: 'sentence' }, text),
+        vd.low !== undefined ? h('p', { class: 'small faint' }, INTERVAL_NOTE) : null,
         controlNote(v.concurrent),
         h('p', { class: 'small faint' }, `Counted the same way before and after: one corrections-only reading of each whole session.${v.selfReported?.turns ? ` Not included: what the learning reviews counted themselves (${fmt.rate(v.selfReported.rate)} per 100 on ${fmt.int(v.selfReported.turns)} turns).` : ''}`)),
       h('div', { class: 'stats' },
@@ -911,10 +907,11 @@ async function renderOverview() {
   }
 
   const marker = !failed(v) && v.enabledAt ? { day: dayOf(v.enabledAt), label: 'learning on' } : null;
-  const rate = (d) => (d.reviewedTurns ? (d.corrections / d.reviewedTurns) * 100 : null);
+  // The 7-day moving average computed by the API (§9.2), not each day's own ratio.
+  const rate = (d) => d.rate7;
   const charts = h('div', { class: 'charts' },
-    barChart({ title: 'Corrections per 100 turns', sub: 'by the day the session started; lower is better', data: o.series, value: rate, format: (x) => x.toFixed(x > 0 && x < 10 ? 1 : 0), marker, wide: true, height: 200,
-      tip: (d) => [fmt.day(d.day), `${d.corrections} corrections · ${d.reviewedTurns} turns reviewed`], emptyText: 'No reviewed sessions in this period' }),
+    barChart({ title: 'Corrections per 100 turns', sub: '7-day average, by the day the session started; lower is better', data: o.series, value: rate, format: (x) => x.toFixed(x > 0 && x < 10 ? 1 : 0), marker, wide: true, height: 200,
+      tip: (d) => [fmt.day(d.day), `That day: ${d.corrections} corrections · ${d.reviewedTurns} turns reviewed`, `Last 7 days: ${d.corrections7} corrections · ${d.turns7} turns`], emptyText: 'No reviewed sessions in this period' }),
     failed(v) ? sectionError(v, 'this chart') : barChart({ title: 'Sessions opening a learning', data: v.series, value: (d) => d.hits, format: (x) => fmt.int(x), marker,
       tip: (d) => [fmt.day(d.day), `${d.hits} of ${d.sessions} sessions`] }),
     barChart({ title: 'User turns', data: o.series, value: (d) => d.turns, format: (x) => fmt.compact(x),
@@ -982,11 +979,10 @@ function lifecycleNote(c) {
  */
 function controlNote(c) {
   if (!c || !c.control.turns) return null;
-  const enough = c.control.turns >= MIN_SAMPLE_TURNS && c.learning.turns >= MIN_SAMPLE_TURNS;
   const side = (label, a) => `${label}: ${fmt.rate(a.rate)} per 100 on ${fmt.int(a.turns)} turns`;
-  return h('p', { class: 'small', title: 'Control projects are listed in controlProjects (~/.ouroboros/config.json): measured with the same instrument, never learned from' },
+  return h('p', { class: 'small', title: `Control projects are listed in controlProjects (~/.ouroboros/config.json): measured with the same instrument, never learned from. ${INTERVAL_NOTE}` },
     `Same period, since ${fmt.date(c.since)} · ${side('learning projects', c.learning)} · ${side('control projects', c.control)}`,
-    enough ? null : h('span', { class: 'faint' }, ` · too few turns to compare (each side needs ${fmt.int(MIN_SAMPLE_TURNS)})`));
+    h('span', { class: 'faint' }, ` · ${c.verdict.text}`));
 }
 
 function learnedRow(c) {
@@ -1909,6 +1905,20 @@ async function fillActivity(results, seg) {
 }
 
 // ---------- System ----------
+/** What the periodic in-session reviews yield: each one reads the whole context again. */
+function inloopPanel(i) {
+  if (!i || !i.reviews) return h('div', { class: 'panel pad' }, h('h3', { class: 'bars-title' }, 'In-session reviews'), h('p', { class: 'muted small flush' }, 'None in this period.'));
+  const share = i.finished ? fmt.pct((i.saved / i.finished) * 100) : '—';
+  return h('div', { class: 'panel pad' },
+    h('h3', { class: 'bars-title' }, 'In-session reviews'),
+    h('dl', { class: 'facts' },
+      ...[['Reviews', fmt.int(i.reviews)], ['Finished', fmt.int(i.finished)], ['Saved something', `${fmt.int(i.saved)} (${share})`],
+        ['Skipped', fmt.int(i.skipped.reduce((n, x) => n + x.n, 0))], ['Read per finished review', i.avgTokensRead === null ? '—' : `${fmt.int(i.avgTokensRead)} tok`]]
+        .map(([k, v]) => h('div', {}, h('dt', {}, k), h('dd', {}, v)))),
+    i.skipped.length ? h('ul', { class: 'small faint flush' }, i.skipped.map((x) => h('li', {}, `${fmt.int(x.n)} skipped: ${x.detail}`))) : null,
+    h('p', { class: 'small faint panel-note' }, 'Each in-session review reads the whole context again (input, cache read and cache write tokens), on your own plan. A low share saved against a high read per review means the cadence costs more than it yields.'));
+}
+
 async function renderSystem() {
   const [hl, q, c, failedFirst, errorsFirst] = await settle([
     api('health'), api('quality', { days: state.days }), api('cost', { days: state.days }),
@@ -1975,6 +1985,7 @@ async function renderSystem() {
       h('div', { class: 'panel' }, h('dl', { class: 'facts' },
         ...[['Reviews', fmt.int(bgN + (mode.inloop?.n || 0))], ['Billed reviews', fmt.usd(bgUsd)], ['Average per review', bgN ? fmt.usd(bgUsd / bgN) : '—'],
           ['Context per session', `${fmt.int(c.overhead.tokensPerSession)} tok`]].map(([k, v]) => h('div', {}, h('dt', {}, k), h('dd', {}, v))))),
+      inloopPanel(c.inloop),
       h('div', { class: 'charts spaced' },
         barChart({ title: 'Billed review cost', data: c.series, value: (d) => d.usd, format: fmt.usd, tip: (d) => [fmt.day(d.day), fmt.plural(d.reviews, 'review')] }),
         barChart({ title: 'Reviews', data: c.series, value: (d) => d.reviews, format: (x) => fmt.int(x), tip: (d) => [fmt.day(d.day)] })),
