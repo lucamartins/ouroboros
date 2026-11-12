@@ -77,9 +77,15 @@ export async function runAction(db, action, id, api) {
     case 'reject_many': {
       const f = id && typeof id === 'object' && !Array.isArray(id) ? id : null;
       if (!f || !api?.inboxKeys) return { status: 'invalid', reason: 'a bulk decision takes a filter: { project, group }' };
-      const str = (x) => (typeof x === 'string' && x.length <= 400 ? x : null);
-      const keys = api.inboxKeys({ project: str(f.project), group: str(f.group) }, action === 'approve_many' ? 'approve' : 'reject');
-      if (Number.isInteger(f.expect) && f.expect !== keys.length) return { status: 'changed', total: keys.length, expected: f.expect };
+      // A filter that cannot be read must never widen to "the whole inbox", and the count the user
+      // confirmed is required: a bulk decision without it decides nothing. (A group id is a project
+      // key plus a file path, so it may be long.)
+      const readable = (x) => x === undefined || x === null || (typeof x === 'string' && x.length <= 4000);
+      if (!Number.isInteger(f.expect) || !readable(f.project) || !readable(f.group)) {
+        return { status: 'invalid', reason: 'a bulk decision needs the count you confirmed (expect) and a readable filter' };
+      }
+      const keys = api.inboxKeys({ project: f.project ?? null, group: f.group ?? null }, action === 'approve_many' ? 'approve' : 'reject');
+      if (f.expect !== keys.length) return { status: 'changed', total: keys.length, expected: f.expect };
       const results = keys.slice(0, MAX_BULK).map((x) => decide(db, x, action === 'approve_many'));
       const count = (st) => results.filter((r) => r.status === st).length;
       const saved = count('created') + count('patched');
