@@ -56,7 +56,7 @@ function cliApply(payload, autonomy = 'auto') {
   return { text: r.stdout, results: JSON.parse(lines[lines.length - 1]) };
 }
 
-test('M3: a memory_dir in the payload is kept only when it is an auto-memory directory', () => {
+test('M3: a memory_dir in the payload is kept only when it is the memory directory of its own project', () => {
   const userRules = path.join(process.env.CLAUDE_CONFIG_DIR, 'rules');
   const projectRules = path.join(projA, '.claude', 'rules');
   const computed = paths.memoryDirFor({ cwd: projA });
@@ -82,15 +82,24 @@ test('M3: a memory_dir in the payload is kept only when it is an auto-memory dir
   for (const c of db.prepare("SELECT id FROM candidates WHERE outcome = 'queued'").all()) curator.decideQueued(db, c.id, true);
   assert.equal(fs.existsSync(userRules), false);
 
-  // Claude Code's own directories are kept: the computed one, and a memory folder of another project.
+  // Only the directory computed for the item's own project is kept; another project's memory folder is not (review III: validators).
   const other = path.join(process.env.CLAUDE_CONFIG_DIR, 'projects', '-somewhere-else', 'memory');
-  for (const dir of [computed, other]) {
-    const { text, results } = cliApply({ cwd: projA, memory_dir: dir, items: [{
-      op: 'create', kind: 'memory', memory_type: 'project', title: dir === computed ? 'Staging runs on its own host' : 'Billing exports are nightly', description: dir === computed ? 'Staging runs on its own host' : 'Billing exports are nightly', body: 'Noted.',
+  {
+    const { text, results } = cliApply({ cwd: projA, memory_dir: computed, items: [{
+      op: 'create', kind: 'memory', memory_type: 'project', title: 'Staging runs on its own host', description: 'Staging runs on its own host', body: 'Noted.',
     }] });
     assert.doesNotMatch(text, /ignored/);
     assert.equal(results[0].status, 'created');
-    assert.equal(path.dirname(results[0].path), dir);
+    assert.equal(path.dirname(results[0].path), computed);
+  }
+  {
+    const { text, results } = cliApply({ cwd: projA, memory_dir: other, items: [{
+      op: 'create', kind: 'memory', memory_type: 'project', title: 'Billing exports are nightly', description: 'Billing exports are nightly', body: 'Noted.',
+    }] });
+    assert.match(text, /memory_dir ignored/);
+    assert.equal(results[0].status, 'created');
+    assert.equal(path.dirname(results[0].path), computed, "a card of this project is not written into another project's memory folder");
+    assert.equal(fs.existsSync(other), false);
   }
   // Not a memory folder directly under projects/<name>/.
   assert.equal(curator.checkedMemoryDir({ cwd: projA, memory_dir: path.join(process.env.CLAUDE_CONFIG_DIR, 'projects', 'x', 'memory', 'deeper') }).ignored !== null, true);

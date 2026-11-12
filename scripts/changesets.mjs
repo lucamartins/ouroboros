@@ -38,11 +38,32 @@ export function hashText(text) {
 }
 
 function frontmatter(text) {
-  return /^---\r?\n[\s\S]*?\r?\n---/.exec(text)?.[0] || '';
+  // A byte-order mark or spaces after the opening --- do not stop a reader from seeing the frontmatter.
+  return /^\uFEFF?---[ \t]*\r?\n[\s\S]*?\r?\n---/.exec(text)?.[0] || '';
 }
 
-function headingCount(text) {
-  return (String(text).match(/^#{1,6}\s+\S/gm) || []).length;
+/** The heading lines of a text (not the `#` comments inside a fenced code block). */
+function headings(text) {
+  const out = [];
+  let fenced = false;
+  for (const l of String(text).split(/\r?\n/)) {
+    if (/^\s*(?:```|~~~)/.test(l)) fenced = !fenced;
+    else if (!fenced && /^#{1,6}\s+\S/.test(l)) out.push(l.trimEnd());
+  }
+  return out;
+}
+
+/** Why `next` does not keep the headings of `cur` as they were, if it does not. */
+function headingProblem(cur, next) {
+  const left = new Map();
+  for (const h of headings(next)) left.set(h, (left.get(h) || 0) + 1);
+  const gone = headings(cur).filter((h) => {
+    const c = left.get(h) || 0;
+    if (c > 0) left.set(h, c - 1);
+    return c === 0;
+  });
+  if (!gone.length) return null;
+  return headings(next).length < headings(cur).length ? 'removes a heading' : 'changes a heading';
 }
 
 /** Words of `old` that `next` no longer has: what an edit removes. */
@@ -101,9 +122,14 @@ export function applyEdits(text, edits) {
       // continuation of the section's last rule, an item under its "Never:" (isInsertion).
       if (!e.corrects && !isInsertion(cur, next)) edit = { ...e, corrects: true, rewrites: true };
     } else {
-      const old = String(e.old ?? '');
-      const repl = String(e.new ?? '');
+      // The fragment matches whatever line ending it was written with, and what replaces it
+      // takes the file's own (a CRLF file never ends up with bare LF lines).
+      const eol = cur.includes('\r\n') ? '\r\n' : '\n';
+      const fit = (s) => String(s ?? '').replace(/\r?\n/g, eol);
+      let old = String(e.old ?? '');
+      const repl = fit(e.new);
       if (old.trim().length < MIN_OLD_CHARS) { reject('the fragment to replace is too short to be unique'); continue; }
+      if (cur.split(old).length - 1 !== 1 && cur.split(fit(old)).length > 1) old = fit(old);
       const count = cur.split(old).length - 1;
       if (count !== 1) { reject(count ? `the fragment appears ${count} times` : 'the fragment is not in the file'); continue; }
       if (old === repl) { reject('changes nothing'); continue; }
@@ -123,8 +149,11 @@ export function applyEdits(text, edits) {
       }
     }
     if (!describes && frontmatter(next) !== frontmatter(cur)) { reject('changes the frontmatter'); continue; }
-    if (headingCount(next) < headingCount(cur)) { reject('removes a heading'); continue; }
-    if (containsSecret(added)) { reject('adds something that looks like a secret'); continue; }
+    const headingWrong = headingProblem(cur, next);
+    if (headingWrong) { reject(headingWrong); continue; }
+    // The text the edit adds, and the lines it leaves in the file: a fragment can be harmless
+    // while the line it completes ("password: " + a value) is not.
+    if (containsSecret(added, addedText(cur, next))) { reject('adds something that looks like a secret'); continue; }
     cur = next;
     applied.push(edit);
   }
@@ -188,6 +217,9 @@ export function changesetNeedsApproval(db, cs, actor, autonomy) {
 export function applyChangeset(db, id, { actor = 'manual' } = {}) {
   const cs = getChangeset(db, id);
   if (!cs || cs.status !== 'pending') return { status: 'not_found', reason: 'no pending change with that id' };
+  // A change nobody is waiting for (its learnings were decided or removed) writes nothing.
+  const claims = claimsOf(db, id);
+  if (!claims.length) return { status: 'not_found', reason: 'no learning of this change is waiting for it' };
   const current = readKnowledgeFile(cs.file);
   if (current === null) {
     db.prepare("UPDATE changesets SET status = 'stale', note = ? WHERE id = ?").run('the file no longer exists', id);
@@ -199,7 +231,6 @@ export function applyChangeset(db, id, { actor = 'manual' } = {}) {
     db.prepare("UPDATE changesets SET status = 'stale', note = ? WHERE id = ?").run(`the file changed since: ${why}`, id);
     return { status: 'stale', reason: 'the file changed since this was proposed; the next check composes it again' };
   }
-  const claims = claimsOf(db, id);
   const r = writeText(db, {
     file: cs.file, after, actor, expectBefore: current,
     title: claims.length === 1 ? claims[0].title : `${fileDisplayName(cs.file)}: ${claims.length} updates`,
