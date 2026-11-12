@@ -26,7 +26,25 @@ before(() => {
   delete env.OUROBOROS_REVIEWER;
 });
 
-after(() => fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }));
+// Let hook-spawned review workers finish before the temp dir goes away.
+async function settle(file) {
+  const end = Date.now() + 15_000;
+  while (Date.now() < end) {
+    try {
+      const d = new DatabaseSync(file);
+      try {
+        d.exec('PRAGMA busy_timeout = 5000');
+        if (!d.prepare("SELECT 1 FROM sessions WHERE queue_state IN ('queued', 'running')").get()) return;
+      } finally { d.close(); }
+    } catch (e) { if (!/locked|busy|unable to open/i.test(String(e?.message))) return; }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
+after(async () => {
+  await settle(path.join(tmp, 'data', 'events.db'));
+  fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+});
 
 function hook(event, input, extraEnv = {}) {
   const r = spawnSync(process.execPath, ['--no-warnings', path.join(root, 'scripts', 'hook.mjs'), event], {
@@ -38,14 +56,21 @@ function hook(event, input, extraEnv = {}) {
   return r.stdout;
 }
 
+function open(file) {
+  const d = new DatabaseSync(file);
+  d.exec('PRAGMA busy_timeout = 5000');
+  return d;
+}
+
 function db() {
-  return new DatabaseSync(path.join(tmp, 'data', 'events.db'));
+  return open(path.join(tmp, 'data', 'events.db'));
 }
 
 async function waitFor(fn, ms = 10_000) {
   const end = Date.now() + ms;
   while (Date.now() < end) {
-    const v = fn();
+    let v;
+    try { v = fn(); } catch (e) { if (!/locked|busy/i.test(String(e?.message))) throw e; }
     if (v) return v;
     await new Promise((r) => setTimeout(r, 100));
   }
