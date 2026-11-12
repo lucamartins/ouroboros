@@ -17,6 +17,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(here, 'public');
 const DEFAULT_PORT = 4747;
 const IDLE_SHUTDOWN_MS = 4 * 60 * 60 * 1000;
+const CSP = "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
 
 function parseArgs(argv) {
@@ -71,10 +72,15 @@ function ping(port) {
   });
 }
 
-async function stopServer(state) {
-  try { process.kill(state.pid); } catch { /* already gone */ }
-  for (let i = 0; i < 30 && (await ping(state.port)); i++) await new Promise((r) => setTimeout(r, 100));
+/** Stops the server a ping answered for: the pid comes from the ping, never from a file that may be stale. */
+async function stopServer(running, port) {
+  if (Number.isInteger(running.pid)) { try { process.kill(running.pid); } catch { /* already gone */ } }
+  for (let i = 0; i < 30 && (await ping(port)); i++) await new Promise((r) => setTimeout(r, 100));
 }
+
+/** The same data directory, however it is spelled. */
+const sameDir = (a, b) => typeof a === 'string' && typeof b === 'string'
+  && (process.platform === 'win32' ? path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase() : path.resolve(a) === path.resolve(b));
 
 function openBrowser(url) {
   const [cmd, args] = process.platform === 'win32'
@@ -88,9 +94,11 @@ function openBrowser(url) {
 async function launch(args) {
   const state = (() => { try { return JSON.parse(fs.readFileSync(stateFile(), 'utf8')); } catch { return null; } })();
   let port = state?.port;
-  const running = port ? await ping(port) : null;
+  // Only a server that serves this data directory is ours; another install's server on that port is left alone.
+  const found = port ? await ping(port) : null;
+  const running = found && sameDir(found.data, dataDir()) ? found : null;
   if (running && running.version !== codeVersion()) {
-    await stopServer(state);
+    await stopServer(running, port);
     console.log('Restarted the dashboard server: the plugin code changed since it started.');
   }
   if (!running || running.version !== codeVersion()) {
@@ -184,15 +192,20 @@ async function serve(args) {
     return codeVersion() !== version;
   };
 
-  const server = http.createServer((req, res) => {
+  const onRequest = (req, res) => {
     lastRequest = Date.now();
+    // No other site may frame the page (a click inside a frame would act as the user).
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Content-Security-Policy', CSP);
     // Reject DNS-rebinding: only our own loopback host names.
     const host = String(req.headers.host || '');
     if (host !== `127.0.0.1:${port}` && host !== `localhost:${port}`) {
       res.writeHead(403).end();
       return;
     }
-    const url = new URL(req.url, `http://${host}`);
+    // Built from the validated host, so a target like "//" or "/\\" is a path, not a new authority.
+    let url;
+    try { url = new URL(`http://${host}${req.url}`); } catch { res.writeHead(400).end(); return; }
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'no-referrer');
 
@@ -210,7 +223,7 @@ async function serve(args) {
       }
       if (url.pathname === '/api/ping') {
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
-        res.end(JSON.stringify({ app: 'ouroboros', version }));
+        res.end(JSON.stringify({ app: 'ouroboros', version, data: dataDir(), pid: process.pid }));
         return;
       }
       if (isStale()) {
@@ -234,13 +247,24 @@ async function serve(args) {
 
     const name = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
     const file = path.join(publicDir, path.normalize(name));
-    if (!file.startsWith(publicDir + path.sep) || !fs.existsSync(file)) { res.writeHead(404).end(); return; }
-    res.writeHead(200, {
-      'Content-Type': TYPES[path.extname(file)] || 'application/octet-stream',
-      'Content-Security-Policy': "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:",
-    });
-    fs.createReadStream(file).pipe(res);
+    let isFile = false;
+    try { isFile = file.startsWith(publicDir + path.sep) && fs.statSync(file).isFile(); } catch { /* missing or unreadable */ }
+    if (!isFile) { res.writeHead(404).end(); return; }
+    res.writeHead(200, { 'Content-Type': TYPES[path.extname(file)] || 'application/octet-stream' });
+    const stream = fs.createReadStream(file);
+    stream.on('error', () => res.destroy());
+    stream.pipe(res);
+  };
+
+  const server = http.createServer((req, res) => {
+    // Nothing a request does may take the server down.
+    try { onRequest(req, res); } catch (err) {
+      logError(db, 'dashboard:request', err);
+      if (!res.headersSent) res.writeHead(500);
+      res.end();
+    }
   });
+  server.on('clientError', (err, socket) => { if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); });
 
   port = await listen(server, Number(args.port) || DEFAULT_PORT);
   fs.writeFileSync(stateFile(), JSON.stringify({ port, pid: process.pid, startedAt: Date.now() }));
