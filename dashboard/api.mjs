@@ -83,6 +83,21 @@ function dayKey(ts) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
+/**
+ * What the SessionStart hook recorded about Claude Code's auto memory (`options.json`), as the
+ * warning System shows when it is off: `{ on, reason, project, project_name, text }`, `text`
+ * only when off. Null while no session has reported it.
+ */
+function autoMemoryNotice(am, idx) {
+  if (!am || typeof am.on !== 'boolean') return null;
+  const project_name = am.project ? idx.byId.get(idx.idOf(am.project))?.name || null : null;
+  const reason = String(am.reason || 'no reason reported').replace(/[.\s]+$/, '');
+  return {
+    on: am.on, reason: am.reason || null, project: am.project || null, project_name,
+    text: am.on ? null : `Claude Code's auto memory is off${project_name ? ` for ${project_name}` : ''} (${reason}). The project memories Ouroboros saves there are not loaded by Claude Code; Ouroboros adds its own index of them to the session context instead.`,
+  };
+}
+
 /** Characters Ouroboros adds to every session's context (the learning protocol). */
 function overheadChars() {
   try { return sessionContext().length; } catch { return null; }
@@ -105,13 +120,20 @@ function rangeStart(params, fallback = 30) {
   return { days, since: dayStart(days - 1) };
 }
 
-/** One bucket per local calendar day from `since` to today. */
+/**
+ * One bucket per local calendar day from `since` to today. Each day is built from calendar
+ * fields (noon of the day, which every zone has) and compared by day key, never by time of
+ * day: where the clock skips local midnight (Santiago, Havana) a 00:00 step lands on 01:00
+ * and would drop today's bucket for the first hour.
+ */
 function emptySeries(since, make) {
   const m = new Map();
-  const d = new Date(since);
-  for (let n = 0; d.getTime() <= Date.now() && n < 800; n++) {
-    m.set(dayKey(d.getTime()), { day: dayKey(d.getTime()), ...make() });
-    d.setDate(d.getDate() + 1);
+  const s = new Date(since);
+  const today = dayKey(Date.now());
+  for (let n = 0; n < 800; n++) {
+    const key = dayKey(new Date(s.getFullYear(), s.getMonth(), s.getDate() + n, 12).getTime());
+    if (key > today) break;
+    m.set(key, { day: key, ...make() });
   }
   return m;
 }
@@ -119,25 +141,40 @@ function emptySeries(since, make) {
 /** Corrections-per-100-turns comparisons need this many reviewed turns on each side (§9.2). */
 export const MIN_SAMPLE_TURNS = 200;
 
-const per100 = (x) => `${x > 0 ? '+' : x < 0 ? '−' : ''}${Math.abs(x).toFixed(1)}`;
+/** A signed figure with one decimal; what rounds to zero has no sign (never "−0.0"). */
+const per100 = (x) => {
+  const t = Math.abs(x).toFixed(1);
+  return `${Number(t) === 0 ? '' : x > 0 ? '+' : '−'}${t}`;
+};
+
+/** The 95% Wilson score interval of a proportion `k / n`: it does not collapse at 0 or n successes. */
+function wilson(k, n) {
+  const z = 1.96;
+  const p = k / n;
+  const centre = (p + (z * z) / (2 * n)) / (1 + (z * z) / n);
+  const half = (z * Math.sqrt((p * (1 - p)) / n + (z * z) / (4 * n * n))) / (1 + (z * z) / n);
+  return { p, low: Math.max(0, centre - half), high: Math.min(1, centre + half) };
+}
 
 /**
  * Compare two arms (`{ turns, corrections }`): the difference b − a in corrections per 100
  * turns with its 95% interval, and a verdict that is "lower" or "higher" only when the whole
- * interval lies on one side of zero. The interval treats every turn as independent; corrections
- * cluster by session, so the real one is wider: it is approximate.
+ * interval lies on one side of zero. The interval is Newcombe's: each arm's Wilson score
+ * interval, combined (so 0 corrections on both sides still gives a width, not "0.0 to 0.0").
+ * It treats every turn as independent; corrections cluster by session, so the real one is
+ * wider: it is approximate.
  */
 export function compareArms(a, b) {
   const short = [];
   if (a.turns < MIN_SAMPLE_TURNS) short.push('a');
   if (b.turns < MIN_SAMPLE_TURNS) short.push('b');
   if (short.length) return { state: 'short', short, min: MIN_SAMPLE_TURNS };
-  const p1 = a.corrections / a.turns;
-  const p2 = b.corrections / b.turns;
-  const se = Math.sqrt((p1 * (1 - p1)) / a.turns + (p2 * (1 - p2)) / b.turns);
-  const diff = (p2 - p1) * 100;
-  const low = (p2 - p1 - 1.96 * se) * 100;
-  const high = (p2 - p1 + 1.96 * se) * 100;
+  const w1 = wilson(a.corrections, a.turns);
+  const w2 = wilson(b.corrections, b.turns);
+  const d = w2.p - w1.p;
+  const diff = d * 100;
+  const low = (d - Math.sqrt((w2.p - w2.low) ** 2 + (w1.high - w1.p) ** 2)) * 100;
+  const high = (d + Math.sqrt((w2.high - w2.p) ** 2 + (w1.p - w1.low) ** 2)) * 100;
   return { state: high < 0 ? 'lower' : low > 0 ? 'higher' : 'unclear', diff, low, high, min: MIN_SAMPLE_TURNS };
 }
 
@@ -232,14 +269,6 @@ function listOf(db, { select, from, where = [], args = [], order, limit, offset 
   const rows = db.prepare(`SELECT ${select} ${from} ${w} ORDER BY ${order} LIMIT ? OFFSET ?`).all(...args, limit, offset);
   return { rows, total };
 }
-
-/** Sessions that used at least one learned memory or skill. */
-const HITS_SQL = `
-  SELECT e.session_id, MIN(e.ts) ts FROM events e
-  JOIN learnings l ON l.status = 'active' AND l.origin_session IS NOT 'native' AND (
-    (e.kind = 'skill_used' AND l.kind = 'skill' AND (e.target = l.name OR e.target LIKE '%:' || l.name)) OR
-    (e.kind = 'memory_read' AND lower(e.target) = lower(l.path)))
-  WHERE e.ts >= ? AND e.session_id NOT IN (SELECT id FROM sessions WHERE control = 1) GROUP BY e.session_id`;
 
 const GROUP_LABEL = { 'new:memory': 'New memories', 'new:skill': 'New skills', 'new:preference': 'New preferences', fixes: 'Suggested fixes' };
 
@@ -341,6 +370,48 @@ export function createApi(db) {
     args.push(...columns.map(() => likeArg(q)));
   }
 
+  // ---------- learned items in use ----------
+
+  /**
+   * Sessions that used a learned item: sessions that started on or after `since` (the same set
+   * the page divides by), not control sessions, with at least one event that is that learned
+   * item. A skill use is the item when the name matches and the session is in the item's
+   * scope: a personal skill reaches every session, a project skill only sessions of its
+   * project (so another project's own `deploy` is not the learned `deploy`). A memory read is
+   * the item when the path is its path. Returns `[{ id, t }]`, `t` being the session's start.
+   */
+  function hitSessions(since) {
+    const idx = projects();
+    const learned = db.prepare("SELECT kind, scope, project, name, path FROM learnings WHERE status = 'active' AND origin_session IS NOT 'native' AND kind IN ('skill', 'memory')").all();
+    if (!learned.length) return [];
+    const lower = (x) => normalize(x).toLowerCase();
+    const skills = new Map();
+    const memories = new Set();
+    for (const l of learned) {
+      if (l.kind === 'memory') { memories.add(lower(l.path)); continue; }
+      const personal = l.scope === 'global' || lower(l.path).startsWith(`${lower(claudeDir())}/skills/`);
+      const root = /^(.*)\/\.claude\/skills\/[^/]+\/skill\.md$/.exec(lower(l.path))?.[1] || null;
+      const where = personal ? { any: true } : { pid: idx.fileProject(l.path) || (l.project ? idx.idOf(l.project) : null), root };
+      const key = String(l.name).toLowerCase();
+      if (!skills.has(key)) skills.set(key, []);
+      skills.get(key).push(where);
+    }
+    const inScope = (w, ses) => w.any
+      || (w.pid ? idx.idOf(ses.project) === w.pid : !!w.root && (lower(ses.cwd) === w.root || lower(ses.cwd).startsWith(`${w.root}/`)));
+    const hit = new Map();
+    const rows = db.prepare(`
+      SELECT DISTINCT e.session_id id, e.kind, e.target, s.project, s.cwd, s.started_at t FROM events e JOIN sessions s ON s.id = e.session_id
+      WHERE e.kind IN ('skill_used', 'memory_read') AND e.target IS NOT NULL AND s.started_at >= ? AND s.control IS NOT 1`).all(since);
+    for (const r of rows) {
+      if (hit.has(r.id)) continue;
+      const used = r.kind === 'memory_read'
+        ? memories.has(lower(r.target))
+        : (skills.get(String(r.target).toLowerCase()) || []).some((w) => inScope(w, r));
+      if (used) hit.set(r.id, r.t);
+    }
+    return [...hit].map(([id, t]) => ({ id, t }));
+  }
+
   // ---------- learned (ledger batches) ----------
 
   /** Every batch, light (no file contents), with its project and the text the filter searches. */
@@ -408,18 +479,23 @@ export function createApi(db) {
     for (const r of db.prepare("SELECT target, COUNT(*) n, MAX(ts) last FROM events WHERE kind = 'memory_read' GROUP BY target").all()) {
       reads.set(normalize(r.target), r);
     }
-    const uses = new Map();
-    for (const r of db.prepare("SELECT target, COUNT(*) n, MAX(ts) last FROM events WHERE kind = 'skill_used' GROUP BY target").all()) {
-      for (const name of new Set([String(r.target), String(r.target).split(':').pop()])) {
-        const prev = uses.get(name);
-        uses.set(name, { n: (prev?.n || 0) + r.n, last: Math.max(prev?.last || 0, r.last) });
-      }
-    }
+    // Skill uses per (name, project of the session that used it): a use belongs to the skill it
+    // is, not to every skill of that name: a personal skill takes the uses by name from any
+    // project, a project skill only those of sessions of its own project.
+    const useRows = db.prepare(`SELECT e.target, s.project, COUNT(*) n, MAX(e.ts) last FROM events e LEFT JOIN sessions s ON s.id = e.session_id
+      WHERE e.kind = 'skill_used' AND e.target IS NOT NULL GROUP BY e.target, s.project`).all()
+      .map((r) => ({ ...r, name: String(r.target).toLowerCase(), pid: idx.idOf(r.project) }));
+    const usesOf = (s, group) => {
+      const name = s.name.toLowerCase();
+      const names = group === 'plugin' ? new Set([name, name.split(':').pop()]) : new Set([name]);
+      const mine = useRows.filter((r) => names.has(r.name) && (group !== 'project' || (r.pid && r.pid === (idx.fileProject(s.file) || idx.idOf(s.project)))));
+      return { n: mine.reduce((n, r) => n + r.n, 0), last: Math.max(0, ...mine.map((r) => r.last)) || null };
+    };
     const project = (key) => ({ project_id: idx.idOf(key), project_name: key ? idx.nameOf(key) : null });
     const skills = [...listSkills(cwds), ...listPluginSkills()].map((s) => {
-      const u = uses.get(s.name) || uses.get(s.name.split(':').pop());
       const group = s.scope === 'personal' ? 'personal' : s.scope === 'plugin' ? 'plugin' : 'project';
-      return { ...s, ...project(s.project), path: tilde(s.file), group, uses: u?.n || 0, lastUsed: u?.last || null };
+      const u = usesOf(s, group);
+      return { ...s, ...project(s.project), path: tilde(s.file), group, uses: u.n, lastUsed: u.last };
     });
     const memories = listMemories().filter((m) => !m.index).map((m) => {
       const r = reads.get(normalize(m.file));
@@ -645,9 +721,9 @@ export function createApi(db) {
         const d = series.get(dayKey(r.t));
         if (d) d.sessions++;
       }
-      const hits = db.prepare(HITS_SQL).all(since);
+      const hits = hitSessions(since);
       for (const r of hits) {
-        const d = series.get(dayKey(r.ts));
+        const d = series.get(dayKey(r.t));
         if (d) d.hits++;
       }
       const sessions = db.prepare('SELECT COUNT(*) n FROM sessions WHERE started_at >= ? AND control IS NOT 1').get(since).n;
@@ -663,7 +739,8 @@ export function createApi(db) {
       const { days, since } = rangeStart(params, 30);
       const opts = readOptions();
       const series = emptySeries(since, () => ({ usd: 0, inloopTokens: 0, reviews: 0 }));
-      for (const r of db.prepare('SELECT ts, mode, cost_usd, input_tokens, output_tokens, cache_write_tokens FROM reviews WHERE ts >= ?').all(since)) {
+      // `triage-summary` rows are bookkeeping, not reviews (the Activity list hides them too).
+      for (const r of db.prepare("SELECT ts, mode, cost_usd, input_tokens, output_tokens, cache_write_tokens FROM reviews WHERE ts >= ? AND trigger IS NOT 'triage-summary'").all(since)) {
         const d = series.get(dayKey(r.ts));
         if (!d) continue;
         d.usd += r.cost_usd;
@@ -671,11 +748,12 @@ export function createApi(db) {
         if (r.mode === 'inloop') d.inloopTokens += r.input_tokens + r.output_tokens + r.cache_write_tokens;
       }
       const byMode = db.prepare(`
-        SELECT mode, COUNT(*) n, COALESCE(SUM(cost_usd), 0) usd, COALESCE(SUM(output_tokens), 0) output,
+        SELECT mode, COUNT(*) n, SUM(cost_usd > 0) billed, COALESCE(SUM(cost_usd), 0) usd, COALESCE(SUM(output_tokens), 0) output,
                COALESCE(SUM(input_tokens + cache_write_tokens), 0) input, COALESCE(SUM(cache_read_tokens), 0) cache_read
-        FROM reviews WHERE ts >= ? GROUP BY mode`).all(since);
-      const sessions = db.prepare('SELECT COUNT(*) n FROM sessions WHERE started_at >= ?').get(since).n;
-      const hits = db.prepare(HITS_SQL).all(since).length;
+        FROM reviews WHERE ts >= ? AND trigger IS NOT 'triage-summary' GROUP BY mode`).all(since).map((m) => ({ ...m, billed: m.billed || 0 }));
+      // Control sessions get no injection: they do not carry the fixed overhead.
+      const sessions = db.prepare('SELECT COUNT(*) n FROM sessions WHERE started_at >= ? AND control IS NOT 1').get(since).n;
+      const hits = hitSessions(since).length;
       // What the periodic in-session reviews yield: each one reads the whole context again.
       const inloopRows = db.prepare("SELECT status, detail, learned, patched, input_tokens + cache_read_tokens + cache_write_tokens read FROM reviews WHERE mode = 'inloop' AND ts >= ?").all(since);
       const finished = inloopRows.filter((r) => r.status === 'ok');
@@ -881,13 +959,15 @@ export function createApi(db) {
       if (outcome === 'measured') where.push('c.outcome IS NULL');
       else if (outcome && outcome !== 'all') { where.push('c.outcome = ?'); args.push(outcome); }
       whereProject('COALESCE(c.project, s.project)', p.project, where, args);
-      whereSince('s.started_at', params, where, args);
+      // A proposal can have no session row (a curator call with no session id): it is listed,
+      // dated by its own time.
+      whereSince('COALESCE(s.started_at, c.ts)', params, where, args);
       whereText(['c.title', 'c.summary', 'c.claim'], p.q, where, args);
-      const from = 'FROM candidates c JOIN sessions s ON s.id = c.session_id LEFT JOIN changesets cs ON cs.id = c.changeset_id';
+      const from = 'FROM candidates c LEFT JOIN sessions s ON s.id = c.session_id LEFT JOIN changesets cs ON cs.id = c.changeset_id';
       const r = listOf(db, {
         select: `c.id, c.kind, c.memory_type, c.title, c.summary, c.outcome, c.changeset_id, COALESCE(c.project, s.project) project,
-          COALESCE(c.cwd, s.cwd) cwd, s.started_at session_started_at, cs.status cs_status, cs.batch cs_batch`,
-        from, where, args, order: `s.started_at ${dirOf(params)}, c.id`, ...p,
+          COALESCE(c.cwd, s.cwd) cwd, COALESCE(s.started_at, c.ts) session_started_at, cs.status cs_status, cs.batch cs_batch`,
+        from, where, args, order: `COALESCE(s.started_at, c.ts) ${dirOf(params)}, c.id`, ...p,
       });
       return {
         rows: annotate(r.rows), total: r.total,
@@ -1015,7 +1095,15 @@ export function createApi(db) {
         dropReasons[reason] = (dropReasons[reason] || 0) + 1;
       }
       const writes = db.prepare('SELECT COUNT(DISTINCT batch) n, COUNT(DISTINCT CASE WHEN reverted_at IS NOT NULL THEN batch END) undone FROM writes WHERE ts >= ?').get(since);
-      const decided = db.prepare("SELECT outcome FROM candidates WHERE decided_at >= ? AND outcome IN ('created', 'patched', 'rejected_by_user') OR (decided_at >= ? AND outcome LIKE 'approved_%')").all(since, since);
+      // Approval rate: only decisions the user made. A rejection is `rejected_by_user`; an approval
+      // is a write whose ledger actor is `manual` (the inbox and dashboard buttons) within seconds of
+      // the decision, or an approval that wrote nothing (`approved_*`). Saves the evaluation made by
+      // itself (actor `background` / `inloop`) are not approvals.
+      const decided = db.prepare(`
+        SELECT c.outcome FROM candidates c WHERE c.decided_at >= ? AND (
+          c.outcome = 'rejected_by_user' OR c.outcome LIKE 'approved_%' OR (c.outcome IN ('created', 'patched') AND EXISTS (
+            SELECT 1 FROM writes w WHERE w.learning_id = c.learning_id AND w.actor = 'manual' AND w.op IN ('create', 'patch', 'consolidate')
+              AND ABS(w.ts - c.decided_at) <= 10000)))`).all(since);
       const approved = decided.filter((d) => d.outcome !== 'rejected_by_user').length;
       return {
         days,
@@ -1037,13 +1125,32 @@ export function createApi(db) {
     },
 
     health() {
+      const options = readOptions();
       const cwds = knownCwds(db);
       const indexes = listMemories().filter((m) => m.index).map((m) => ({
         project: m.project, project_name: projects().nameOf(m.project), lines: m.lines, chars: m.chars,
         lineLimit: MEMORY_INDEX_LINE_LIMIT, byteLimit: MEMORY_INDEX_BYTE_LIMIT,
       }));
-      const skills = listSkills(cwds).filter((s) => !s.userOnly);
-      const listingChars = skills.reduce((n, s) => n + Math.min(s.descriptionChars, 1536) + s.name.length + 4, 0);
+      // What one session loads: the personal skills plus its own project's (a worktree is its
+      // repository, and two checkouts of one repository list a skill once). The meter shows the
+      // largest such listing, not the sum over every project, which no session ever loads.
+      const idx = projects();
+      const listed = listSkills(cwds).filter((s) => !s.userOnly);
+      const cost = (s) => Math.min(s.descriptionChars, 1536) + s.name.length + 4;
+      const personal = listed.filter((s) => s.scope === 'personal');
+      const byProject = new Map();
+      for (const s of listed.filter((x) => x.scope !== 'personal')) {
+        const pid = idx.fileProject(s.file) || idx.idOf(s.project) || s.project;
+        if (!byProject.has(pid)) byProject.set(pid, new Map());
+        if (!byProject.get(pid).has(s.name)) byProject.get(pid).set(s.name, s);
+      }
+      let skills = personal;
+      let listingProject = null;
+      for (const [pid, own] of byProject) {
+        const all = [...personal, ...[...own.values()].filter((s) => !personal.some((x) => x.name === s.name))];
+        if (all.reduce((n, s) => n + cost(s), 0) > skills.reduce((n, s) => n + cost(s), 0)) { skills = all; listingProject = idx.byId.get(pid)?.name || null; }
+      }
+      const listingChars = skills.reduce((n, s) => n + cost(s), 0);
       const queue = db.prepare('SELECT COALESCE(queue_state, \'none\') state, COUNT(*) n FROM sessions GROUP BY queue_state').all();
       const capture = db.prepare("SELECT MAX(ts) last, SUM(CASE WHEN ts >= ? THEN 1 ELSE 0 END) day FROM events").get(Date.now() - DAY);
       const settings = loadSettings();
@@ -1054,10 +1161,11 @@ export function createApi(db) {
           memoryIndexLines: settings.limits.memoryIndexLines,
         },
         indexes,
-        skillListing: { skills: skills.length, chars: listingChars, tokens: Math.round(listingChars / 4) },
+        skillListing: { skills: skills.length, chars: listingChars, tokens: Math.round(listingChars / 4), project: listingProject },
         queue,
         capture: { lastEventAt: capture.last, eventsLast24h: capture.day || 0 },
-        options: readOptions(),
+        options,
+        autoMemory: autoMemoryNotice(options?.autoMemory, projects()),
       };
     },
 

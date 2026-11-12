@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { after, before, test } from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DAY = 86_400_000;
@@ -96,12 +96,19 @@ test('A4: the short side is named, either one or both', () => {
 });
 
 test('A4: the verdict follows the 95% interval of the difference', () => {
-  // The formula of the brief, on known numbers: 10% on 1000 turns against 6% on 1000.
+  // Newcombe's interval (each arm's Wilson interval, combined), on known numbers: 10% on 1000 turns against 6% on 1000.
   const c = compareArms({ turns: 1000, corrections: 100 }, { turns: 1000, corrections: 60 });
-  const se = Math.sqrt((0.1 * 0.9) / 1000 + (0.06 * 0.94) / 1000);
+  const wilson = (k, n) => {
+    const p = k / n; const z = 1.96;
+    const mid = (p + (z * z) / (2 * n)) / (1 + (z * z) / n);
+    const half = (z * Math.sqrt((p * (1 - p)) / n + (z * z) / (4 * n * n))) / (1 + (z * z) / n);
+    return { p, l: mid - half, u: mid + half };
+  };
+  const w1 = wilson(100, 1000);
+  const w2 = wilson(60, 1000);
   assert.ok(Math.abs(c.diff - -4) < 1e-9);
-  assert.ok(Math.abs(c.low - (-0.04 - 1.96 * se) * 100) < 1e-9);
-  assert.ok(Math.abs(c.high - (-0.04 + 1.96 * se) * 100) < 1e-9);
+  assert.ok(Math.abs(c.low - (-0.04 - Math.sqrt((w2.p - w2.l) ** 2 + (w1.u - w1.p) ** 2)) * 100) < 1e-9);
+  assert.ok(Math.abs(c.high - (-0.04 + Math.sqrt((w2.u - w2.p) ** 2 + (w1.p - w1.l) ** 2)) * 100) < 1e-9);
   assert.equal(c.state, 'lower');
 
   // 10 vs 7 per 100 on 200 turns each: a 3-point drop that fits inside the noise (about +-6).
@@ -178,30 +185,43 @@ test('M17: control sessions are in neither the trend nor the baseline figure', (
   assert.equal(v.series.reduce((n, d) => n + d.sessions, 0), 1);
 });
 
-test('M18: one bucket per calendar day across both clock changes', () => {
+test('M18: one bucket per calendar day across both clock changes, and where the clock skips midnight', () => {
+  // A fixed "now" (a Date shim in the child) a few hours after each change, so the test does not depend on
+  // when it runs; Santiago and Havana skip local midnight, which used to drop today's bucket until 01:00.
   const script = path.join(tmp, 'dst-child.mjs');
   fs.writeFileSync(script, `
-    const { openDb } = await import(${JSON.stringify(path.join(root, 'scripts', 'db.mjs'))});
-    const { createApi } = await import(${JSON.stringify(path.join(root, 'dashboard', 'api.mjs'))});
+    const fake = Date.parse(process.argv[2]);
+    const RealDate = Date;
+    globalThis.Date = class extends RealDate { constructor(...a) { if (a.length === 0) super(fake); else super(...a); } static now() { return fake; } };
+    const { openDb } = await import(${JSON.stringify(pathToFileURL(path.join(root, 'scripts', 'db.mjs')).href)});
+    const { createApi } = await import(${JSON.stringify(pathToFileURL(path.join(root, 'dashboard', 'api.mjs')).href)});
     const db = openDb();
     const now = Date.now();
-    db.prepare('INSERT INTO sessions (id, project, cwd, started_at, turns) VALUES (?, ?, ?, ?, ?)').run('t1', '-w-app', '/w/app', now - 3600e3, 50);
-    db.prepare("INSERT INTO reviews (session_id, mode, trigger, status, instrument, turns_reviewed, corrections, cost_usd, session_started_at, ts) VALUES ('t1', 'corrections', 'session_end', 'ok', 'corrections', 50, 5, 0.02, ?, ?)").run(now - 3600e3, now);
+    db.prepare('INSERT INTO sessions (id, project, cwd, started_at, turns) VALUES (?, ?, ?, ?, ?)').run('t1', '-w-app', '/w/app', now - 1800e3, 50);
+    db.prepare("INSERT INTO reviews (session_id, mode, trigger, status, instrument, turns_reviewed, corrections, cost_usd, session_started_at, ts) VALUES ('t1', 'corrections', 'session_end', 'ok', 'corrections', 50, 5, 0.02, ?, ?)").run(now - 1800e3, now);
     const api = createApi(db);
     const key = (d) => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
     const out = {};
-    for (const days of [7, 30, 90, 365]) {
+    for (const days of [1, 2, 7, 30, 90, 365]) {
       const p = new URLSearchParams({ days });
-      // The calendar in the child's own time zone: today, and the days before it one by one.
       const expected = [];
       for (let i = days - 1; i >= 0; i--) { const d = new Date(); d.setHours(12, 0, 0, 0); d.setDate(d.getDate() - i); expected.push(key(d)); }
       out[days] = { expected, overview: api('overview', p).series, value: api('value', p).series, cost: api('cost', p).series };
     }
     console.log(JSON.stringify(out));
   `);
-  for (const TZ of ['America/New_York', 'Australia/Sydney', 'UTC']) {
-    const slug = TZ.replace('/', '-');
-    const r = spawnSync(process.execPath, ['--no-warnings', script], {
+  // [zone, local "now"] as UTC instants: shortly after the spring and the autumn change of each zone.
+  const cases = [
+    ['America/New_York', '2026-03-08T12:00:00Z'], ['America/New_York', '2026-11-01T12:00:00Z'],
+    ['Australia/Sydney', '2026-04-05T04:00:00Z'], ['Australia/Sydney', '2026-10-04T04:00:00Z'],
+    ['America/Santiago', '2026-09-07T03:30:00Z'], // 00:30 on the day after midnight was skipped
+    ['America/Santiago', '2026-09-06T04:30:00Z'], // 01:30 on the day midnight was skipped
+    ['America/Havana', '2026-03-09T04:30:00Z'], ['America/Havana', '2026-03-08T05:30:00Z'],
+    ['UTC', '2026-06-01T00:30:00Z'],
+  ];
+  for (const [TZ, at] of cases) {
+    const slug = `${TZ.replace('/', '-')}-${at.slice(0, 10)}`;
+    const r = spawnSync(process.execPath, ['--no-warnings', script, at], {
       env: { ...process.env, TZ, OUROBOROS_HOME: path.join(tmp, `dst-${slug}`), CLAUDE_PLUGIN_DATA: path.join(tmp, `dst-data-${slug}`) },
       encoding: 'utf8',
     });
@@ -209,12 +229,12 @@ test('M18: one bucket per calendar day across both clock changes', () => {
     const out = JSON.parse(r.stdout);
     for (const [days, { expected, ...routes }] of Object.entries(out)) {
       for (const [name, series] of Object.entries(routes)) {
-        assert.deepEqual(series.map((d) => d.day), expected, `${TZ}: ${name} over ${days} days`);
+        assert.deepEqual(series.map((d) => d.day), expected, `${TZ} at ${at}: ${name} over ${days} days`);
       }
     }
-    assert.equal(out[30].overview.at(-1).sessions, 1, `${TZ}: today's session is in the chart`);
+    assert.equal(out[30].overview.at(-1).sessions, 1, `${TZ} at ${at}: today's session is in the chart`);
     assert.equal(out[30].overview.at(-1).corrections, 5);
-    assert.ok(out[30].cost.at(-1).usd > 0, `${TZ}: today's cost is in the chart`);
+    assert.ok(out[30].cost.at(-1).usd > 0, `${TZ} at ${at}: today's cost is in the chart`);
   }
 });
 
@@ -261,4 +281,32 @@ test('new: in-session reviews report how many saved something, were skipped and 
   assert.equal(c.inloop.skipped.reduce((n, x) => n + x.n, 0), 3);
   assert.deepEqual(c.inloop.skipped[0], { detail: 'context of N tokens is over inloop_review_max_context (N): left to the end-of-session review', n: 2 });
   assert.equal(c.inloop.avgTokensRead, Math.round((41_010 + 61_010 + 81_010 + 101_010) / 4));
+});
+
+test('review III: the interval does not collapse at zero corrections, and zero has no sign', () => {
+  // 0 of 300 against 0 of 300 used to read "95% interval 0.0 to 0.0": the normal approximation has no spread at p = 0.
+  const c = compareArms({ turns: 300, corrections: 0 }, { turns: 300, corrections: 0 });
+  assert.equal(c.state, 'unclear');
+  assert.equal(c.diff, 0);
+  assert.ok(c.low < -0.5 && c.high > 0.5, `${c.low} to ${c.high}`);
+  // One side at zero: the other side's rate is still told apart from it.
+  const one = compareArms({ turns: 300, corrections: 0 }, { turns: 300, corrections: 30 });
+  assert.equal(one.state, 'higher');
+  assert.ok(one.low > 0);
+
+  reset();
+  const now = Date.now();
+  enable(now - 10 * DAY);
+  measured({ at: now - 20 * DAY, turns: 300, corrections: 0 });
+  measured({ at: now - 2 * DAY, turns: 300, corrections: 0 });
+  const v = get('value', { days: 60 });
+  assert.equal(v.verdict.state, 'unclear');
+  assert.match(v.verdict.text, /^No difference can be told yet: 0\.0 per 100 turns, 95% interval −1\.\d to \+1\.\d, which includes zero/);
+  assert.doesNotMatch(v.verdict.text, /[+−]0\.0|0\.0 to 0\.0/);
+
+  // A bound that rounds to zero loses its sign: a tiny negative never prints "−0.0".
+  measured({ at: now - 2 * DAY, turns: 100_000, corrections: 1, control: 1 });
+  measured({ at: now - 2 * DAY, turns: 100_000, corrections: 1 });
+  const cc = get('value', { days: 60 }).concurrent.verdict;
+  assert.doesNotMatch(cc.text, /[+−]0\.0(?!\d)/);
 });

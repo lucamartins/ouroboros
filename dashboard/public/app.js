@@ -310,13 +310,22 @@ function paintNavLinks() {
 let actionToken = null;
 
 async function act(action, id) {
-  if (!actionToken) actionToken = (await api('token')).token;
-  const res = await fetch('/api/action', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Ouroboros-Token': actionToken },
-    body: JSON.stringify({ action, id }),
-  });
-  const body = await res.json().catch(() => ({}));
+  // The token belongs to one server start: after a restart the open page's token is refused
+  // ("bad token"), so fetch it again and retry once.
+  const send = async () => {
+    if (!actionToken) actionToken = (await api('token')).token;
+    const r = await fetch('/api/action', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Ouroboros-Token': actionToken },
+      body: JSON.stringify({ action, id }),
+    });
+    return { res: r, body: await r.json().catch(() => ({})) };
+  };
+  let { res, body } = await send();
+  if (res.status === 403 && body.error === 'bad token') {
+    actionToken = null;
+    ({ res, body } = await send());
+  }
   if (!res.ok) throw new Error(body.message || body.error || `HTTP ${res.status}`);
   return body;
 }
@@ -1981,9 +1990,11 @@ async function renderSystem() {
     const mode = Object.fromEntries(c.byMode.map((m) => [m.mode, m]));
     const bgUsd = Object.values(mode).filter((m) => m.mode !== 'inloop').reduce((n, m) => n + m.usd, 0);
     const bgN = Object.values(mode).filter((m) => m.mode !== 'inloop').reduce((n, m) => n + m.n, 0);
+    // Skipped reviews make no model call: the average divides by the calls that were billed.
+    const bgBilled = Object.values(mode).filter((m) => m.mode !== 'inloop').reduce((n, m) => n + m.billed, 0);
     costSection = [
       h('div', { class: 'panel' }, h('dl', { class: 'facts' },
-        ...[['Reviews', fmt.int(bgN + (mode.inloop?.n || 0))], ['Billed reviews', fmt.usd(bgUsd)], ['Average per review', bgN ? fmt.usd(bgUsd / bgN) : '—'],
+        ...[['Reviews', fmt.int(bgN + (mode.inloop?.n || 0))], ['Billed reviews', fmt.usd(bgUsd)], ['Average per billed review', bgBilled ? fmt.usd(bgUsd / bgBilled) : '—'],
           ['Context per session', `${fmt.int(c.overhead.tokensPerSession)} tok`]].map(([k, v]) => h('div', {}, h('dt', {}, k), h('dd', {}, v))))),
       inloopPanel(c.inloop),
       h('div', { class: 'charts spaced' },
@@ -2002,7 +2013,7 @@ async function renderSystem() {
         h('h3', {}, 'Always in context'),
         budgetRow('Skill listing', hl.skillListing.tokens, LISTING_REF, 'tokens'),
         budgetRow('Learned skills', hl.budgets.learnedSkills.used, hl.budgets.learnedSkills.limit, 'skills'),
-        h('p', { class: 'small faint panel-note' }, `Skill listing: ${hl.skillListing.skills} skills Claude can invoke (plugin skills not counted); ~2,000 tokens is 1% of a 200K context. Limits live in ~/.ouroboros/config.json; past 80%, Ouroboros consolidates.`)),
+        h('p', { class: 'small faint panel-note' }, `Skill listing: ${hl.skillListing.skills} skills Claude can invoke in one session, personal ones plus ${hl.skillListing.project ? `those of ${hl.skillListing.project}, the largest project` : 'a project’s'} (plugin skills not counted); ~2,000 tokens is 1% of a 200K context. Limits live in ~/.ouroboros/config.json; past 80%, Ouroboros consolidates.`)),
       h('div', { class: 'panel pad' },
         h('h3', {}, 'MEMORY.md indexes'),
         hl.indexes.length ? hl.indexes.map((ix) => budgetRow(ix.project_name || ix.project, ix.lines, hl.budgets.memoryIndexLines, 'lines'))
@@ -2025,6 +2036,10 @@ async function renderSystem() {
   return [
     pageHead('System', 'Is everything running, how good is what it learns, and what does it cost?'),
     status,
+    // Claude Code's auto memory is off where the last session started: say what that means.
+    !failed(hl) && hl.autoMemory && !hl.autoMemory.on
+      ? h('div', { class: 'panel spaced', role: 'status' }, h('div', { class: 'signal warn' }, icon('alert'), h('div', {}, h('b', {}, 'Warning: '), hl.autoMemory.text)))
+      : null,
     h('section', { class: 'section' }, sectionHead('Learning quality', `What the knowledge check did with proposals in the last ${failed(q) ? state.days : q.days} days, and how you judged what reached you.`), quality),
     h('section', { class: 'section' }, sectionHead('Cost', 'End-of-session and maintenance reviews are isolated Haiku calls billed per use; in-session reviews use your plan.'), ...costSection),
     h('section', { class: 'section' }, sectionHead('Context budgets', 'What Ouroboros keeps in every session’s context, against its limits.'), budgets),

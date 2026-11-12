@@ -380,6 +380,8 @@ dl.facts dd { margin: 2px 0 0; font-size: 20px; font-weight: 650; font-variant-n
 .signal { display: flex; gap: 10px; align-items: flex-start; padding: 10px var(--s5); border-top: 1px solid var(--grid); font-size: 13px; }
 .signal svg { color: var(--warning); margin-top: 2px; }
 .signal.ok svg { color: var(--good); }
+.panel.spaced { margin-top: var(--s4); }
+.signal.warn { border-top: 0; }
 .problems li { padding: 10px 0; border-bottom: 1px solid var(--grid); }
 .problems li:last-child { border-bottom: 0; }
 
