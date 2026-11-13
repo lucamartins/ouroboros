@@ -671,6 +671,7 @@ Phase 1 is read-only on purpose. Later, the same graph could drive behavior: wri
 
 - Public GitHub repository (MIT) that is its own marketplace (`.claude-plugin/marketplace.json`).
 - Install: `/plugin marketplace add lucamartins/ouroboros` → `/plugin install ouroboros@ouroboros`.
+- Updates: users receive a release only when `version` in `plugin.json` changes (Claude Code compares it with the installed copy; new commits under the same version are not delivered), so every user-visible change bumps it. Auto-update is off by default for third-party marketplaces; the README tells users to turn it on under `/plugin` › Marketplaces, or to run `claude plugin update ouroboros@ouroboros`. State lives in `${CLAUDE_PLUGIN_DATA}` and `~/.ouroboros/`, which survive updates.
 - `claude plugin validate --strict` in CI.
 - On Windows the reviewer runs `claude.exe` when the PATH has one (the native install), else the CLI script behind npm's `claude.cmd` shim with the current Node: Node cannot spawn a `.cmd` without a shell, and a shell would mangle the JSON schema argument (`resolveClaude`; unit-tested, not yet exercised on a real Windows npm install).
 - Declared requirement: Node ≥ 22.13 on PATH. `SessionStart` checks the version and, if missing, warns once and disables the hooks silently.
