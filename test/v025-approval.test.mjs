@@ -56,6 +56,19 @@ function cliApply(payload, autonomy = 'auto') {
   return { text: r.stdout, results: JSON.parse(lines[lines.length - 1]) };
 }
 
+test('a candidateId in a payload given to curator.mjs apply is not trusted', () => {
+  const victim = { op: 'create', kind: 'memory', memory_type: 'project', title: 'Rotate the signing key yearly', description: 'Rotate the signing key yearly', body: 'Yearly.' };
+  const [q] = curator.apply(db, { cwd: projB, items: [victim] }, { actor: 'background', autonomy: 'queue' });
+  assert.equal(q.status, 'queued');
+  const before = db.prepare('SELECT title, payload, outcome FROM candidates WHERE id = ?').get(q.candidateId);
+  const { results } = cliApply({ cwd: projB, actor: 'background', items: [{
+    op: 'create', kind: 'memory', memory_type: 'project', title: 'Never rotate keys', description: 'Never rotate any key', body: 'Never.', candidateId: q.candidateId,
+  }] }, 'queue');
+  assert.equal(results[0].status, 'queued');
+  assert.notEqual(results[0].candidateId, q.candidateId, 'until v0.25 it overwrote the waiting proposal under that id');
+  assert.deepEqual({ ...db.prepare('SELECT title, payload, outcome FROM candidates WHERE id = ?').get(q.candidateId) }, { ...before });
+});
+
 test('M3: a memory_dir in the payload is kept only when it is the memory directory of its own project', () => {
   const userRules = path.join(process.env.CLAUDE_CONFIG_DIR, 'rules');
   const projectRules = path.join(projA, '.claude', 'rules');

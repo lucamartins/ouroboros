@@ -226,29 +226,67 @@ export function skipInherited(db, sessionId, entries) {
   return n;
 }
 
+/**
+ * Mark a session that never got a SessionEnd as ended (at its last event) and queue it,
+ * with what SessionEnd would have recorded. One statement claims it (two SessionStarts
+ * at once sweep the same session): only the call that changed the row records the end,
+ * and only it may start the worker.
+ */
+export function claimIdleSession(db, id, reason, now) {
+  const claimed = db.prepare(`UPDATE sessions SET ended_at = last_event_at, end_reason = ?, review_requested_at = NULL,
+    queue_state = 'queued', last_event_at = ? WHERE id = ? AND queue_state IS NULL AND ended_at IS NULL`).run(reason, now, id);
+  if (!claimed.changes) return false;
+  db.prepare("INSERT INTO events (session_id, ts, kind, target) VALUES (?, ?, 'session_end', ?)").run(id, now, reason);
+  return true;
+}
+
 const LEARN_SKILL_RE = /^(ouroboros:)?learn$/;
 
 /**
  * Whether a step that saves learnings failed or was denied in entries [fromLine, end):
  * an error result for a `Skill` call of the learn skill, for a shell call that runs
- * `curator.mjs` (the skill's apply step), or for any tool called after the learn skill
- * (the Write of the payload file, a read it needed).
+ * `curator.mjs` (the skill's apply step), or for a Write after the learn skill that no
+ * later `curator.mjs` call used (the payload file it could not write). Never when a
+ * `curator.mjs apply` call after the learn step returned without error: what it reported
+ * (saved, queued) is the outcome. Other tools that fail meanwhile (a Read of a file that
+ * does not exist) are not the save: until v0.25 they made a review whose items were all
+ * queued read as "could not save".
  */
 export function learnStepFailed(entries, fromLine = 0) {
-  const learnCalls = new Set();
+  const calls = new Map();
+  const curatorCommands = [];
+  const failed = [];
   let learning = false;
+  let applied = false;
+  let order = 0;
   for (let i = fromLine; i < entries.length; i++) {
     const e = entries[i];
     if (!e || e.isSidechain || !Array.isArray(e.message?.content)) continue;
     for (const c of e.message.content) {
       if (e.type === 'assistant' && c?.type === 'tool_use') {
         const ti = c.input || {};
-        if ((c.name === 'Skill' && LEARN_SKILL_RE.test(String(ti.skill || ''))) || (COMMAND_TOOL_RE.test(c.name) && /curator\.mjs/.test(String(ti.command || '')))) learning = true;
-        if (learning) learnCalls.add(c.id);
-      } else if (e.type === 'user' && c?.type === 'tool_result' && c.is_error && learnCalls.has(c.tool_use_id)) return true;
+        const command = COMMAND_TOOL_RE.test(c.name) ? String(ti.command || '') : '';
+        order++;
+        if (c.name === 'Skill' && LEARN_SKILL_RE.test(String(ti.skill || ''))) {
+          learning = true;
+          calls.set(c.id, { kind: 'skill' });
+        } else if (/curator\.mjs/.test(command)) {
+          learning = true;
+          calls.set(c.id, { kind: /\bapply\b/.test(command) ? 'apply' : 'curator' });
+          curatorCommands.push({ order, command: command.replace(/\\/g, '/') });
+        } else if (learning && c.name === 'Write' && ti.file_path) {
+          calls.set(c.id, { kind: 'write', order, file: String(ti.file_path).replace(/\\/g, '/') });
+        }
+      } else if (e.type === 'user' && c?.type === 'tool_result' && calls.has(c.tool_use_id)) {
+        const call = calls.get(c.tool_use_id);
+        if (!c.is_error) applied ||= call.kind === 'apply';
+        else failed.push(call);
+      }
     }
   }
-  return false;
+  if (applied) return false;
+  const used = (w) => curatorCommands.some((x) => x.order > w.order && x.command.includes(w.file));
+  return failed.some((f) => f.kind !== 'write' || !used(f));
 }
 
 /**
@@ -480,13 +518,7 @@ const handlers = {
       for (const { id, queue_state: state } of orphans) {
         if (state === null) {
           // What SessionEnd would have set, ended at its last event.
-          const reason = `no SessionEnd: idle over ${IDLE_AS_ENDED_MS / 3_600_000} h`;
-          // One statement claims it (two SessionStarts at once sweep the same session);
-          // only the one that changed the row records the end and starts the worker.
-          const claimed = db.prepare(`UPDATE sessions SET ended_at = last_event_at, end_reason = ?, review_requested_at = NULL,
-            queue_state = 'queued', last_event_at = ? WHERE id = ? AND queue_state IS NULL AND ended_at IS NULL`).run(reason, now, id);
-          if (!claimed.changes) continue;
-          db.prepare("INSERT INTO events (session_id, ts, kind, target) VALUES (?, ?, 'session_end', ?)").run(id, now, reason);
+          if (!claimIdleSession(db, id, `no SessionEnd: idle over ${IDLE_AS_ENDED_MS / 3_600_000} h`, now)) continue;
         } else {
           db.prepare("UPDATE sessions SET queue_state = 'queued', last_event_at = ? WHERE id = ?").run(now, id);
         }

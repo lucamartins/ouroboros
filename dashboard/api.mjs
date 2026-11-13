@@ -12,7 +12,7 @@ import { getMeta, monthSpend, monthStart } from '../scripts/db.mjs';
 import { actsThroughIndex } from '../scripts/maintenance.mjs';
 import { loadSettings } from '../scripts/settings.mjs';
 import { listInstructionFiles, listMemories, listPluginSkills, listSkills } from '../scripts/inventory.mjs';
-import { claudeDir, dataDir, home, normalize, ouroborosDir, projectKey, repoRoot } from '../scripts/paths.mjs';
+import { claudeDir, dataDir, home, normalize, ouroborosDir, projectDirName, projectKey, repoRoot } from '../scripts/paths.mjs';
 import { inboxCounts, sessionContext } from '../scripts/hook.mjs';
 import { inboxEntries } from '../scripts/inbox.mjs';
 import { buildGraph, focusGraph } from '../scripts/graph.mjs';
@@ -296,6 +296,8 @@ export function createApi(db) {
       if (!p) { p = { id, dir: dir || null, repo, sessions: 0, last: 0 }; list.set(id, p); }
       if (key) byKey.set(key, id);
       byKey.set(id, id);
+      // A long path's memory folder is named differently from its key (`projectDirName`).
+      if (dir) byKey.set(projectDirName(dir), id);
       p.sessions += sessions;
       p.last = Math.max(p.last, last || 0);
       return id;

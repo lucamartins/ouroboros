@@ -796,11 +796,12 @@ function runItem(db, item, settings, payload, actor, { dryRun = false } = {}) {
     if (dryRun) {
       db.exec('ROLLBACK');
       batch.rollback();
-    } else {
-      batch.commit();
-      db.exec('COMMIT');
+      return result;
     }
-    return result;
+    batch.commit();
+    db.exec('COMMIT');
+    // The ledger batch of what was written (undo, and the stand-ins it retires: `retireInterim`).
+    return ['created', 'patched'].includes(result.status) ? { ...result, batch: batch.id } : result;
   } catch (err) {
     try { db.exec('ROLLBACK'); } catch { /* not in a transaction */ }
     batch.rollback();
@@ -1051,11 +1052,12 @@ export function syncInterim(db, learningId, file) {
 
 /**
  * Retire the stand-in memory of a candidate (its line was written, or the claim turned out
- * wrong). The ones retired are remembered on the candidate (`retired`), so that undoing the
- * change that wrote the line brings them back (`restoreRetired`): otherwise the rule is in
+ * wrong). The ones retired are remembered on the candidate (`retired`), each with the
+ * ledger batch that wrote the line (`batch`, none when the claim was dropped), so that
+ * undoing that very write brings them back (`restoreRetired`): otherwise the rule is in
  * neither place.
  */
-export function retireInterim(db, candidateId) {
+export function retireInterim(db, candidateId, batch = null) {
   const retired = [];
   // A promoted rule can have one stand-in per project that learned it while it waited.
   for (const id of candidatePayload(db, candidateId).interims || []) {
@@ -1065,26 +1067,35 @@ export function retireInterim(db, candidateId) {
   if (l && forget(db, { match: l.id }).status === 'archived') retired.push(l.id);
   if (retired.length) {
     const p = candidatePayload(db, candidateId);
-    db.prepare('UPDATE candidates SET payload = ? WHERE id = ?').run(JSON.stringify({ ...p, retired: [...(p.retired || []), ...retired] }), candidateId);
+    db.prepare('UPDATE candidates SET payload = ? WHERE id = ?').run(JSON.stringify({ ...p, retired: [...(p.retired || []), ...retired.map((id) => ({ id, batch }))] }), candidateId);
   }
   return retired.length ? retired[retired.length - 1] : null;
 }
 
-/** Bring back the stand-in memories that approving a change retired (its candidates, by changeset or learning). */
-function restoreRetired(db, { batch, learningId }) {
-  const rows = db.prepare(`SELECT id, payload FROM candidates WHERE payload LIKE '%"retired":[%'
-    AND (changeset_id IN (SELECT id FROM changesets WHERE batch = ?) OR (? IS NOT NULL AND learning_id = ?))`).all(batch, learningId ?? null, learningId ?? null);
+/**
+ * Bring back the stand-in memories that the write of `batch` retired. Only those: two
+ * approved changes to the same file share its learning, and undoing the second must not
+ * bring back the first one's stand-in, whose line is still in the file. (Entries recorded
+ * before v0.25 carry no batch: they belong to their candidate's changeset.)
+ */
+function restoreRetired(db, { batch }) {
+  const rows = db.prepare(`SELECT c.id, c.payload, cs.batch AS cs_batch FROM candidates c LEFT JOIN changesets cs ON cs.id = c.changeset_id
+    WHERE c.payload LIKE '%"retired":[%'`).all();
   const restored = [];
   for (const c of rows) {
     const p = candidatePayload(db, c.id);
     const left = [];
-    for (const id of p.retired || []) {
+    let touched = false;
+    for (const e of p.retired || []) {
+      const { id, batch: by } = typeof e === 'string' ? { id: e, batch: c.cs_batch } : e;
+      if (!by || by !== batch) { left.push(e); continue; }
+      touched = true;
       // The archive batch is the learning's latest write unless something touched it since.
       const l = db.prepare('SELECT status FROM learnings WHERE id = ?').get(id);
       if (l?.status === 'archived' && undo(db, { id }).status === 'undone') restored.push(id);
-      else left.push(id);
+      else left.push(e);
     }
-    db.prepare('UPDATE candidates SET payload = ? WHERE id = ?').run(JSON.stringify({ ...p, retired: left }), c.id);
+    if (touched) db.prepare('UPDATE candidates SET payload = ? WHERE id = ?').run(JSON.stringify({ ...p, retired: left }), c.id);
   }
   return restored;
 }
@@ -1132,13 +1143,26 @@ export function decideQueued(db, candidateId, approve) {
   // meanwhile (until v0.25 it was, and the user's "yes" created that file).
   const [result] = apply(db, { cwd: p.cwd, memory_dir: p.memory_dir, trigger: p.trigger, session_id: c.session_id, items: [p.item] }, { actor: 'manual', promote: false });
   const written = result.status === 'created' || result.status === 'patched';
-  // An approval that wrote nothing (the memory index is full, the file changed, a duplicate
-  // appeared) decides nothing: the entry keeps waiting, with the reason in the answer.
-  if (!written) return { ...result, reason: result.reason || `nothing was written (${result.status}); the proposal is still waiting` };
+  // The same thing was saved meanwhile: the approval is settled (it was already saved), so
+  // the entry leaves the inbox instead of being retried by every "Approve all".
+  if (result.status === 'duplicate') {
+    const where = result.target ? ` (${result.target})` : '';
+    db.prepare("UPDATE candidates SET outcome = 'approved_duplicate', decided_at = ?, note = ? WHERE id = ?")
+      .run(Date.now(), `approved, but it was already saved${where}`, candidateId);
+    return { ...result, reason: `it was already saved${where}, so nothing new was written; the entry left the inbox` };
+  }
+  // An approval that wrote nothing else (the memory index is full, an error) decides
+  // nothing: the entry keeps waiting, with the reason in the answer.
+  if (!written) {
+    const why = result.status === 'over_budget' ? `${result.reason}; it is still in the inbox: approve it again once there is room`
+      : result.status === 'error' ? `${result.reason || 'unknown error'}; it is still in the inbox: approve it again later`
+        : `${result.reason || `nothing was written (${result.status})`}; it is still in the inbox`;
+    return { ...result, reason: why };
+  }
   db.prepare('UPDATE candidates SET outcome = ?, learning_id = ?, decided_at = ? WHERE id = ?')
     .run(result.status, result.id || null, Date.now(), candidateId);
   // A promoted rule had a project memory standing in for it: the line is in place now.
-  retireInterim(db, candidateId);
+  retireInterim(db, candidateId, result.batch);
   return result;
 }
 
@@ -1204,7 +1228,7 @@ export function undo(db, { id, last, batch } = {}) {
   }
   const l = learningId ? db.prepare('SELECT title, kind FROM learnings WHERE id = ?').get(learningId) : null;
   // Undoing the write that retired no stand-in itself, but one that did: the memories come back.
-  const restored = ops.has('archive') ? [] : restoreRetired(db, { batch: batchRow.batch, learningId });
+  const restored = ops.has('archive') ? [] : restoreRetired(db, { batch: batchRow.batch });
   return { status: 'undone', id: learningId, title: l?.title, kind: l?.kind, op: [...ops].join(','), files: writes.map((w) => w.file), ...(restored.length ? { restored } : {}) };
 }
 
@@ -1467,6 +1491,9 @@ async function main() {
       const { memoryDir, ignored } = checkedMemoryDir(payload);
       payload.memory_dir = memoryDir;
       if (ignored) console.log(`⚠ memory_dir ignored: ${ignored} is not a Claude Code auto-memory directory; memories go to ${memoryDirFor({ cwd: payload.cwd || process.cwd() })}`);
+      // A candidate row is the evaluation's own (in-process): an id from a payload would
+      // overwrite whatever proposal waits under that number.
+      if (Array.isArray(payload.items)) payload.items = payload.items.map((it) => (it && typeof it === 'object' && !Array.isArray(it) ? (({ candidateId, ...rest }) => rest)(it) : it));
       const results = apply(db, payload, { actor, autonomy: options().autonomy, ownerCheck: true }).map((r) => (ignored ? { ...r, memory_dir_ignored: ignored } : r));
       // What the review noticed but could not settle yet waits for the session's next
       // review; what it settled (saved now, or shown to be a one-off) is closed.
