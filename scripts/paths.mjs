@@ -49,9 +49,32 @@ export function dataDir(explicit) {
   return explicit || process.env.CLAUDE_PLUGIN_DATA || path.join(ouroborosDir(), 'data');
 }
 
-/** Same sanitization Claude Code uses for ~/.claude/projects/<key>. */
+/**
+ * Same sanitization Claude Code uses for ~/.claude/projects/<key>. The project keys in
+ * the database are this, whatever the length; a long path's folder name under projects/
+ * is `projectDirName`.
+ */
 export function projectKey(cwd) {
   return String(cwd || '').replace(/[^a-zA-Z0-9]/g, '-');
+}
+
+/** Longest sanitized path Claude Code uses as is for a folder name under projects/. */
+const MAX_DIR_NAME = 200;
+
+/**
+ * The name of a project's folder under projects/, as Claude Code 2.1 names it: the
+ * sanitized path or, when that is longer than 200 characters, its first 200 followed by
+ * "-" and a hash of the path (Java's string hash, absolute value, base 36). Until v0.25
+ * the whole sanitized path was used, so a long path's memory was looked for in a folder
+ * Claude Code never reads.
+ */
+export function projectDirName(dir) {
+  const key = projectKey(dir);
+  if (key.length <= MAX_DIR_NAME) return key;
+  const s = String(dir);
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+  return `${key.slice(0, MAX_DIR_NAME)}-${Math.abs(h).toString(36)}`;
 }
 
 /** The nearest directory at or above `dir` with a `.git` entry (a folder, or a worktree's file). */
@@ -126,14 +149,28 @@ function expandTilde(p) {
 }
 
 /**
- * The auto-memory directory Claude Code uses for a working directory: the
+ * The directory `CLAUDE_COWORK_MEMORY_PATH_OVERRIDE` names, when it is one Claude Code
+ * accepts: an absolute path (`~` is not expanded), not a bare drive, without NUL.
+ */
+export function coworkMemoryDir(env = process.env) {
+  const v = env.CLAUDE_COWORK_MEMORY_PATH_OVERRIDE;
+  if (typeof v !== 'string' || !v || v.includes('\0') || !path.isAbsolute(v)) return null;
+  const dir = path.normalize(v).replace(/[\\/]+$/, '');
+  return dir.length < 3 || /^[A-Za-z]:$/.test(dir) ? null : dir;
+}
+
+/**
+ * The auto-memory directory Claude Code uses for a working directory:
+ * `CLAUDE_COWORK_MEMORY_PATH_OVERRIDE` when it is a valid path, else the
  * `autoMemoryDirectory` setting (local, then project, then user settings), else
- * `<config>/projects/<project>/memory` where <project> is the repository's main
+ * `<config, or CLAUDE_CODE_REMOTE_MEMORY_DIR when set>/projects/<project>/memory` where <project> is the repository's main
  * checkout (shared by its worktrees and subdirectories), `CLAUDE_CODE_PROJECT_DIR_NAME`
- * when set, or the working directory outside git.
+ * when set, or the working directory outside git, named as `projectDirName` does.
  */
 export function memoryDirFor({ memoryDir, cwd } = {}) {
   if (memoryDir) return path.resolve(expandTilde(memoryDir));
+  const override = coworkMemoryDir();
+  if (override) return override;
   const root = repoRoot(cwd) || cwd || process.cwd();
   for (const file of [
     path.join(root, '.claude', 'settings.local.json'),
@@ -143,8 +180,43 @@ export function memoryDirFor({ memoryDir, cwd } = {}) {
     const v = settingsValue(file, 'autoMemoryDirectory');
     if (typeof v === 'string' && v.trim()) return path.resolve(expandTilde(v.trim()));
   }
-  const name = process.env.CLAUDE_CODE_PROJECT_DIR_NAME || projectKey(root);
-  return path.join(claudeDir(), 'projects', name, 'memory');
+  const name = process.env.CLAUDE_CODE_PROJECT_DIR_NAME || projectDirName(root);
+  // Cloud sessions: Claude Code keeps auto memory under that directory instead of the config dir.
+  const base = process.env.CLAUDE_CODE_REMOTE_MEMORY_DIR || claudeDir();
+  return path.join(base, 'projects', name, 'memory');
+}
+
+const TRUTHY = ['1', 'true', 'yes', 'on'];
+const FALSY = ['0', 'false', 'no', 'off'];
+
+/**
+ * Whether Claude Code loads auto memory (MEMORY.md and the files it points to) in a
+ * session in `cwd`, and if not, why. The same order as Claude Code 2.1: the
+ * `CLAUDE_CODE_DISABLE_AUTO_MEMORY` variable decides when set (a falsy value forces it
+ * on); then `--bare` (`CLAUDE_CODE_SIMPLE`) and cloud sessions without a memory
+ * directory (`CLAUDE_CODE_REMOTE`) turn it off; then the `autoMemoryEnabled` setting
+ * (local, then project, then user settings). Hook processes inherit the session's
+ * environment, so a hook sees what the session sees. Managed policy settings are not read.
+ */
+export function autoMemoryStatus(cwd, env = process.env) {
+  const flag = String(env.CLAUDE_CODE_DISABLE_AUTO_MEMORY ?? '').trim().toLowerCase();
+  if (TRUTHY.includes(flag)) return { on: false, reason: 'CLAUDE_CODE_DISABLE_AUTO_MEMORY is set' };
+  if (FALSY.includes(flag)) return { on: true, reason: null };
+  if (env.CLAUDE_CODE_SIMPLE) return { on: false, reason: 'the session runs with --bare' };
+  if (env.CLAUDE_CODE_SAFE_MODE) return { on: false, reason: 'the session runs in safe mode' };
+  if (env.CLAUDE_CODE_REMOTE && !env.CLAUDE_CODE_REMOTE_MEMORY_DIR && !env.CLAUDE_COWORK_MEMORY_PATH_OVERRIDE) {
+    return { on: false, reason: 'a cloud session: CLAUDE_CODE_REMOTE is set without CLAUDE_CODE_REMOTE_MEMORY_DIR' };
+  }
+  const root = repoRoot(cwd) || cwd || process.cwd();
+  for (const file of [
+    path.join(root, '.claude', 'settings.local.json'),
+    path.join(root, '.claude', 'settings.json'),
+    path.join(claudeDir(), 'settings.json'),
+  ]) {
+    const v = settingsValue(file, 'autoMemoryEnabled');
+    if (typeof v === 'boolean') return v ? { on: true, reason: null } : { on: false, reason: `autoMemoryEnabled is false in ${file}` };
+  }
+  return { on: true, reason: null };
 }
 
 /** Forward slashes, lowercase on Windows, for path matching. */

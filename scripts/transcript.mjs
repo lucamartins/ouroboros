@@ -28,6 +28,9 @@ function textOf(content) {
 /** A prompt the human typed (not tool results, skill bodies, notifications or hook output). */
 export function isHumanPrompt(e) {
   if (!e || e.type !== 'user' || e.isMeta || e.isSidechain) return false;
+  // The summary Claude Code writes after a compaction is a user entry without `isMeta`
+  // or `origin`: model-written text that restates turns already counted and reviewed.
+  if (e.isCompactSummary || e.isVisibleInTranscriptOnly) return false;
   if (e.origin && e.origin.kind && e.origin.kind !== 'human') return false;
   const c = e.message?.content;
   if (Array.isArray(c) && c.some((x) => x?.type === 'tool_result')) return false;
@@ -199,6 +202,38 @@ export function userTurnsOfReview(entries, { reviewedAt, turnsReviewed, fromStar
   const human = entries.filter((e) => isHumanPrompt(e) && (!reviewedAt || !e.timestamp || Date.parse(e.timestamp) <= reviewedAt));
   const offset = fromStart ? 0 : Math.max(0, human.length - (turnsReviewed || 0));
   return human.slice(offset).map((e, i) => ({ n: i + 1, text: clip(textOf(e.message.content), QUOTE_CHARS) }));
+}
+
+/**
+ * Where the entries a forked session copied from its parent end: the line after the last
+ * entry timestamped before the fork started, up to the fork's first own prompt. A fork
+ * (`--fork-session`) gets a new id and a transcript that repeats the parent's entries
+ * with their uuids and timestamps but the fork's `sessionId`, so the session id cannot
+ * tell them apart and the time can. Entries without a timestamp (metadata) do not count.
+ * A copied entry may also carry `forkedFrom.sessionId` (the parent's id): the marked
+ * entries before the first human prompt that is not marked end the copy too, and need
+ * no start time, so they also serve a session Ouroboros never saw start (a backfill
+ * passes `startedAt` null). Like the time, the marker can only skip a marked prefix: if
+ * the fork's own entries were ever marked too, its first unmarked prompt still stops it.
+ */
+export function inheritedLines(entries, startedAt) {
+  let end = 0;
+  let marked = true;
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    if (marked) {
+      if (typeof e?.forkedFrom?.sessionId === 'string') end = i + 1;
+      else if (isHumanPrompt(e)) marked = false;
+    }
+    if (!startedAt) {
+      if (!marked) break;
+      continue;
+    }
+    const t = e?.timestamp ? Date.parse(e.timestamp) : NaN;
+    if (t < startedAt) end = i + 1;
+    else if (t >= startedAt && isHumanPrompt(e)) break;
+  }
+  return end;
 }
 
 /** Number of lines in a transcript (the cursor unit), or null if unreadable. */

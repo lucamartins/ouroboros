@@ -9,6 +9,9 @@
  * tests" to "do not run the tests", or a clause appended to a rule), so it is not an
  * insertion. Meant for whole texts (a file before and after an edit): on a fragment it
  * cannot see that the fragment ends in the middle of a line.
+ *
+ * Whole new lines can still change what existing text says, through the markdown
+ * structure they join; three such cases are not insertions either (`joinsExisting`).
  */
 export function isInsertion(before, after) {
   const lines = (s) => {
@@ -18,13 +21,79 @@ export function isInsertion(before, after) {
   };
   const a = lines(before);
   const b = lines(after);
+  const kept = new Array(b.length).fill(false);
   let j = 0;
   for (const line of a) {
     while (j < b.length && b[j] !== line) j++;
     if (j >= b.length) return false;
+    kept[j] = true;
     j++;
   }
-  return true;
+  return !joinsExisting(b, kept);
+}
+
+const LIST_ITEM = /^\s*(?:[-*+]|\d+[.)])\s/;
+const FENCE = /^\s*(?:```|~~~)/;
+// Lines that start a block of their own: a list item, a heading, a fence, a table row, a quote, an HTML comment.
+const OWN_BLOCK = /^\s*(?:[-*+]\s|\d+[.)]\s|#{1,6}\s|```|~~~|\||>|<!--)/;
+
+/**
+ * Whether lines added to a text (`kept[i]` false) change what lines it already had say:
+ *   - an indented line glued under an existing rule or sentence, with no marker of its
+ *     own (a continuation: "- Always deploy from main." + "  except on Fridays, when you
+ *     must never deploy" is one item to every reader);
+ *   - a line inside an existing fenced code block (a command run as part of those steps);
+ *   - a list item added to a list an existing line introduces with a colon ("Never:"),
+ *     which says what the new item means.
+ * New sections, new items at the end of an ordinary list and sub-items with their own
+ * marker remain additions. Other cases are not seen (stated limits, DESIGN §7.6): a
+ * word on its own line above a sentence, a heading above an existing list, a new parent
+ * item above existing sub-items, an unindented line right under a sentence or item
+ * (a new line in a plain-text file; markdown reads it as a lazy continuation, which
+ * `appendToSection` avoids by starting a paragraph), an indented continuation after a
+ * blank line, a lead-in that does not end in a colon ("Rules to follow").
+ */
+function joinsExisting(b, kept) {
+  const indent = (l) => /^\s*/.exec(l)[0].length;
+  // Fenced blocks: one that holds both existing and added lines was changed from inside.
+  let open = -1;
+  for (let i = 0; i <= b.length; i++) {
+    const end = i === b.length;
+    if (!end && !FENCE.test(b[i])) continue;
+    if (open < 0 && !end) { open = i; continue; }
+    if (open >= 0) {
+      const block = kept.slice(open, end ? b.length : i + 1);
+      if (block.includes(true) && block.includes(false)) return true;
+      open = -1;
+    }
+  }
+  for (let i = 0; i < b.length; i++) {
+    if (kept[i] || !b[i].trim()) continue;
+    if (!OWN_BLOCK.test(b[i])) {
+      // An indented continuation: the text block it joins starts at an existing line.
+      // (An unindented line under a sentence or item reads as a new line in a plain-text
+      // file and stays an addition: a stated limit. The append path does not produce one
+      // under a list item: `appendToSection` starts a paragraph of its own there.)
+      if (!/^\s/.test(b[i])) continue;
+      for (let k = i - 1; k >= 0 && b[k].trim(); k--) {
+        if (kept[k] && !/^\s*(?:#{1,6}\s|```|~~~|\||<!--)/.test(b[k])) return true;
+        if (OWN_BLOCK.test(b[k])) break;
+      }
+    } else if (LIST_ITEM.test(b[i])) {
+      // The line that introduces this item's list: its parent item, or the line above the list.
+      const own = indent(b[i]);
+      for (let k = i - 1; k >= 0; k--) {
+        const l = b[k];
+        if (!l.trim()) continue;
+        if (LIST_ITEM.test(l) && indent(l) >= own) continue;
+        if (!LIST_ITEM.test(l) && indent(l) > own) continue; // a continuation line of an item above
+        // "Never:", "**Never:**", "_Never:_", "`Never:`": the colon may sit inside the emphasis.
+        if (kept[k] && !/^\s*#{1,6}\s/.test(l) && l.replace(/[\s*_`]+$/, '').endsWith(':')) return true;
+        break;
+      }
+    }
+  }
+  return false;
 }
 
 /** Lines of `after` that `before` does not have (multiset difference): what a change adds. */

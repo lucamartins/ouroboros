@@ -491,6 +491,7 @@ function createSkill(db, batch, item, settings) {
 
 function createPreference(db, batch, item, settings) {
   if (item.invalid) return { status: 'rejected', reason: item.invalid };
+  if (containsSecret(item.prefText, item.title, item.description)) return { status: 'rejected', reason: 'looks like it contains a secret (token, key or password); never store secrets' };
   const topicTitle = String(item.topic).replace(/\s+/g, ' ').trim();
   const id = newId();
   const line = /^[-*]\s/.test(item.prefText) ? item.prefText : `- ${item.prefText}`;
@@ -524,16 +525,24 @@ export function createdByOuroboros(db, file) {
 }
 
 /**
- * Whether a memory is still exactly what Ouroboros wrote: it created the file, and the
- * file's text is the result of its own last write (the user never edited it by hand).
- * Refining such a memory is Ouroboros rewriting its own words, not the user's, so in
- * `auto` it needs no approval; one hand edit and the file is the user's again.
+ * Whether a memory is still exactly what Ouroboros wrote: it created the file, every
+ * later write of its started from what the previous one left, and the file is what the
+ * last one left (the user never edited it by hand). Refining such a memory is Ouroboros
+ * rewriting its own words, not the user's, so in `auto` it needs no approval; one hand
+ * edit and the file is the user's again, for good. (Until v0.25 only the last write was
+ * compared with the file, so an Ouroboros addition on top of a hand edit made the file
+ * "untouched" again, and the next correction rewrote the user's line without asking.)
  */
 export function ownUntouched(db, file) {
   const target = path.resolve(String(file));
   if (knowledgeKind(target) !== 'memory' || !createdByOuroboros(db, target)) return false;
-  const last = db.prepare('SELECT after FROM writes WHERE lower(file) = lower(?) AND reverted_at IS NULL ORDER BY id DESC LIMIT 1').get(target);
-  return !!last && last.after !== null && last.after === readOrNull(target);
+  const all = db.prepare('SELECT before, after FROM writes WHERE lower(file) = lower(?) AND reverted_at IS NULL ORDER BY id').all(target);
+  // This file's history starts with the write that created it (an earlier file of the same name is gone).
+  const writes = all.slice(Math.max(0, all.findLastIndex((w) => w.before === null)));
+  if (!writes.length || writes[0].before !== null) return false;
+  for (let i = 1; i < writes.length; i++) if (writes[i].before !== writes[i - 1].after) return false;
+  const last = writes[writes.length - 1];
+  return last.after !== null && last.after === readOrNull(target);
 }
 
 /** Resolve the file a patch targets: learning id, a knowledge file path, or a name. */
@@ -594,7 +603,12 @@ export function appendToSection(text, section, addition) {
   const block = bullet !== null && !/^\s*[-*]\s/.test(add) ? `${bullet}- ${add}` : add;
   // A blank line after a heading (and before text added at the end of a file without a final newline).
   const prev = end > 0 ? lines[end - 1] : '';
-  const insert = /^#{1,6}\s/.test(prev) || (start < 0 && lines[lines.length - 1] !== '') ? ['', block] : [block];
+  // Plain text directly under a list item would be read as a continuation of that item
+  // (the text is trimmed, so "  except on Fridays" arrives unindented): it starts a paragraph of its own.
+  let item = end - 1;
+  while (item >= 0 && lines[item].trim() && !/^\s*(?:[-*+]|\d+[.)])\s/.test(lines[item])) item--;
+  const glued = !/^\s*(?:[-*+]\s|\d+[.)]\s|#{1,6}\s|```|~~~|\||>|<!--)/.test(block) && item >= 0 && item < end && !!lines[item].trim() && /^\s*(?:[-*+]|\d+[.)])\s/.test(lines[item]);
+  const insert = /^#{1,6}\s/.test(prev) || glued || (start < 0 && lines[lines.length - 1] !== '') ? ['', block] : [block];
   lines.splice(end, 0, ...insert);
   return lines.join(eol);
 }
@@ -782,11 +796,12 @@ function runItem(db, item, settings, payload, actor, { dryRun = false } = {}) {
     if (dryRun) {
       db.exec('ROLLBACK');
       batch.rollback();
-    } else {
-      batch.commit();
-      db.exec('COMMIT');
+      return result;
     }
-    return result;
+    batch.commit();
+    db.exec('COMMIT');
+    // The ledger batch of what was written (undo, and the stand-ins it retires: `retireInterim`).
+    return ['created', 'patched'].includes(result.status) ? { ...result, batch: batch.id } : result;
   } catch (err) {
     try { db.exec('ROLLBACK'); } catch { /* not in a transaction */ }
     batch.rollback();
@@ -812,20 +827,26 @@ function enqueue(db, rawItem, payload, actor) {
   });
   const dup = item.op === 'create' ? findSimilar(waiting.filter((w) => w.op !== 'patch'), keyText(item)) : null;
   if (dup) {
+    // The memories standing in for the waiting proposal stay registered with it.
+    const was = candidatePayload(db, dup.id);
+    const kept = was.interim ? JSON.stringify({ ...JSON.parse(stored), interim: was.interim, interims: was.interims }) : stored;
     db.prepare(`
       UPDATE candidates SET title = ?, summary = ?, evidence = ?, confidence = MAX(COALESCE(confidence, 0), ?), payload = ?, cwd = ?, session_id = ?, ts = ?
       WHERE id = ?`).run(
       String(item.title || item.text || '').slice(0, 200), String(item.text || item.body || item.description || '').slice(0, 1500),
-      String(item.evidence || '').slice(0, 800), item.confidence, stored, payload.cwd || null, payload.session_id || actor, Date.now(), dup.id);
-    if (candidateId) db.prepare("UPDATE candidates SET outcome = 'merged', note = ?, decided_at = ? WHERE id = ?").run(`merged into #${dup.id}: a similar proposal was already waiting`, Date.now(), candidateId);
+      String(item.evidence || '').slice(0, 800), item.confidence, kept, payload.cwd || null, payload.session_id || actor, Date.now(), dup.id);
+    if (candidateId) db.prepare("UPDATE candidates SET outcome = 'merged', note = ?, decided_at = ? WHERE id = ? AND outcome IN ('pending', 'queued')").run(`merged into #${dup.id}: a similar proposal was already waiting`, Date.now(), candidateId);
     return { id: dup.id, replaced: true };
   }
   if (candidateId) {
-    db.prepare(`
+    // Only a row nobody has decided: a rejection or an approval that landed while this
+    // proposal was being prepared stays what it is.
+    const r = db.prepare(`
       UPDATE candidates SET kind = ?, scope = ?, memory_type = ?, title = ?, summary = ?, confidence = ?, outcome = 'queued', payload = ?, cwd = COALESCE(cwd, ?)
-      WHERE id = ?`).run(item.kind, item.scope, item.memory_type ?? null,
+      WHERE id = ? AND outcome IN ('pending', 'queued')`).run(item.kind, item.scope, item.memory_type ?? null,
       String(item.title || item.text || '').slice(0, 200), String(item.text || item.body || item.description || '').slice(0, 1500),
       item.confidence, stored, payload.cwd || null, candidateId);
+    if (!r.changes) return { id: candidateId, replaced: false, decided: true };
     return { id: candidateId, replaced: false };
   }
   const r = db.prepare(`
@@ -846,7 +867,7 @@ export function apply(db, payload, { actor = 'manual', autonomy = 'auto', ownerC
   for (const raw of items) {
     const normalized = normalizeItem(raw, payload || {});
     const item = promote ? promoteToGlobal(normalized, payload || {}) : normalized;
-    if (containsSecret(item.title, item.description, item.body, item.text, item.new)) {
+    if (containsSecret(item.title, item.description, item.body, item.text, item.new, item.append, item.prefText, item.globalFact)) {
       results.push({ status: 'rejected', title: item.title, reason: 'looks like it contains a secret (token, key or password); never store secrets' });
       continue;
     }
@@ -907,7 +928,12 @@ export function apply(db, payload, { actor = 'manual', autonomy = 'auto', ownerC
         const same = pending && findSimilar(claimsOf(db, pending.id).map((c) => ({ id: c.id, text: String(c.claim || c.summary || '').replace(/^[-*]s+/, '') })), item.globalFact);
         if (same) {
           db.prepare('UPDATE candidates SET confidence = MAX(COALESCE(confidence, 0), ?), session_id = ?, ts = ? WHERE id = ?').run(item.confidence, payload?.session_id || actor, Date.now(), same.id);
-          results.push({ status: 'queued', title: item.title, candidateId: same.id, changesetId: pending.id, replaced: true, reason: 'merged with a similar proposal already waiting for approval' });
+          const meanwhile = item.promoted ? keepPromotedHere(db, same.id, normalized, payload || {}, actor, autonomy) : null;
+          results.push({
+            status: 'queued', title: item.title, candidateId: same.id, changesetId: pending.id, replaced: true,
+            reason: `merged with a similar proposal already waiting for approval${meanwhile ? '. Active now as a project memory until you decide' : ''}`,
+            ...(meanwhile ? { meanwhile: meanwhile.path } : {}),
+          });
           continue;
         }
         // A change to an existing file joins that file's pending changeset.
@@ -915,7 +941,7 @@ export function apply(db, payload, { actor = 'manual', autonomy = 'auto', ownerC
         // Learn now, promote on approval: an addition to a project's CLAUDE.md or rule
         // file is active at once as a project memory while the change waits.
         const added = item.corrects ? '' : item.append !== undefined ? String(item.append) : addedText(String(item.old ?? ''), String(item.new ?? ''));
-        const meanwhile = added.trim() ? learnMeanwhile(db, {
+        const meanwhile = item.promoted ? keepPromotedHere(db, q.id, normalized, payload || {}, actor, autonomy) : added.trim() ? learnMeanwhile(db, {
           candidateId: q.id, file: item.target, title: item.title, claim: added, evidence: item.why || item.evidence,
           cwd: item.projectDir, confidence: item.confidence, sessionId: payload?.session_id, actor, autonomy,
         }) : null;
@@ -927,9 +953,16 @@ export function apply(db, payload, { actor = 'manual', autonomy = 'auto', ownerC
         continue;
       }
       const q = enqueue(db, item, payload || {}, actor);
+      if (q.decided) {
+        results.push({ status: 'decided', title: item.title || item.text, candidateId: q.id, reason: 'this proposal was decided meanwhile; nothing was queued' });
+        continue;
+      }
+      // A rule promoted to the global CLAUDE.md is active in this project while it waits.
+      const meanwhile = item.promoted ? keepPromotedHere(db, q.id, normalized, payload || {}, actor, autonomy) : null;
       results.push({
         status: 'queued', title: item.title || item.text, candidateId: q.id, replaced: q.replaced,
-        reason: q.replaced ? 'merged with a similar proposal already waiting for approval' : waitReason(item, actor, autonomy),
+        reason: `${q.replaced ? 'merged with a similar proposal already waiting for approval' : waitReason(item, actor, autonomy)}${meanwhile ? '. Active now as a project memory until you decide' : ''}`,
+        ...(meanwhile ? { meanwhile: meanwhile.path } : {}),
       });
       continue;
     }
@@ -1006,7 +1039,9 @@ export function syncInterim(db, learningId, file) {
   const said = interimText(file);
   if (!said) return 0;
   let n = 0;
-  for (const c of db.prepare("SELECT id, changeset_id, claim, payload FROM candidates WHERE outcome = 'queued' AND payload LIKE ?").all(`%"interim":"${learningId}"%`)) {
+  // Only changes to a file (changesets): a promoted global fact waits as its stored item,
+  // which this cannot recompose, and its card must keep showing what approval writes.
+  for (const c of db.prepare("SELECT id, changeset_id, claim, payload FROM candidates WHERE outcome = 'queued' AND changeset_id IS NOT NULL AND payload LIKE ?").all(`%"interim":"${learningId}"%`)) {
     if (String(c.claim || '').trim() === said) continue;
     db.prepare('UPDATE candidates SET claim = ?, summary = ? WHERE id = ?').run(said.slice(0, 2000), said.slice(0, 1500), c.id);
     if (c.changeset_id) db.prepare("UPDATE changesets SET status = 'stale', note = ? WHERE id = ? AND status = 'pending'").run('the memory standing in for one of its learnings was refined; composing again', c.changeset_id);
@@ -1015,12 +1050,72 @@ export function syncInterim(db, learningId, file) {
   return n;
 }
 
-/** Retire the stand-in memory of a candidate (its line was written, or the claim turned out wrong). */
-export function retireInterim(db, candidateId) {
+/**
+ * Retire the stand-in memory of a candidate (its line was written, or the claim turned out
+ * wrong). The ones retired are remembered on the candidate (`retired`), each with the
+ * ledger batch that wrote the line (`batch`, none when the claim was dropped), so that
+ * undoing that very write brings them back (`restoreRetired`): otherwise the rule is in
+ * neither place.
+ */
+export function retireInterim(db, candidateId, batch = null) {
+  const retired = [];
+  // A promoted rule can have one stand-in per project that learned it while it waited.
+  for (const id of candidatePayload(db, candidateId).interims || []) {
+    if (db.prepare("SELECT 1 FROM learnings WHERE id = ? AND status = 'active'").get(id) && forget(db, { match: id }).status === 'archived') retired.push(id);
+  }
   const l = interimOf(db, candidateId);
-  if (!l) return null;
-  const r = forget(db, { match: l.id });
-  return r.status === 'archived' ? l.id : null;
+  if (l && forget(db, { match: l.id }).status === 'archived') retired.push(l.id);
+  if (retired.length) {
+    const p = candidatePayload(db, candidateId);
+    db.prepare('UPDATE candidates SET payload = ? WHERE id = ?').run(JSON.stringify({ ...p, retired: [...(p.retired || []), ...retired.map((id) => ({ id, batch }))] }), candidateId);
+  }
+  return retired.length ? retired[retired.length - 1] : null;
+}
+
+/**
+ * Bring back the stand-in memories that the write of `batch` retired. Only those: two
+ * approved changes to the same file share its learning, and undoing the second must not
+ * bring back the first one's stand-in, whose line is still in the file. (Entries recorded
+ * before v0.25 carry no batch: they belong to their candidate's changeset.)
+ */
+function restoreRetired(db, { batch }) {
+  const rows = db.prepare(`SELECT c.id, c.payload, cs.batch AS cs_batch FROM candidates c LEFT JOIN changesets cs ON cs.id = c.changeset_id
+    WHERE c.payload LIKE '%"retired":[%'`).all();
+  const restored = [];
+  for (const c of rows) {
+    const p = candidatePayload(db, c.id);
+    const left = [];
+    let touched = false;
+    for (const e of p.retired || []) {
+      const { id, batch: by } = typeof e === 'string' ? { id: e, batch: c.cs_batch } : e;
+      if (!by || by !== batch) { left.push(e); continue; }
+      touched = true;
+      // The archive batch is the learning's latest write unless something touched it since.
+      const l = db.prepare('SELECT status FROM learnings WHERE id = ?').get(id);
+      if (l?.status === 'archived' && undo(db, { id }).status === 'undone') restored.push(id);
+      else left.push(e);
+    }
+    if (touched) db.prepare('UPDATE candidates SET payload = ? WHERE id = ?').run(JSON.stringify({ ...p, retired: left }), c.id);
+  }
+  return restored;
+}
+
+/**
+ * A rule a second project learns is promoted to a line for the global CLAUDE.md
+ * (`promoteToGlobal`), and that line waits for the user. Until v0.25 nothing was active
+ * in the second project meanwhile: the rule worked where it was first learned and was
+ * unknown where it was learned again. Now the project memory is saved as well, under the
+ * same autonomy rules as any new memory, and stands in for the waiting change as for a
+ * project's CLAUDE.md (`learnMeanwhile`): approving retires it, rejecting keeps it.
+ */
+function keepPromotedHere(db, candidateId, original, payload, actor, autonomy) {
+  if (needsApproval(original, actor, autonomy)) return null;
+  const [r] = apply(db, { ...payload, items: [{ ...original, project_dir: original.projectDir }] }, { actor, autonomy, promote: false });
+  if (r?.status !== 'created') return null;
+  const p = candidatePayload(db, candidateId);
+  const next = p.interim ? { ...p, interims: [...(p.interims || []), r.id] } : { ...p, interim: r.id };
+  db.prepare('UPDATE candidates SET payload = ? WHERE id = ?').run(JSON.stringify(next), candidateId);
+  return { id: r.id, path: r.path };
 }
 
 // ---------- approval queue and confirmation ----------
@@ -1043,9 +1138,31 @@ export function decideQueued(db, candidateId, approve) {
     return { status: 'rejected_by_user', title: c.title };
   }
   const p = JSON.parse(c.payload || '{}');
-  const [result] = apply(db, { cwd: p.cwd, memory_dir: p.memory_dir, trigger: p.trigger, session_id: c.session_id, items: [p.item] }, { actor: 'manual' });
+  // An approval writes what the card showed: a project memory is not turned into a line
+  // for the global CLAUDE.md here because another project saved something similar
+  // meanwhile (until v0.25 it was, and the user's "yes" created that file).
+  const [result] = apply(db, { cwd: p.cwd, memory_dir: p.memory_dir, trigger: p.trigger, session_id: c.session_id, items: [p.item] }, { actor: 'manual', promote: false });
+  const written = result.status === 'created' || result.status === 'patched';
+  // The same thing was saved meanwhile: the approval is settled (it was already saved), so
+  // the entry leaves the inbox instead of being retried by every "Approve all".
+  if (result.status === 'duplicate') {
+    const where = result.target ? ` (${result.target})` : '';
+    db.prepare("UPDATE candidates SET outcome = 'approved_duplicate', decided_at = ?, note = ? WHERE id = ?")
+      .run(Date.now(), `approved, but it was already saved${where}`, candidateId);
+    return { ...result, reason: `it was already saved${where}, so nothing new was written; the entry left the inbox` };
+  }
+  // An approval that wrote nothing else (the memory index is full, an error) decides
+  // nothing: the entry keeps waiting, with the reason in the answer.
+  if (!written) {
+    const why = result.status === 'over_budget' ? `${result.reason}; it is still in the inbox: approve it again once there is room`
+      : result.status === 'error' ? `${result.reason || 'unknown error'}; it is still in the inbox: approve it again later`
+        : `${result.reason || `nothing was written (${result.status})`}; it is still in the inbox`;
+    return { ...result, reason: why };
+  }
   db.prepare('UPDATE candidates SET outcome = ?, learning_id = ?, decided_at = ? WHERE id = ?')
-    .run(result.status === 'created' || result.status === 'patched' ? result.status : `approved_${result.status}`, result.id || null, Date.now(), candidateId);
+    .run(result.status, result.id || null, Date.now(), candidateId);
+  // A promoted rule had a project memory standing in for it: the line is in place now.
+  retireInterim(db, candidateId, result.batch);
   return result;
 }
 
@@ -1110,7 +1227,9 @@ export function undo(db, { id, last, batch } = {}) {
     if (status) db.prepare('UPDATE learnings SET status = ?, updated_at = ? WHERE id = ?').run(status, now, learningId);
   }
   const l = learningId ? db.prepare('SELECT title, kind FROM learnings WHERE id = ?').get(learningId) : null;
-  return { status: 'undone', id: learningId, title: l?.title, kind: l?.kind, op: [...ops].join(','), files: writes.map((w) => w.file) };
+  // Undoing the write that retired no stand-in itself, but one that did: the memories come back.
+  const restored = ops.has('archive') ? [] : restoreRetired(db, { batch: batchRow.batch });
+  return { status: 'undone', id: learningId, title: l?.title, kind: l?.kind, op: [...ops].join(','), files: writes.map((w) => w.file), ...(restored.length ? { restored } : {}) };
 }
 
 export function findLearnings(db, match) {
@@ -1150,12 +1269,12 @@ export function forget(db, { match }) {
     if (l.kind === 'rules') {
       const content = readOrNull(l.path);
       if (content === null) throw new Error(`file not found: ${l.path}`);
-      batch.write(path.join(archiveDir, `${today()}-${path.basename(l.path)}`), content, { learningId: l.id, op: 'archive' });
+      batch.write(path.join(archiveDir, `${today()}-${l.id}-${path.basename(l.path)}`), content, { learningId: l.id, op: 'archive' });
       batch.write(l.path, null, { learningId: l.id, op: 'archive' });
     } else if (l.kind === 'memory') {
       const content = readOrNull(l.path);
       if (content === null) throw new Error(`file not found: ${l.path}`);
-      batch.write(path.join(archiveDir, `${today()}-${path.basename(l.path)}`), content, { learningId: l.id, op: 'archive' });
+      batch.write(path.join(archiveDir, `${today()}-${l.id}-${path.basename(l.path)}`), content, { learningId: l.id, op: 'archive' });
       batch.write(l.path, null, { learningId: l.id, op: 'archive' });
       const indexFile = path.join(path.dirname(l.path), 'MEMORY.md');
       const idx = readOrNull(indexFile);
@@ -1165,7 +1284,7 @@ export function forget(db, { match }) {
       const others = safeList(dir).filter((f) => f !== 'SKILL.md');
       if (others.length) throw new Error(`skill folder has other files (${others.join(', ')}); remove it by hand`);
       const content = readOrNull(l.path);
-      batch.write(path.join(archiveDir, `${today()}-${path.basename(dir)}-SKILL.md`), content, { learningId: l.id, op: 'archive' });
+      batch.write(path.join(archiveDir, `${today()}-${l.id}-${path.basename(dir)}-SKILL.md`), content, { learningId: l.id, op: 'archive' });
       batch.write(l.path, null, { learningId: l.id, op: 'archive' });
       const link = db.prepare("SELECT file FROM writes WHERE learning_id = ? AND after LIKE '@link:%' AND reverted_at IS NULL").get(l.id);
       if (link && readLinkOrFile(link.file)) batch.write(link.file, null, { learningId: l.id, op: 'archive' });
@@ -1306,6 +1425,24 @@ export function summarize(results) {
   return results.map((r) => `${icon[r.status] || r.status}: ${r.title || ''}${r.reason ? ` — ${r.reason}` : ''}${r.warning ? ` (${r.warning})` : ''}${r.path ? ` → ${r.path}` : ''}`).join('\n');
 }
 
+/**
+ * The `memory_dir` of a payload Claude wrote, kept only when it is the directory
+ * `memoryDirFor` computes for the payload's own project. Anything else is ignored in
+ * favour of the computed one (a memory attributed to one project cannot be written into
+ * another project's memory folder, which was accepted until v0.25 when it looked like a
+ * `memory` folder under `<claude dir>/projects/`). Until v0.25 it was also taken as given, and
+ * `curator.mjs apply` (which the `learn` skill pre-approves) wrote a "memory" into
+ * `~/.claude/rules` or a project's `.claude/rules` with no approval, in every autonomy
+ * mode. Returns { memoryDir, ignored }.
+ */
+export function checkedMemoryDir(payload) {
+  const given = typeof payload?.memory_dir === 'string' ? payload.memory_dir.trim() : '';
+  if (!given) return { memoryDir: undefined, ignored: null };
+  const dir = normalize(path.resolve(expandHome(given))).replace(/\/+$/, '');
+  const computed = normalize(memoryDirFor({ cwd: payload.cwd || process.cwd() })).replace(/\/+$/, '');
+  return dir === computed ? { memoryDir: given, ignored: null } : { memoryDir: undefined, ignored: given };
+}
+
 // ---------- CLI ----------
 
 function parseArgs(argv) {
@@ -1349,7 +1486,15 @@ async function main() {
       // in the session) is a request, not a decision: only the inbox and the dashboard,
       // which call `apply` in-process, act as the user.
       const actor = ['inloop', 'background'].includes(payload.actor) ? payload.actor : 'requested';
-      const results = apply(db, payload, { actor, autonomy: options().autonomy, ownerCheck: true });
+      // The memory directory is Claude's word too: only an auto-memory directory is kept
+      // (and only a clean payload is stored with what waits for approval).
+      const { memoryDir, ignored } = checkedMemoryDir(payload);
+      payload.memory_dir = memoryDir;
+      if (ignored) console.log(`⚠ memory_dir ignored: ${ignored} is not a Claude Code auto-memory directory; memories go to ${memoryDirFor({ cwd: payload.cwd || process.cwd() })}`);
+      // A candidate row is the evaluation's own (in-process): an id from a payload would
+      // overwrite whatever proposal waits under that number.
+      if (Array.isArray(payload.items)) payload.items = payload.items.map((it) => (it && typeof it === 'object' && !Array.isArray(it) ? (({ candidateId, ...rest }) => rest)(it) : it));
+      const results = apply(db, payload, { actor, autonomy: options().autonomy, ownerCheck: true }).map((r) => (ignored ? { ...r, memory_dir_ignored: ignored } : r));
       // What the review noticed but could not settle yet waits for the session's next
       // review; what it settled (saved now, or shown to be a one-off) is closed.
       const sid = /^[\w-]{8,}$/.test(String(payload.session_id || '')) ? payload.session_id : null;

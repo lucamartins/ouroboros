@@ -269,6 +269,21 @@ function waitedBecause({ corrects, file, kind, confidence, autonomy, backfill })
   return `your autonomy setting (${autonomy || 'auto'})`;
 }
 
+/** A learning the editor or the knowledge check could not handle waits for that reason, whatever the autonomy. */
+function unhandledReason(note, item = {}) {
+  const n = String(note || '').trim();
+  const separate = `approving saves it as a separate ${item.kind === 'skill' ? 'skill' : item.kind === 'preference' ? 'preference' : 'memory'}, not in that file`;
+  // A route whose owner could not be resolved (evaluate: "the knowledge check sent it to X, ...").
+  const owner = /^the knowledge check sent it to (.+?), (?:which is not a file|.*nothing was created, you decide)/i.exec(n);
+  if (owner) return `its topic has an owner Ouroboros could not pick (the knowledge check named ${owner[1]}), so nothing was created and you decide; ${separate}`;
+  const restored = /^you restored it, but (.+); nothing was written, you decide/i.exec(n);
+  if (restored) return `you restored it, but ${restored[1]}; nothing was written and you decide; ${separate}`;
+  if (/^the editor of .* gave no verdict/i.test(n)) return 'the editor of its file gave no verdict, so nothing was written and you decide';
+  if (/^the change to .* could not be composed/i.test(n)) return 'the change to its file could not be composed, so nothing was written and you decide';
+  if (/^the knowledge check (failed|gave no verdict)/i.test(n)) return 'the knowledge check could not be completed, so nothing was written and you decide';
+  return null;
+}
+
 function editorNote(note) {
   // "adds to C:\x\SKILL.md: reason" -> "reason" (a drive letter's colon is not the separator)
   return note ? oneLine(String(note)
@@ -373,6 +388,8 @@ export function showEntry(db, key, { project } = {}) {
     : item.kind === 'preference' ? `a preference about "${item.topic || ''}"${item.paths?.length ? ` (loaded with ${[].concat(item.paths).join(', ')})` : ' (loaded when the topic comes up)'}`
       : item.kind === 'skill' ? `a new ${item.scope === 'global' ? 'global ' : ''}skill${item.name ? ` "${item.name}"` : ''}${item.scope === 'global' ? '' : ` of project ${path.basename(projectDir || '')}`}`
       : `a new ${item.memory_type ? `${item.memory_type} ` : ''}memory of project ${path.basename(projectDir || '')} (${shortPath(memoryDirFor({ cwd: projectDir }))})`;
+  const standIns = [p.interim, ...(Array.isArray(p.interims) ? p.interims : [])].filter(Boolean)
+    .map((id) => db.prepare("SELECT * FROM learnings WHERE id = ? AND status = 'active'").get(id)).filter(Boolean);
   const content = [
     item.name ? `name: ${item.name}` : null,
     `title: ${item.title || c.title}`,
@@ -386,7 +403,8 @@ export function showEntry(db, key, { project } = {}) {
     `Lands in: ${lands}`,
     `From: ${originOf(c)}`,
     ...evidence,
-    `Waited because: ${waitedBecause({ corrects: item.corrects, file: item.op === 'patch' ? item.target : null, kind: item.kind, confidence: c.confidence ?? item.confidence, autonomy: p.autonomy || currentAutonomy(), backfill: fromBackfill(db, c) })}`,
+    `Waited because: ${unhandledReason(c.note, item) || waitedBecause({ corrects: item.corrects, file: item.op === 'patch' ? item.target : null, kind: item.kind, confidence: c.confidence ?? item.confidence, autonomy: p.autonomy || currentAutonomy(), backfill: fromBackfill(db, c) })}`,
+    standIns.length ? `Meanwhile: already active as a project memory (${standIns.map((l) => shortPath(l.path)).join(', ')}). Approving writes the line here and retires ${standIns.length > 1 ? 'them' : 'it'}; rejecting keeps ${standIns.length > 1 ? 'them' : 'the memory'}.` : null,
     c.triaged_at ? null : 'Not checked against existing knowledge yet: look for duplicates before approving.',
     c.note ? `Note: ${oneLine(c.note, 400)}` : null,
     '',
@@ -408,9 +426,22 @@ export function approve(db, key) {
   if (!k) return { status: 'not_found', reason: `unknown key ${key}` };
   if (k.type === 'cs') {
     if (getChangeset(db, k.id)?.status === 'stale') return { status: 'stale', reason: 'the file changed since this was composed: edit it against the current file, or let the editor compose it again' };
+    if (getChangeset(db, k.id)?.status === 'pending' && !claimsOf(db, k.id).length) {
+      // Every learning of it was decided elsewhere: writing would save lines nobody approved.
+      rejectChangeset(db, k.id);
+      return { status: 'invalid', reason: 'no learning of this change is waiting any more: it was closed without writing' };
+    }
     return applyChangeset(db, k.id, { actor: 'manual' });
   }
-  if (k.type === 'it') return decideQueued(db, k.id, true);
+  if (k.type === 'it') {
+    // A learning folded into a change since it was shown: approving the key must not
+    // approve the whole change. Say where it went; the user looks at the change.
+    const c = db.prepare("SELECT changeset_id FROM candidates WHERE id = ? AND outcome = 'queued'").get(k.id);
+    // A change that is closed has no card to look at: pointing there would be a dead end.
+    if (c?.changeset_id && !['pending', 'stale'].includes(getChangeset(db, c.changeset_id)?.status)) return { status: 'not_found', reason: `the change cs:${c.changeset_id} this learning belonged to is closed, so there is nothing to approve: reject the learning to clear it` };
+    if (c?.changeset_id) return { status: 'changed', key: `cs:${c.changeset_id}`, changeset: c.changeset_id, reason: `this learning is now part of change cs:${c.changeset_id}: look at that change and approve it as a whole` };
+    return decideQueued(db, k.id, true);
+  }
   if (k.type === 'cf') return { status: 'invalid', reason: 'a conflict is settled with resolve (keep or new)' };
   return { status: 'invalid', reason: 'a suggested fix is made in the project, then marked done or dismissed' };
 }
@@ -464,15 +495,17 @@ export function editAndApprove(db, key, { edits, drop = [], item, replace = fals
   if (k.type === 'cs') {
     const cs = getChangeset(db, k.id);
     if (!cs || !['pending', 'stale'].includes(cs.status)) return { status: 'not_found', reason: 'no pending change with that id' };
+    if (!Array.isArray(drop)) return { status: 'invalid', reason: 'drop must be a list of learning ids' };
     const t = tryEdits(cs.file, edits);
     if (t.error) return { status: 'invalid', reason: t.error };
     const now = Date.now();
     const dropped = new Set(drop.map(Number));
+    // Validate before changing anything: a refused call leaves the change as it was.
+    if (!claimsOf(db, k.id).some((c) => !dropped.has(c.id))) return { status: 'invalid', reason: 'every learning of this change was dropped: reject it instead' };
     for (const c of claimsOf(db, k.id)) {
       if (!dropped.has(c.id)) continue;
       db.prepare("UPDATE candidates SET outcome = 'rejected_by_user', decided_at = ? WHERE id = ?").run(now, c.id);
     }
-    if (!claimsOf(db, k.id).length) return { status: 'invalid', reason: 'every learning of this change was dropped: reject it instead' };
     for (const c of claimsOf(db, k.id)) note(db, c.id, reason || 'edited before approving');
     db.prepare("UPDATE changesets SET edits = ?, base_hash = ?, corrects = ?, status = 'pending', note = ? WHERE id = ?")
       .run(JSON.stringify(t.applied), hashText(t.current), t.applied.some((e) => e.corrects) ? 1 : 0, 'edited by you before approving', k.id);
@@ -505,7 +538,9 @@ export function resolveConflict(db, key, choice, { edits, reason } = {}) {
   const k = parseKey(key);
   const c = k?.type === 'cf' || k?.type === 'it' ? db.prepare("SELECT * FROM candidates WHERE id = ? AND outcome = 'conflict'").get(k.id) : null;
   if (!c) return { status: 'not_found', reason: 'no conflict waiting with that id' };
-  if (choice !== 'new') {
+  const pick = String(choice ?? '').trim().toLowerCase();
+  if (pick !== 'new' && pick !== 'keep') return { status: 'invalid', reason: 'the choice is "new" or "keep"' };
+  if (pick === 'keep') {
     note(db, c.id, reason);
     db.prepare("UPDATE candidates SET outcome = 'rejected_by_user', decided_at = ? WHERE id = ?").run(Date.now(), c.id);
     return { status: 'rejected_by_user', title: c.title };

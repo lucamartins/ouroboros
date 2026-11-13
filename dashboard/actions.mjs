@@ -33,9 +33,15 @@ export async function runAction(db, action, id, api) {
       return r.status === 'done' ? { status: 'done', ...summed(r) } : r;
     }
     case 'restore': {
+      // The restore is remembered in the payload: the next queue check must not screen the
+      // proposal away again (it is treated like a confirmed conflict).
+      const row = db.prepare("SELECT payload FROM candidates WHERE id = ? AND outcome IN ('dropped', 'merged', 'suggested', 'duplicate')").get(Number(id));
+      if (!row) return { status: 'not_found' };
+      let payload = {};
+      try { payload = JSON.parse(row.payload || '{}'); } catch { /* ignore */ }
       const r = db.prepare(`
-        UPDATE candidates SET outcome = 'queued', decided_at = NULL, triaged_at = NULL, changeset_id = NULL, note = COALESCE(note, '') || ' (restored by you)'
-        WHERE id = ? AND outcome IN ('dropped', 'merged', 'suggested', 'duplicate')`).run(Number(id));
+        UPDATE candidates SET outcome = 'queued', decided_at = NULL, triaged_at = NULL, changeset_id = NULL, note = COALESCE(note, '') || ' (restored by you)', payload = ?
+        WHERE id = ? AND outcome IN ('dropped', 'merged', 'suggested', 'duplicate')`).run(JSON.stringify({ ...payload, restored: true }), Number(id));
       return r.changes ? { status: 'restored' } : { status: 'not_found' };
     }
     case 'resolve_conflict': {
@@ -77,14 +83,22 @@ export async function runAction(db, action, id, api) {
     case 'reject_many': {
       const f = id && typeof id === 'object' && !Array.isArray(id) ? id : null;
       if (!f || !api?.inboxKeys) return { status: 'invalid', reason: 'a bulk decision takes a filter: { project, group }' };
-      const str = (x) => (typeof x === 'string' && x.length <= 400 ? x : null);
-      const keys = api.inboxKeys({ project: str(f.project), group: str(f.group) }, action === 'approve_many' ? 'approve' : 'reject');
-      if (Number.isInteger(f.expect) && f.expect !== keys.length) return { status: 'changed', total: keys.length, expected: f.expect };
+      // A filter that cannot be read must never widen to "the whole inbox", and the count the user
+      // confirmed is required: a bulk decision without it decides nothing. (A group id is a project
+      // key plus a file path, so it may be long.)
+      const readable = (x) => x === undefined || x === null || (typeof x === 'string' && x.length <= 4000);
+      if (!Number.isInteger(f.expect) || !readable(f.project) || !readable(f.group)) {
+        return { status: 'invalid', reason: 'a bulk decision needs the count you confirmed (expect) and a readable filter' };
+      }
+      const keys = api.inboxKeys({ project: f.project ?? null, group: f.group ?? null }, action === 'approve_many' ? 'approve' : 'reject');
+      if (f.expect !== keys.length) return { status: 'changed', total: keys.length, expected: f.expect };
       const results = keys.slice(0, MAX_BULK).map((x) => decide(db, x, action === 'approve_many'));
       const count = (st) => results.filter((r) => r.status === st).length;
       const saved = count('created') + count('patched');
       const rejected = count('rejected_by_user');
-      return { status: 'done', total: results.length, saved, rejected, other: results.length - saved - rejected };
+      // An approval of something saved meanwhile is settled (already saved); the others still wait.
+      const already = count('duplicate');
+      return { status: 'done', total: results.length, saved, rejected, already, other: results.length - saved - rejected - already };
     }
     default: return null;
   }

@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { options } from './config.mjs';
 import { destinationsText } from './router.mjs';
 import { rubricText } from './rubric.mjs';
-import { isExcluded, significantRecoveries } from './hook.mjs';
+import { isExcluded, significantRecoveries, skipInherited } from './hook.mjs';
 import { logError, monthSpend, openDb } from './db.mjs';
 import { inventoryForPrompt, parseFrontmatter } from './inventory.mjs';
 import { tokenize } from './knowledge.mjs';
@@ -521,9 +521,12 @@ export async function reviewSession(db, sessionId, trigger, overrides = {}) {
   }
 
   const entries = readTranscript(session.transcript_path);
+  // A fork starts with a copy of its parent's turns: those were the parent's to review and measure.
+  const inherited = skipInherited(db, sessionId, entries);
+  if (inherited) Object.assign(session, db.prepare('SELECT review_cursor, measure_cursor FROM sessions WHERE id = ?').get(sessionId));
   // The correction rate comes from its own pass over the whole session, with learning on or off.
   if (!learnBackfill) await measureCorrections(db, session, entries, opts, trigger);
-  const fromLine = learnBackfill ? 0 : session.review_cursor || 0;
+  const fromLine = learnBackfill ? inherited : session.review_cursor || 0;
   const digest = buildDigest(entries, { fromLine, contextTurns: CONTEXT_TURNS });
   const parts = digest.chunks;
   // What the tail does not show by itself: what earlier reviews of this session did and

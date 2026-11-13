@@ -4,6 +4,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import os from 'node:os';
 import path from 'node:path';
 import { after, before, test } from 'node:test';
@@ -41,7 +42,23 @@ before(async () => {
   delete hookEnv.OUROBOROS_REVIEWER;
 });
 
-after(() => {
+// Let hook-spawned review workers finish before the temp dir goes away.
+async function settle(file) {
+  const end = Date.now() + 15_000;
+  while (Date.now() < end) {
+    try {
+      const d = new DatabaseSync(file);
+      try {
+        d.exec('PRAGMA busy_timeout = 5000');
+        if (!d.prepare("SELECT 1 FROM sessions WHERE queue_state IN ('queued', 'running')").get()) return;
+      } finally { d.close(); }
+    } catch (e) { if (!/locked|busy|unable to open/i.test(String(e?.message))) return; }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
+after(async () => {
+  await settle(path.join(tmp, 'data-hooks', 'events.db'));
   db.close();
   fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
 });

@@ -60,10 +60,21 @@ function fromEnv() {
   };
 }
 
+let inHook = false;
+
+/**
+ * Called by the hook dispatcher. Claude Code exports only the options the user set, so in
+ * a hook an absent variable means the default, not "read the snapshot": a hook that fell
+ * back to the snapshot wrote it back, and a value set once outlived its reset.
+ */
+export function optionsFromEnvOnly() {
+  inHook = true;
+}
+
 export function options() {
   const hasEnv = Object.keys(process.env).some((k) => k.startsWith('CLAUDE_PLUGIN_OPTION_'));
   const base = fromEnv();
-  if (hasEnv) return base;
+  if (hasEnv || inHook) return base;
   const snap = snapshot();
   if (!snap) return base;
   const { updatedAt, measureReview, ...rest } = snap;

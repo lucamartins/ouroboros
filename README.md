@@ -12,7 +12,7 @@ Self-learning for Claude Code. Ouroboros reviews your sessions, turns what is wo
 
 - **At session start**, Claude gets a short learning protocol: save preferences, corrections, conventions and working paths as you go, without being asked.
 - **During the session**, every 10 turns you typed (and right after a turn that found a working path: a command that failed repeatedly and then worked once it was changed, or once something else was run) Claude briefly reviews the recent turns and saves what is worth keeping. Tests that fail until the code is fixed, or a flaky command retried, do not ask for one; nor does a session whose context is very large, which is left to the end-of-session review.
-- **When the session ends**, a small isolated model call reviews whatever was not reviewed yet. What it ties to something you said is saved; a new skill it proposes, or anything it only inferred from what happened, waits for you.
+- **When the session ends**, a small isolated model call reviews whatever was not reviewed yet. What it ties to something you said is saved; a new skill it proposes, or anything it only inferred from what happened, waits for you. A session that never ran its end hook (a crash, a killed terminal) is reviewed at the next session start, once it has been idle for 6 hours.
 - **Everything goes through one curator**: checked against what your CLAUDE.md files, rules, skills and memories already say, deduplicated, routed to the file that owns the topic, budgeted and undoable. Changes to existing files and corrections wait for your approval.
 - **Daily maintenance** archives what nobody uses and consolidates what grew too big.
 - **A local dashboard** shows what was learned and why, whether corrections are going down, what it costs, and a graph of how your skills, memories and instruction files connect.
@@ -35,7 +35,7 @@ For a local checkout: `/plugin marketplace add /path/to/ouroboros`.
 | Command | What it does |
 |---|---|
 | `/ouroboros:learn [focus]` | Saves what was learned (Claude also uses it on its own) |
-| `/ouroboros:inbox [this project \| key]` | Goes through what waits for your decision in the conversation, one entry at a time: Claude shows the diff, checks it and recommends; you approve, reject, skip, or discuss and edit it before it is saved |
+| `/ouroboros:inbox [this project \| key]` | Goes through what waits for your decision in the conversation, one entry at a time: Claude shows the diff, checks it and recommends; you approve, reject, skip, or discuss and edit it before it is saved. It opens only when you type it: Claude never starts it on its own, since it can approve |
 | `/ouroboros:undo [id]` | Reverts the last (or a given) learning write |
 | `/ouroboros:forget <match>` | Archives a learning so it stops loading |
 | `/ouroboros:dashboard` | Opens the local dashboard (`http://127.0.0.1:4747`): an inbox of what waits for you, what was learned (each item with what it changed, why and from which session; undo, archive, keep), a graph of how skills, memories and instruction files connect, value, activity, cost and health |
@@ -79,9 +79,13 @@ Everything else is automatic: capture hooks record turns, tool calls, error → 
 - **Promotion:** a working rule saved in one project that shows up in another becomes a proposed addition to your global CLAUDE.md.
 - **Daily maintenance:** archives Ouroboros memories and skills unused for 60 days (unless confident), trims memory indexes and learned skills over budget, and tries again what could not be evaluated. You see what it did at the next session start.
 - **If you delete what it learned:** delete a learned memory or skill by hand (or let Claude Code tidy its own memory) and Ouroboros follows: the learning is marked as removed (*File gone* in the dashboard), leaves every count and budget, its leftover line in `MEMORY.md` is removed, and the same thing is not saved again unless you ask for it or something new comes up. Put the file back and it is active again. A project skill that is only missing because you are on another branch comes back with it, and is never treated as thrown out.
-- **Archive, never delete:** archived items move to `~/.ouroboros/archive/`; every change is undoable (`/ouroboros:undo` or the dashboard). If you edited the file since, undo reverts only the lines that change wrote and keeps your edits.
+- **Archive, never delete:** archived items move to `~/.ouroboros/archive/`; every change is undoable (`/ouroboros:undo` or the dashboard). If you edited the file since, undo reverts only the lines that change wrote and keeps your edits. Undoing an approved line brings back only the stand-in memories that approval retired.
 
 `~/.ouroboros/config.json` also takes `excludeProjects` (globs, e.g. `["**/client-*"]`): Ouroboros does nothing at all in those directories.
+
+### Auto memory must be on
+
+Project memories only help if Claude Code loads them, and it does so only while its auto memory is on. It is off with `autoMemoryEnabled: false`, `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, `--bare` and in cloud sessions, where the container is also thrown away afterwards, so nothing Ouroboros learns there outlives the session. Ouroboros checks at session start: where it is off, it tells you once per project, adds the index of the memories it saved there to the session context, and System shows a warning. Skills, rule files and your `CLAUDE.md` do not depend on it.
 
 ### Is it working? Measure it against a control
 
@@ -91,7 +95,9 @@ Everything else is automatic: capture hooks record turns, tool calls, error → 
 { "controlProjects": ["**/billing-api"] }
 ```
 
-In a control project Ouroboros only measures: it injects nothing, reviews nothing in session, and at session end counts your corrections with the same call it uses everywhere, without saving anything. The dashboard's Overview then shows corrections per 100 turns for the learning projects and for the control projects side by side, and says so while there are too few turns to compare (200 on each side). Two things to keep in mind: projects differ, so swap the control after a few weeks; and what was saved for every project (learned skills, your global CLAUDE.md) still loads in a control project, so the difference you see is that of project-level learning.
+In a control project Ouroboros only measures: it injects nothing, reviews nothing in session, and at session end counts your corrections with the same call it uses everywhere, without saving anything. The dashboard's Overview then shows corrections per 100 turns for the learning projects and for the control projects side by side, and says so while there are too few turns to compare (200 on each side).
+
+The same goes for "before and after": the Overview says "fewer" or "more" only when the 95% interval of the difference lies wholly on one side of zero, and otherwise that no difference can be told yet. It needs a baseline of 200 reviewed turns from before learning turned on (`/ouroboros:backfill measure` builds one from past sessions). The interval is approximate, because corrections cluster by session. Compaction summaries, forked sessions' inherited turns and control sessions are not counted. Two things to keep in mind: projects differ, so swap the control after a few weeks; and what was saved for every project (learned skills, your global CLAUDE.md) still loads in a control project, so the difference you see is that of project-level learning.
 
 ## Options
 

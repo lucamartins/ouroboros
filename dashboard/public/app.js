@@ -24,8 +24,7 @@ const tabsEl = document.querySelector('.tabs');
 /** Rows per page of a list, and per group of the inbox before "Load more". */
 const PAGE = 50;
 const INBOX_PER_GROUP = 20;
-/** Below this many reviewed turns after learning turned on, the before/after delta is not judged. */
-const MIN_SAMPLE_TURNS = 200;
+const INTERVAL_NOTE = 'The 95% interval is approximate: it treats every turn as independent, but corrections cluster by session, so the true interval is wider.';
 /** Relative times ("3 h ago") up to this age; older ones show the date. */
 const RELATIVE_FOR_MS = 7 * 86_400_000;
 const SEARCH_DEBOUNCE_MS = 200;
@@ -311,13 +310,22 @@ function paintNavLinks() {
 let actionToken = null;
 
 async function act(action, id) {
-  if (!actionToken) actionToken = (await api('token')).token;
-  const res = await fetch('/api/action', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Ouroboros-Token': actionToken },
-    body: JSON.stringify({ action, id }),
-  });
-  const body = await res.json().catch(() => ({}));
+  // The token belongs to one server start: after a restart the open page's token is refused
+  // ("bad token"), so fetch it again and retry once.
+  const send = async () => {
+    if (!actionToken) actionToken = (await api('token')).token;
+    const r = await fetch('/api/action', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Ouroboros-Token': actionToken },
+      body: JSON.stringify({ action, id }),
+    });
+    return { res: r, body: await r.json().catch(() => ({})) };
+  };
+  let { res, body } = await send();
+  if (res.status === 403 && body.error === 'bad token') {
+    actionToken = null;
+    ({ res, body } = await send());
+  }
   if (!res.ok) throw new Error(body.message || body.error || `HTTP ${res.status}`);
   return body;
 }
@@ -363,17 +371,20 @@ const ACTION_LABEL = {
   pin: (r) => (r.status === 'kept' ? 'Kept: it will not be archived automatically' : r.status === 'unkept' ? 'Maintenance may archive it if it goes unused' : sentence(r)),
   forget: (r) => (r.status === 'archived' ? `Archived: ${r.title}` : sentence(r)),
   confirm: (r) => (r.status === 'confirmed' ? 'Confidence raised' : sentence(r)),
-  approve: (r) => (r.status === 'created' || r.status === 'patched' ? `Saved: ${r.title}${r.rebased ? ' (applied on top of the newer file)' : ''}` : sentence(r)),
+  approve: (r) => (r.status === 'created' || r.status === 'patched' ? `Saved: ${r.title}${r.rebased ? ' (applied on top of the newer file)' : ''}`
+    : r.status === 'duplicate' ? `Already saved${r.target ? ` in ${r.target}` : ''}: nothing new was written, and the entry left the inbox` : sentence(r)),
   reject: (r) => (r.status === 'rejected_by_user' ? (r.recompose ? 'Removed; the rest of the change was composed again' : 'Rejected') : sentence(r)),
   triage_queue: (r) => (r.status !== 'done' ? sentence(r) : `Checked ${fmt.int(r.total)}${r.recomposed ? ` and recomposed ${r.recomposed}` : ''}: ${fmt.int(r.kept)} new, ${fmt.int(r.routed)} to files, ${fmt.int(r.dropped)} dropped, ${fmt.int(r.merged)} merged, ${fmt.int(r.suggested)} fixes (${fmt.usd(r.cost)})`),
   dismiss: (r) => (r.status === 'dismissed' ? 'Dismissed' : sentence(r)),
   resolve_conflict: (r) => (r.status === 'composed' ? `Composed as a change to approve: ${r.title}` : r.status === 'rejected_by_user' ? 'The current rule stands' : sentence(r)),
   restore: (r) => (r.status === 'restored' ? 'Back in the inbox' : sentence(r)),
   approve_many: (r) => (r.status === 'changed' ? `The inbox changed: ${fmt.plural(r.total, 'entry', 'entries')} match now. Nothing was decided; check and confirm again.`
-    : `Saved ${fmt.int(r.saved)} of ${fmt.int(r.total)}${r.other ? `; ${fmt.int(r.other)} not saved (already known, stale, or over a budget)` : ''}`),
+    : `Saved ${fmt.int(r.saved)} of ${fmt.int(r.total)}${r.already ? `; ${fmt.int(r.already)} already saved` : ''}${r.other ? `; ${fmt.int(r.other)} not saved and still in the inbox (stale, over a budget, or an error)` : ''}`),
   reject_many: (r) => (r.status === 'changed' ? `The inbox changed: ${fmt.plural(r.total, 'entry', 'entries')} match now. Nothing was decided; check and confirm again.` : `Rejected ${fmt.int(r.rejected)}`),
 };
 const BAD = ['conflict', 'error', 'not_found', 'nothing', 'ambiguous', 'stale', 'rejected', 'over_budget', 'refused', 'invalid', 'changed', 'budget'];
+/** Whether an action's answer is shown as not done: a bad status, or a bulk approval that left some waiting. */
+const notDone = (action, r) => BAD.includes(r.status) || (action === 'approve_many' && r.other > 0);
 
 /** The row or card a control belongs to, and the ones after it, for focus after an action. */
 function focusCandidates(btn) {
@@ -417,7 +428,7 @@ function actionButton(label, action, id, { confirmText, title, variant = '', ico
     if (busyText) paint(busyText);
     try {
       const r = await act(action, id);
-      toast(ACTION_LABEL[action](r), BAD.includes(r.status));
+      toast(ACTION_LABEL[action](r), notDone(action, r));
       await render({ keepScroll: true, focus: { fk: ownKey, entries: candidates } });
     } catch (err) {
       toast(String(err.message), true);
@@ -878,15 +889,11 @@ async function renderOverview() {
   if (failed(v)) verdict = sectionError(v, 'the before/after comparison');
   else {
     const delta = v.before.rate !== null && v.after.rate !== null ? v.after.rate - v.before.rate : null;
-    // A delta on a few dozen turns is noise: it stays neutral until the sample is big enough.
-    const enough = v.after.turns >= MIN_SAMPLE_TURNS;
-    let text;
-    if (!v.enabledAt) text = 'Nothing has been learned yet, so this is the baseline: how often you corrected Claude before learning.';
-    else if (v.after.rate === null) text = 'Learning is on, but no session after it has been reviewed yet.';
-    else if (!enough) text = `Too early to tell: ${fmt.plural(v.after.turns, 'turn')} reviewed since learning turned on; the comparison needs at least ${fmt.int(MIN_SAMPLE_TURNS)}.`;
-    else if (delta < 0) text = `You correct Claude ${fmt.rate(Math.abs(delta))} fewer times per 100 turns than before learning turned on.`;
-    else text = 'Not lower yet. Give it more sessions, and check Misses: repeated corrections mean a learning is not being used.';
-    const tone = !enough || delta === null ? '' : delta < 0 ? 'good' : 'warn';
+    // What to tell the user is decided in the API (usable baseline, 95% interval); this only draws it.
+    const vd = v.verdict;
+    const judged = vd.state === 'lower' || vd.state === 'higher';
+    const tone = vd.state === 'lower' ? 'good' : vd.state === 'higher' ? 'warn' : '';
+    const text = vd.text;
     verdict = h('div', { class: 'panel verdict' },
       h('div', { class: 'verdict-main' },
         h('div', { class: 'label' }, 'Corrections per 100 turns'),
@@ -894,9 +901,10 @@ async function renderOverview() {
           v.enabledAt ? h('div', { class: 'figure before' }, h('div', { class: 'v' }, fmt.rate(v.before.rate)), h('div', { class: 'k' }, `before · n = ${fmt.int(v.before.turns)} turns`)) : null,
           v.enabledAt ? h('div', { class: 'figure' }, h('div', { class: 'v' }, fmt.rate(v.after.rate)), h('div', { class: 'k' }, `since ${fmt.date(v.enabledAt)} · n = ${fmt.int(v.after.turns)} turns`))
             : h('div', { class: 'figure' }, h('div', { class: 'v' }, fmt.rate(o.correctionRate)), h('div', { class: 'k' }, `n = ${fmt.int(o.reviewed.turns)} reviewed turns`)),
-          delta !== null ? h('span', { class: `delta${tone ? '' : ' neutral'}`, title: enough ? null : `Not judged below ${MIN_SAMPLE_TURNS} turns after learning` },
-            h('span', { class: `dot ${tone}` }), `${delta > 0 ? '+' : ''}${delta.toFixed(1)}`, enough ? null : h('span', { class: 'delta-note' }, 'small sample')) : null),
+          delta !== null ? h('span', { class: `delta${tone ? '' : ' neutral'}`, title: judged ? INTERVAL_NOTE : vd.state === 'short' ? `Not judged below ${vd.min} reviewed turns on each side` : INTERVAL_NOTE },
+            h('span', { class: `dot ${tone}` }), `${delta > 0 ? '+' : ''}${delta.toFixed(1)}`, vd.state === 'short' ? h('span', { class: 'delta-note' }, 'small sample') : vd.state === 'unclear' ? h('span', { class: 'delta-note' }, 'within noise') : null) : null),
         h('p', { class: 'sentence' }, text),
+        vd.low !== undefined ? h('p', { class: 'small faint' }, INTERVAL_NOTE) : null,
         controlNote(v.concurrent),
         h('p', { class: 'small faint' }, `Counted the same way before and after: one corrections-only reading of each whole session.${v.selfReported?.turns ? ` Not included: what the learning reviews counted themselves (${fmt.rate(v.selfReported.rate)} per 100 on ${fmt.int(v.selfReported.turns)} turns).` : ''}`)),
       h('div', { class: 'stats' },
@@ -911,10 +919,11 @@ async function renderOverview() {
   }
 
   const marker = !failed(v) && v.enabledAt ? { day: dayOf(v.enabledAt), label: 'learning on' } : null;
-  const rate = (d) => (d.reviewedTurns ? (d.corrections / d.reviewedTurns) * 100 : null);
+  // The 7-day moving average computed by the API (§9.2), not each day's own ratio.
+  const rate = (d) => d.rate7;
   const charts = h('div', { class: 'charts' },
-    barChart({ title: 'Corrections per 100 turns', sub: 'by the day the session started; lower is better', data: o.series, value: rate, format: (x) => x.toFixed(x > 0 && x < 10 ? 1 : 0), marker, wide: true, height: 200,
-      tip: (d) => [fmt.day(d.day), `${d.corrections} corrections · ${d.reviewedTurns} turns reviewed`], emptyText: 'No reviewed sessions in this period' }),
+    barChart({ title: 'Corrections per 100 turns', sub: '7-day average, by the day the session started; lower is better', data: o.series, value: rate, format: (x) => x.toFixed(x > 0 && x < 10 ? 1 : 0), marker, wide: true, height: 200,
+      tip: (d) => [fmt.day(d.day), `That day: ${d.corrections} corrections · ${d.reviewedTurns} turns reviewed`, `Last 7 days: ${d.corrections7} corrections · ${d.turns7} turns`], emptyText: 'No reviewed sessions in this period' }),
     failed(v) ? sectionError(v, 'this chart') : barChart({ title: 'Sessions opening a learning', data: v.series, value: (d) => d.hits, format: (x) => fmt.int(x), marker,
       tip: (d) => [fmt.day(d.day), `${d.hits} of ${d.sessions} sessions`] }),
     barChart({ title: 'User turns', data: o.series, value: (d) => d.turns, format: (x) => fmt.compact(x),
@@ -982,11 +991,10 @@ function lifecycleNote(c) {
  */
 function controlNote(c) {
   if (!c || !c.control.turns) return null;
-  const enough = c.control.turns >= MIN_SAMPLE_TURNS && c.learning.turns >= MIN_SAMPLE_TURNS;
   const side = (label, a) => `${label}: ${fmt.rate(a.rate)} per 100 on ${fmt.int(a.turns)} turns`;
-  return h('p', { class: 'small', title: 'Control projects are listed in controlProjects (~/.ouroboros/config.json): measured with the same instrument, never learned from' },
+  return h('p', { class: 'small', title: `Control projects are listed in controlProjects (~/.ouroboros/config.json): measured with the same instrument, never learned from. ${INTERVAL_NOTE}` },
     `Same period, since ${fmt.date(c.since)} · ${side('learning projects', c.learning)} · ${side('control projects', c.control)}`,
-    enough ? null : h('span', { class: 'faint' }, ` · too few turns to compare (each side needs ${fmt.int(MIN_SAMPLE_TURNS)})`));
+    h('span', { class: 'faint' }, ` · ${c.verdict.text}`));
 }
 
 function learnedRow(c) {
@@ -1760,7 +1768,7 @@ const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').match
 
 // ---------- Activity ----------
 const OUTCOME = {
-  created: ['saved', 'good'], patched: ['saved into a file', 'good'], duplicate: ['already known', ''], dropped: ['dropped', ''],
+  created: ['saved', 'good'], patched: ['saved into a file', 'good'], duplicate: ['already known', ''], approved_duplicate: ['approved, already saved', ''], dropped: ['dropped', ''],
   merged: ['merged', ''], suggested: ['fix suggested', 'info'], dismissed: ['fix dismissed', ''], fixed: ['fixed in the project', 'good'], queued: ['in the inbox', 'info'],
   conflict: ['conflict', 'warn'], rejected_by_user: ['rejected by you', 'bad'], undone: ['undone by you', 'bad'], pending: ['being checked', 'info'], rejected: ['rejected', 'bad'], over_budget: ['over budget', 'warn'], error: ['error', 'bad'],
   measured: ['measured only', ''],
@@ -1909,6 +1917,20 @@ async function fillActivity(results, seg) {
 }
 
 // ---------- System ----------
+/** What the periodic in-session reviews yield: each one reads the whole context again. */
+function inloopPanel(i) {
+  if (!i || !i.reviews) return h('div', { class: 'panel pad' }, h('h3', { class: 'bars-title' }, 'In-session reviews'), h('p', { class: 'muted small flush' }, 'None in this period.'));
+  const share = i.finished ? fmt.pct((i.saved / i.finished) * 100) : '—';
+  return h('div', { class: 'panel pad' },
+    h('h3', { class: 'bars-title' }, 'In-session reviews'),
+    h('dl', { class: 'facts' },
+      ...[['Reviews', fmt.int(i.reviews)], ['Finished', fmt.int(i.finished)], ['Saved something', `${fmt.int(i.saved)} (${share})`],
+        ['Skipped', fmt.int(i.skipped.reduce((n, x) => n + x.n, 0))], ['Read per finished review', i.avgTokensRead === null ? '—' : `${fmt.int(i.avgTokensRead)} tok`]]
+        .map(([k, v]) => h('div', {}, h('dt', {}, k), h('dd', {}, v)))),
+    i.skipped.length ? h('ul', { class: 'small faint flush' }, i.skipped.map((x) => h('li', {}, `${fmt.int(x.n)} skipped: ${x.detail}`))) : null,
+    h('p', { class: 'small faint panel-note' }, 'Each in-session review reads the whole context again (input, cache read and cache write tokens), on your own plan. A low share saved against a high read per review means the cadence costs more than it yields.'));
+}
+
 async function renderSystem() {
   const [hl, q, c, failedFirst, errorsFirst] = await settle([
     api('health'), api('quality', { days: state.days }), api('cost', { days: state.days }),
@@ -1971,10 +1993,13 @@ async function renderSystem() {
     const mode = Object.fromEntries(c.byMode.map((m) => [m.mode, m]));
     const bgUsd = Object.values(mode).filter((m) => m.mode !== 'inloop').reduce((n, m) => n + m.usd, 0);
     const bgN = Object.values(mode).filter((m) => m.mode !== 'inloop').reduce((n, m) => n + m.n, 0);
+    // Skipped reviews make no model call: the average divides by the calls that were billed.
+    const bgBilled = Object.values(mode).filter((m) => m.mode !== 'inloop').reduce((n, m) => n + m.billed, 0);
     costSection = [
       h('div', { class: 'panel' }, h('dl', { class: 'facts' },
-        ...[['Reviews', fmt.int(bgN + (mode.inloop?.n || 0))], ['Billed reviews', fmt.usd(bgUsd)], ['Average per review', bgN ? fmt.usd(bgUsd / bgN) : '—'],
+        ...[['Reviews', fmt.int(bgN + (mode.inloop?.n || 0))], ['Billed reviews', fmt.usd(bgUsd)], ['Average per billed review', bgBilled ? fmt.usd(bgUsd / bgBilled) : '—'],
           ['Context per session', `${fmt.int(c.overhead.tokensPerSession)} tok`]].map(([k, v]) => h('div', {}, h('dt', {}, k), h('dd', {}, v))))),
+      inloopPanel(c.inloop),
       h('div', { class: 'charts spaced' },
         barChart({ title: 'Billed review cost', data: c.series, value: (d) => d.usd, format: fmt.usd, tip: (d) => [fmt.day(d.day), fmt.plural(d.reviews, 'review')] }),
         barChart({ title: 'Reviews', data: c.series, value: (d) => d.reviews, format: (x) => fmt.int(x), tip: (d) => [fmt.day(d.day)] })),
@@ -1991,7 +2016,7 @@ async function renderSystem() {
         h('h3', {}, 'Always in context'),
         budgetRow('Skill listing', hl.skillListing.tokens, LISTING_REF, 'tokens'),
         budgetRow('Learned skills', hl.budgets.learnedSkills.used, hl.budgets.learnedSkills.limit, 'skills'),
-        h('p', { class: 'small faint panel-note' }, `Skill listing: ${hl.skillListing.skills} skills Claude can invoke (plugin skills not counted); ~2,000 tokens is 1% of a 200K context. Limits live in ~/.ouroboros/config.json; past 80%, Ouroboros consolidates.`)),
+        h('p', { class: 'small faint panel-note' }, `Skill listing: ${hl.skillListing.skills} skills Claude can invoke in one session, personal ones plus ${hl.skillListing.project ? `those of ${hl.skillListing.project}, the largest project` : 'a project’s'} (plugin skills not counted); ~2,000 tokens is 1% of a 200K context. Limits live in ~/.ouroboros/config.json; past 80%, Ouroboros consolidates.`)),
       h('div', { class: 'panel pad' },
         h('h3', {}, 'MEMORY.md indexes'),
         hl.indexes.length ? hl.indexes.map((ix) => budgetRow(ix.project_name || ix.project, ix.lines, hl.budgets.memoryIndexLines, 'lines'))
@@ -2014,6 +2039,10 @@ async function renderSystem() {
   return [
     pageHead('System', 'Is everything running, how good is what it learns, and what does it cost?'),
     status,
+    // Claude Code's auto memory is off where the last session started: say what that means.
+    !failed(hl) && hl.autoMemory && !hl.autoMemory.on
+      ? h('div', { class: 'panel spaced', role: 'status' }, h('div', { class: 'signal warn' }, icon('alert'), h('div', {}, h('b', {}, 'Warning: '), hl.autoMemory.text)))
+      : null,
     h('section', { class: 'section' }, sectionHead('Learning quality', `What the knowledge check did with proposals in the last ${failed(q) ? state.days : q.days} days, and how you judged what reached you.`), quality),
     h('section', { class: 'section' }, sectionHead('Cost', 'End-of-session and maintenance reviews are isolated Haiku calls billed per use; in-session reviews use your plan.'), ...costSection),
     h('section', { class: 'section' }, sectionHead('Context budgets', 'What Ouroboros keeps in every session’s context, against its limits.'), budgets),
