@@ -210,16 +210,25 @@ export function userTurnsOfReview(entries, { reviewedAt, turnsReviewed, fromStar
  * (`--fork-session`) gets a new id and a transcript that repeats the parent's entries
  * with their uuids and timestamps but the fork's `sessionId`, so the session id cannot
  * tell them apart and the time can. Entries without a timestamp (metadata) do not count.
- * Claude Code also marks a copied entry with `forkedFrom.sessionId` (the parent's id): the
- * last marked entry ends the copy too, and it needs no start time, so it also serves a
- * session Ouroboros never saw start (a backfill passes `startedAt` null).
+ * A copied entry may also carry `forkedFrom.sessionId` (the parent's id): the marked
+ * entries before the first human prompt that is not marked end the copy too, and need
+ * no start time, so they also serve a session Ouroboros never saw start (a backfill
+ * passes `startedAt` null). Like the time, the marker can only skip a marked prefix: if
+ * the fork's own entries were ever marked too, its first unmarked prompt still stops it.
  */
 export function inheritedLines(entries, startedAt) {
   let end = 0;
+  let marked = true;
   for (let i = 0; i < entries.length; i++) {
     const e = entries[i];
-    if (typeof e?.forkedFrom?.sessionId === 'string') end = i + 1;
-    if (!startedAt) continue;
+    if (marked) {
+      if (typeof e?.forkedFrom?.sessionId === 'string') end = i + 1;
+      else if (isHumanPrompt(e)) marked = false;
+    }
+    if (!startedAt) {
+      if (!marked) break;
+      continue;
+    }
     const t = e?.timestamp ? Date.parse(e.timestamp) : NaN;
     if (t < startedAt) end = i + 1;
     else if (t >= startedAt && isHumanPrompt(e)) break;

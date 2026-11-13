@@ -372,6 +372,30 @@ test('M1 (follow-up): a denied Write of the payload file is a failed save', () =
   assert.equal(hookApi.learnStepFailed(before), false);
 });
 
+test('a failing tool after the learn step is not a failed save when the apply step returned', () => {
+  const a = (id, name, input) => ({ type: 'assistant', message: { content: [{ type: 'tool_use', id, name, input }] } });
+  const u = (id, isError, content = '') => ({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: id, is_error: isError, content }] } });
+  const apply = (id, file, isError = false) => [a(id, 'Bash', { command: `node curator.mjs apply --file ${file}` }), u(id, isError, isError ? 'error' : 'queued: Deploy rule')];
+  const skill = [a('s1', 'Skill', { skill: 'ouroboros:learn' }), u('s1', false)];
+  const badRead = [a('r1', 'Read', { file_path: '/repo/.claude/rules/deploy.md' }), u('r1', true, 'File does not exist.')];
+  // All items queued (learned=0 patched=0) and an unrelated Read that failed: saved.
+  assert.equal(hookApi.learnStepFailed([...skill, ...badRead, ...apply('b1', '/tmp/p.json')]), false, 'until v0.25 any failing tool after the learn skill counted');
+  // A failing tool with no apply step after it is not the save either.
+  assert.equal(hookApi.learnStepFailed([...skill, ...badRead]), false);
+  // The Write of the payload failed, then a retry wrote it elsewhere and the apply returned.
+  const badWrite = [a('w1', 'Write', { file_path: '/tmp/p.json', content: '{}' }), u('w1', true, 'denied')];
+  assert.equal(hookApi.learnStepFailed([...skill, ...badWrite, ...apply('b1', '/tmp/q.json')]), false);
+  // The Write failed and nothing used the file: the save failed.
+  assert.equal(hookApi.learnStepFailed([...skill, ...badWrite]), true);
+  // The Write failed, a second one worked and the curator call used the file: that failure was not the save
+  // (here the call's own result is not in the stretch yet, so only its error could have counted).
+  const goodWrite = [a('w2', 'Write', { file_path: '/tmp/p.json', content: '{}' }), u('w2', false, 'ok')];
+  assert.equal(hookApi.learnStepFailed([...skill, ...badWrite, ...goodWrite, apply('b1', '/tmp/p.json')[0]]), false);
+  // The apply step itself failed, or the learn skill was denied.
+  assert.equal(hookApi.learnStepFailed([...skill, ...apply('b1', '/tmp/p.json', true)]), true);
+  assert.equal(hookApi.learnStepFailed([a('s1', 'Skill', { skill: 'learn' }), u('s1', true, 'denied')]), true);
+});
+
 test('M6 (follow-up): the worker alone skips a fork\'s inherited turns when no Stop ever asked for a review', async () => {
   const proj = projectDir('fork-worker');
   const t = path.join(tmp, 'fork-worker.jsonl');
@@ -405,6 +429,40 @@ test('M6 (follow-up): the transcript marks a fork\'s copied entries with forkedF
   assert.equal(transcript.inheritedLines(entries.slice(3), null), 0, 'an ordinary session has no marker');
   const db = { prepare: (sql) => ({ get: () => (/FROM sessions/.test(sql) ? { started_at: null } : null), run: () => ({ changes: 1 }) }) };
   assert.equal(hookApi.skipInherited(db, 'backfilled', entries), 3);
+  // Were the fork's own entries ever marked too, its first unmarked prompt still ends the copy.
+  const later = [...entries, fork(JSON.parse(prompt('and the linter?', parent + 4))), fork(JSON.parse(answer('`pnpm lint`', parent + 5)))];
+  assert.equal(transcript.inheritedLines(later, null), 3, 'until v0.25 the last marked entry ended the copy, skipping the fork\'s own turns');
+  // A marked entry with no prompt before it still counts (metadata between copied entries).
+  assert.equal(transcript.inheritedLines([fork({ type: 'mode', mode: 'normal' }), ...entries.slice(1)], null), 3);
+});
+
+test('a learning backfill of a fork reads from the end of the copied turns', () => {
+  const proj = projectDir('fork-backfill');
+  const dir = path.join(tmp, 'claude', 'projects', 'fork-backfill');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, 'm6-backfill.jsonl');
+  const t0 = Date.now() - 2 * HOUR;
+  const at = (o) => ({ ...JSON.parse(o), cwd: proj });
+  const fork = (o) => ({ ...at(o), forkedFrom: { sessionId: 'parent-id', messageUuid: 'x' } });
+  const lines = [
+    fork(prompt('PARENTTURN install the deps', t0)), fork(answer('Running npm install.', t0 + 1)),
+    fork(prompt('PARENTTURN no, use pnpm', t0 + 2)), fork(answer('Done with pnpm.', t0 + 3)),
+    at(prompt('FORKTURN which command runs the tests?', t0 + 4)), at(answer('`pnpm test`', t0 + 5)),
+    at(prompt('FORKTURN and the linter?', t0 + 6)), at(answer('`pnpm lint`', t0 + 7)),
+  ];
+  fs.writeFileSync(file, lines.map(line).join(''));
+  const old = (Date.now() - HOUR) / 1000;
+  fs.utimesSync(file, old, old);
+  const prompts = path.join(tmp, 'fork-backfill-prompts');
+  const r = spawnSync(process.execPath, ['--no-warnings', path.join(root, 'scripts', 'review-worker.mjs'), '--backfill', '--learn', '--days', '30', '--limit', '10'], {
+    env: { ...env, OUROBOROS_CLAUDE_CMD: JSON.stringify([process.execPath, path.join(fixtures, 'fake-queue.mjs')]), FAKE_QUEUE_PROMPTS: prompts }, encoding: 'utf8',
+  });
+  assert.equal(r.status, 0, r.stderr);
+  const learn = fs.readdirSync(prompts).map((f) => fs.readFileSync(path.join(prompts, f), 'utf8')).filter((p) => p.includes('FORKTURN'));
+  assert.equal(learn.length, 1, r.stdout);
+  // The copy may show as EARLIER context; it is never a turn to review.
+  assert.doesNotMatch(learn[0], /USER #\d+[^\n]*PARENTTURN/, 'the parent\'s turns were the parent\'s to learn from');
+  assert.match(learn[0], /USER #1[^\n]*FORKTURN which command/);
 });
 
 test('A1 (follow-up): auto memory under CLAUDE_CODE_REMOTE_MEMORY_DIR, and safe mode turns it off', () => {
@@ -445,4 +503,23 @@ test('M2 (follow-up): two SessionStarts at once record one session_end for the s
   await Promise.all([start('m2-race-a'), start('m2-race-b')]);
   await waitFor(() => query("SELECT 1 FROM sessions WHERE id = 'm2-race' AND queue_state IN ('done', 'skipped')").length);
   assert.equal(query("SELECT COUNT(*) n FROM events WHERE session_id = 'm2-race' AND kind = 'session_end'")[0].n, 1);
+});
+
+test('M2 (follow-up): the sweep\'s claim of an idle session succeeds once for the same row', () => {
+  // Deterministic: two sweeps that both read the row as unclaimed, one after the other.
+  const db = open(path.join(tmp, 'data', 'events.db'));
+  try {
+    const old = Date.now() - 7 * HOUR;
+    db.prepare("INSERT INTO sessions (id, project, cwd, started_at, last_event_at, turns) VALUES ('m2-claim', 'p', ?, ?, ?, 2)").run(tmp, old, old);
+    assert.equal(hookApi.claimIdleSession(db, 'm2-claim', 'no SessionEnd', Date.now()), true);
+    assert.equal(hookApi.claimIdleSession(db, 'm2-claim', 'no SessionEnd', Date.now()), false, 'the second sweep finds it claimed');
+    const s = db.prepare("SELECT queue_state, ended_at FROM sessions WHERE id = 'm2-claim'").get();
+    assert.deepEqual([s.queue_state, s.ended_at], ['queued', old]);
+    assert.equal(db.prepare("SELECT COUNT(*) n FROM events WHERE session_id = 'm2-claim' AND kind = 'session_end'").get().n, 1);
+    // A session that ended meanwhile (its SessionEnd arrived) is not claimed either.
+    db.prepare("INSERT INTO sessions (id, project, cwd, started_at, last_event_at, ended_at, turns) VALUES ('m2-ended', 'p', ?, ?, ?, ?, 2)").run(tmp, old, old, old + 1);
+    assert.equal(hookApi.claimIdleSession(db, 'm2-ended', 'no SessionEnd', Date.now()), false);
+  } finally {
+    db.close();
+  }
 });

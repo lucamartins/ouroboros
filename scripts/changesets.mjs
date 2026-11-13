@@ -249,7 +249,7 @@ export function applyChangeset(db, id, { actor = 'manual' } = {}) {
     .run(now, r.id, r.batch, rebased ? 'applied on top of a newer version of the file' : null, id);
   db.prepare("UPDATE candidates SET outcome = 'patched', learning_id = ?, decided_at = ? WHERE changeset_id = ? AND outcome = 'queued'").run(r.id, now, id);
   // The line is in the file now: the memories that stood in for it meanwhile are retired.
-  for (const c of claims) retireInterim(db, c.id);
+  for (const c of claims) retireInterim(db, c.id, r.batch);
   return { ...r, status: 'patched', title: r.title || path.basename(cs.file), claims: claims.length, rebased };
 }
 

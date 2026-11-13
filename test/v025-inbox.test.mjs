@@ -182,3 +182,19 @@ test('the card says why a learning the editor or the knowledge check could not h
   }
   assert.match(inbox.showEntry(db, `it:${queuedItem(null, { autonomy: 'queue' })}`).text, /Waited because: your autonomy setting is "queue"/);
 });
+
+test('the card of a route whose owner could not be picked names it and says approving saves a separate item', () => {
+  const notes = [
+    'the knowledge check sent it to nowhere/RULES.md, no knowledge file of this project or yours is named nowhere/RULES.md; nothing was created, you decide',
+    'the knowledge check sent it to notes.md, notes.md matches 2 files and no rule picks one; nothing was created, you decide',
+    'the knowledge check sent it to /etc/CLAUDE.md, which is not a file Ouroboros may change (CLAUDE.md); nothing was created, you decide',
+  ];
+  for (const n of notes) {
+    const line = inbox.showEntry(db, `it:${queuedItem(n)}`).text.match(/Waited because: [^\n]*/)[0];
+    assert.doesNotMatch(line, /autonomy/, 'until v0.25 it said "your autonomy setting (auto)"');
+    assert.match(line, /its topic has an owner Ouroboros could not pick \(the knowledge check named [^)]+\)/);
+    assert.match(line, /approving saves it as a separate memory/);
+  }
+  const restored = inbox.showEntry(db, `it:${queuedItem('you restored it, but the editor found it already covered (it says so); nothing was written, you decide')}`).text;
+  assert.match(restored, /Waited because: you restored it, but the editor found it already covered/);
+});

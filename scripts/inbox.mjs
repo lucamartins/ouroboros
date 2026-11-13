@@ -270,8 +270,14 @@ function waitedBecause({ corrects, file, kind, confidence, autonomy, backfill })
 }
 
 /** A learning the editor or the knowledge check could not handle waits for that reason, whatever the autonomy. */
-function unhandledReason(note) {
+function unhandledReason(note, item = {}) {
   const n = String(note || '').trim();
+  const separate = `approving saves it as a separate ${item.kind === 'skill' ? 'skill' : item.kind === 'preference' ? 'preference' : 'memory'}, not in that file`;
+  // A route whose owner could not be resolved (evaluate: "the knowledge check sent it to X, ...").
+  const owner = /^the knowledge check sent it to (.+?), (?:which is not a file|.*nothing was created, you decide)/i.exec(n);
+  if (owner) return `its topic has an owner Ouroboros could not pick (the knowledge check named ${owner[1]}), so nothing was created and you decide; ${separate}`;
+  const restored = /^you restored it, but (.+); nothing was written, you decide/i.exec(n);
+  if (restored) return `you restored it, but ${restored[1]}; nothing was written and you decide; ${separate}`;
   if (/^the editor of .* gave no verdict/i.test(n)) return 'the editor of its file gave no verdict, so nothing was written and you decide';
   if (/^the change to .* could not be composed/i.test(n)) return 'the change to its file could not be composed, so nothing was written and you decide';
   if (/^the knowledge check (failed|gave no verdict)/i.test(n)) return 'the knowledge check could not be completed, so nothing was written and you decide';
@@ -397,7 +403,7 @@ export function showEntry(db, key, { project } = {}) {
     `Lands in: ${lands}`,
     `From: ${originOf(c)}`,
     ...evidence,
-    `Waited because: ${unhandledReason(c.note) || waitedBecause({ corrects: item.corrects, file: item.op === 'patch' ? item.target : null, kind: item.kind, confidence: c.confidence ?? item.confidence, autonomy: p.autonomy || currentAutonomy(), backfill: fromBackfill(db, c) })}`,
+    `Waited because: ${unhandledReason(c.note, item) || waitedBecause({ corrects: item.corrects, file: item.op === 'patch' ? item.target : null, kind: item.kind, confidence: c.confidence ?? item.confidence, autonomy: p.autonomy || currentAutonomy(), backfill: fromBackfill(db, c) })}`,
     standIns.length ? `Meanwhile: already active as a project memory (${standIns.map((l) => shortPath(l.path)).join(', ')}). Approving writes the line here and retires ${standIns.length > 1 ? 'them' : 'it'}; rejecting keeps ${standIns.length > 1 ? 'them' : 'the memory'}.` : null,
     c.triaged_at ? null : 'Not checked against existing knowledge yet: look for duplicates before approving.',
     c.note ? `Note: ${oneLine(c.note, 400)}` : null,

@@ -108,6 +108,85 @@ test('M14: a conflict the user confirmed whose edit cannot be written comes back
   assert.match(inbox.showEntry(db, `cf:${id}`).text, /could not be written/);
 });
 
+test('a conflict the user confirmed that the editor then calls contradicted or covered comes back as a conflict', async () => {
+  for (const status of ['contradicted', 'covered']) {
+    const { db, proj, rules } = sandbox(`confirmed-${status}`);
+    const id = pending(proj, 'Deploy straight', 'CONFLICTME deploy straight to production.', rules);
+    await ev.drainQueue(db);
+    assert.equal(inbox.resolveConflict(db, `cf:${id}`, 'new').status, 'requeued');
+    mod(`export function editor({ out }) { return { claims: out.claims.map((c) => ({ ...c, status: '${status}', reason: 'the workflow deploys to staging' })), edits: [] }; }`);
+    await ev.drainQueue(db);
+    const r = row(id);
+    assert.equal(r.outcome, 'conflict', `${status}: until v0.25 the editor dropped what the user had confirmed`);
+    assert.match(r.note, /you said it is a new rule, but the editor found .*the workflow deploys to staging/);
+    assert.ok(inbox.inboxEntries(db).some((e) => e.key === `cf:${id}`));
+    assert.equal(fs.readFileSync(rules, 'utf8'), RULES);
+    s.db.close();
+    s = null;
+    delete process.env.FAKE_QUEUE_MOD;
+  }
+});
+
+test('a proposal the user restored that the editor drops again goes back to the user', async () => {
+  const { db, proj, rules } = sandbox('restored-editor');
+  const id = pending(proj, 'Friday deploys', 'CONTRADICT deploy on Fridays is fine.', rules);
+  await ev.drainQueue(db);
+  assert.equal(row(id).outcome, 'dropped');
+  assert.equal((await actions.runAction(db, 'restore', id)).status, 'restored');
+  await ev.drainQueue(db);
+  const r = row(id);
+  assert.equal(r.outcome, 'queued', 'until v0.25 the editor dropped it again');
+  assert.match(r.note, /you restored it, but the editor found the project says otherwise \(the code says otherwise\); nothing was written, you decide/);
+  assert.ok(inbox.inboxEntries(db).some((e) => e.key === `it:${id}`));
+  assert.equal(ev.queueHasWork(db), false, 'it is out of the queue');
+});
+
+test('a proposal the user decided while it was evaluated stays as the user left it', async () => {
+  const { db, proj } = sandbox('decided');
+  const id = pending(proj, 'Pin node', 'Pin the node version in CI.', null);
+  // The rejection lands after the evaluation read the row (another process, the dashboard).
+  db.prepare("UPDATE candidates SET outcome = 'rejected_by_user', note = 'not this', decided_at = ? WHERE id = ?").run(Date.now(), id);
+  await ev.evaluate(db, [row(id)], { cwd: proj, sessionId: 's1', actor: 'background', autonomy: 'queue' });
+  assert.deepEqual([row(id).outcome, row(id).note], ['rejected_by_user', 'not this'], 'until v0.25 it became "decided"');
+});
+
+test('a stale flag may only name a knowledge file of the proposal\'s project or the user\'s own', async () => {
+  const { db, proj, tmp } = sandbox('stale-owner');
+  const source = path.join(proj, 'package.json');
+  fs.writeFileSync(source, '{ "scripts": { "deploy": "make deploy" } }\n');
+  spawnSync('git', ['-C', proj, 'add', '.']);
+  const stray = path.join(tmp, 'elsewhere', 'CLAUDE.md');
+  fs.mkdirSync(path.dirname(stray), { recursive: true });
+  fs.writeFileSync(stray, '# Elsewhere\n\n- Deploy with npm run ship.\n');
+  const flag = (file) => `export function screen({ out }) { return { verdicts: out.verdicts.map((v) => ({ ...v, stale: { file: ${JSON.stringify(file)}, source: ${JSON.stringify(source)}, claim: 'Deploy with make deploy.' } })) }; }`;
+  const outdated = () => db.prepare("SELECT target FROM candidates WHERE title LIKE 'Outdated:%'").all().map((r) => r.target);
+  mod(flag(stray));
+  pending(proj, 'Deploy target', 'Deploys go through make.', null);
+  await ev.drainQueue(db);
+  assert.deepEqual(outdated(), [], 'until v0.25 a file outside the project could be flagged and changed');
+  assert.equal(fs.readFileSync(stray, 'utf8'), '# Elsewhere\n\n- Deploy with npm run ship.\n');
+  // The project's own CLAUDE.md, named by a bare name, is flagged.
+  mod(flag('CLAUDE.md'));
+  pending(proj, 'Deploy script', 'The deploy script is make deploy.', null);
+  await ev.drainQueue(db);
+  assert.deepEqual(outdated().map((f) => path.resolve(f)), [path.join(proj, 'CLAUDE.md')]);
+});
+
+test('a learning the user decided before the editor could be called stays decided when the call is called off', async () => {
+  const { db, proj, rules } = sandbox('called-off');
+  const id = pending(proj, 'Tag releases', 'Tag every release after deploying.', rules);
+  db.prepare("UPDATE candidates SET outcome = 'queued', target = ? WHERE id = ?").run(rules, id);
+  // Another process (the dashboard) rejects it after the evaluation took it, then the
+  // lease turns out lost before the editor is called: the rows are not this process's any more.
+  const tick = () => {
+    db.prepare("UPDATE candidates SET outcome = 'rejected_by_user', note = 'not this', decided_at = ? WHERE id = ?").run(Date.now(), id);
+    throw new ev.LeaseLost();
+  };
+  await ev.composeRoutes(db, new Map([[rules, [{ id, title: 'Tag releases', claim: 'Tag every release after deploying.' }]]]), { cwd: proj, tick });
+  assert.deepEqual([row(id).outcome, row(id).note], ['rejected_by_user', 'not this'], 'the rejection stands');
+  assert.equal(prompts('editor').length, 0, 'no editor call');
+});
+
 test('M15: the screen of a claim does not see its own stand-in memory as existing knowledge', async () => {
   const { db, proj } = sandbox('m15-standin');
   const md = path.join(proj, 'CLAUDE.md');

@@ -96,7 +96,9 @@ export async function runAction(db, action, id, api) {
       const count = (st) => results.filter((r) => r.status === st).length;
       const saved = count('created') + count('patched');
       const rejected = count('rejected_by_user');
-      return { status: 'done', total: results.length, saved, rejected, other: results.length - saved - rejected };
+      // An approval of something saved meanwhile is settled (already saved); the others still wait.
+      const already = count('duplicate');
+      return { status: 'done', total: results.length, saved, rejected, already, other: results.length - saved - rejected - already };
     }
     default: return null;
   }

@@ -128,6 +128,7 @@ EDITS:
 - To add, pick the line after which the addition belongs (the end of the right section or list): old = that line, new = that same line, a newline, then the addition. Match the surrounding format (bullet, table row, numbered step).
 - Write as the file does: same language, tone and density, as short as its other entries. No dates, PR or issue numbers, session details or people's names unless the file already does that.
 - Only "corrects" edits may remove text, and only the wrong part. Never touch the frontmatter (the --- block at the top).
+- Never change or remove a heading line (a line starting with #): such an edit is refused. To add under a heading, use the last line of its section as "old"; a new heading of your own is fine.
 - One edit may serve several claims: list their ids in "claims". Never write two edits that touch the same text.
 - Only when the FILE is a memory note and your edits make its "description:" line (the one-line summary in the frontmatter, also shown in the memory index) wrong or incomplete: return "description" with the new one line. It is the only part of the frontmatter that may change, and you never edit it through "edits". Otherwise omit it.
 - Claims that say the same thing are not in conflict: give them the same status and implement them with one edit listing all their ids.
@@ -293,7 +294,7 @@ function claimFrom(row, overrides = {}) {
   const text = row.claim || item.append || item.new || [item.description, item.text, item.body].filter(Boolean).join('\n') || row.summary || row.title;
   return {
     id: row.id, title: row.title, claim: String(text).slice(0, 2000), evidence: row.evidence, when: when(row), confidence: row.confidence,
-    confirmed: !!payload.confirmed || undefined, autonomy: payload.autonomy, ...overrides,
+    confirmed: !!payload.confirmed || undefined, restored: !!payload.restored || undefined, autonomy: payload.autonomy, ...overrides,
   };
 }
 
@@ -417,7 +418,26 @@ export async function composeRoutes(db, routes, ctx) {
           }
           continue;
         }
-        if (s.status === 'covered') {
+        // A claim the user settled ("it is a new rule", in Conflicts) or restored (dashboard)
+        // is never dropped by the editor: unless an edit for it applied, it goes back to the
+        // user with the editor's reason, and its stand-in memory stays.
+        const held = (c.confirmed || c.restored) && s.status !== 'conflict' && !appliedFor(c.id);
+        const editorSaid = s.status === 'covered' ? `the editor found it already covered (${s.reason})`
+          : s.status === 'contradicted' ? `the editor found the project says otherwise (${s.reason})`
+            : `it could not be written to ${where} (${rejectedFor(c.id).join('; ') || 'no edit was given'})`;
+        if (held && c.confirmed) {
+          // The conflict it was comes back, with the reason, and the user decides again.
+          report.conflicts++;
+          report.results.push({ status: 'conflict', title: c.title });
+          const payload = payloadOf(db.prepare('SELECT payload FROM candidates WHERE id = ?').get(c.id) || {});
+          delete payload.confirmed;
+          db.prepare('UPDATE candidates SET payload = ? WHERE id = ?').run(JSON.stringify(payload), c.id);
+          setOutcome(db, c.id, 'conflict', `conflict: you said it is a new rule, but ${editorSaid}; decide again`, { target: file, changeset_id: null, claim: c.claim });
+        } else if (held) {
+          report.queued++;
+          if (fresh.some((f) => f.id === c.id)) report.results.push({ status: 'queued', title: c.title, candidateId: c.id });
+          setOutcome(db, c.id, 'queued', `you restored it, but ${editorSaid}; nothing was written, you decide`, { target: file, changeset_id: null });
+        } else if (s.status === 'covered') {
           report.covered++;
           setOutcome(db, c.id, c.duplicateOf ? 'duplicate' : 'dropped', `covered [editor]: ${s.reason} (${file})`, { target: file, changeset_id: null });
         } else if (s.status === 'contradicted') {
@@ -429,16 +449,6 @@ export async function composeRoutes(db, routes, ctx) {
           report.results.push({ status: 'conflict', title: c.title });
           // Never dropped silently: the user decides (dashboard → Conflicts).
           setOutcome(db, c.id, 'conflict', `conflict${s.conflicts_with ? ` with #${s.conflicts_with}` : ''}: ${s.reason}`, { target: file, changeset_id: null, claim: c.claim });
-        } else if (!appliedFor(c.id) && c.confirmed) {
-          // The user settled this conflict ("it is a new rule") and the editor's edit did not
-          // apply: it is never dropped. It comes back as the conflict it was, with the reason,
-          // and the user decides again.
-          report.conflicts++;
-          report.results.push({ status: 'conflict', title: c.title });
-          const payload = payloadOf(db.prepare('SELECT payload FROM candidates WHERE id = ?').get(c.id) || {});
-          delete payload.confirmed;
-          db.prepare('UPDATE candidates SET payload = ? WHERE id = ?').run(JSON.stringify(payload), c.id);
-          setOutcome(db, c.id, 'conflict', `conflict: you said it is a new rule, but it could not be written to ${where} (${rejectedFor(c.id).join('; ') || 'no edit was given'}); decide again`, { target: file, changeset_id: null, claim: c.claim });
         } else if (!appliedFor(c.id)) {
           report.unwritten++;
           setOutcome(db, c.id, 'dropped', `not written to ${where}: ${rejectedFor(c.id).join('; ') || 'no edit was given'}`, { target: file, changeset_id: null });
@@ -662,6 +672,9 @@ export async function evaluate(db, rows, ctx) {
     if (r.status === 'queued') {
       report.queued++;
       db.prepare('UPDATE candidates SET note = COALESCE(?, note), triaged_at = ? WHERE id = ?').run(note || null, Date.now(), r.candidateId);
+    } else if (r.status === 'decided') {
+      // The user approved or rejected it while it was being evaluated: the row stays as they left it.
+      continue;
     } else {
       if (r.status === 'created') report.created++;
       db.prepare('UPDATE candidates SET outcome = ?, learning_id = ?, note = ?, triaged_at = ?, decided_at = ? WHERE id = ?')

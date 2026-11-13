@@ -83,6 +83,40 @@ test('M3: a memory_dir is kept only when it is the directory computed for the it
   }
 });
 
+test('the memory folder of a long path and the cowork override are the ones Claude Code uses', async () => {
+  // Claude Code 2.1: past 200 sanitized characters, the first 200 plus "-" and a base-36 hash of the path.
+  const long = `/work/${'client-project-'.repeat(15)}repo`;
+  assert.equal(paths.projectDirName(long), `${paths.projectKey(long).slice(0, 200)}-cbu1zt`);
+  assert.equal(paths.projectDirName(`C:\\Users\\dev\\${'client-project-'.repeat(15)}repo`).slice(-7), '-8pc508');
+  assert.equal(paths.projectDirName('/home/a/my.repo'), '-home-a-my-repo', 'a short path is its key');
+  assert.equal(paths.projectKey(long).length, 235, 'the project key in the database stays the whole sanitized path');
+  const real = path.join(process.env.CLAUDE_CONFIG_DIR, 'projects', paths.projectDirName(long), 'memory');
+  assert.equal(paths.memoryDirFor({ cwd: long }), real);
+  assert.deepEqual(curator.checkedMemoryDir({ cwd: long, memory_dir: real }), { memoryDir: real, ignored: null }, 'until v0.25 the right folder was thrown away');
+  // CLAUDE_COWORK_MEMORY_PATH_OVERRIDE comes first, when it is an absolute path.
+  const override = path.join(tmp, 'cowork', 'memory');
+  try {
+    process.env.CLAUDE_COWORK_MEMORY_PATH_OVERRIDE = `${override}${path.sep}`;
+    assert.equal(paths.memoryDirFor({ cwd: projA }), override);
+    assert.equal(curator.checkedMemoryDir({ cwd: projA, memory_dir: override }).ignored, null);
+    for (const bad of ['~/memory', 'relative/memory']) {
+      process.env.CLAUDE_COWORK_MEMORY_PATH_OVERRIDE = bad;
+      assert.equal(paths.memoryDirFor({ cwd: projA }), path.join(process.env.CLAUDE_CONFIG_DIR, 'projects', paths.projectKey(projA), 'memory'), bad);
+    }
+  } finally {
+    delete process.env.CLAUDE_COWORK_MEMORY_PATH_OVERRIDE;
+  }
+  // The dashboard puts that folder's memories under the project, not under an unknown key.
+  db.prepare('INSERT INTO sessions (id, project, cwd, started_at) VALUES (?, ?, ?, ?)').run('long-path', paths.projectIdFor(long), long, Date.now());
+  fs.mkdirSync(real, { recursive: true });
+  fs.writeFileSync(path.join(real, 'long-note.md'), '---\nname: long-note\ndescription: A note of the long project\nmetadata:\n  type: project\n---\n\nText.\n');
+  const { createApi } = await import('../dashboard/api.mjs');
+  const inv = createApi(db)('inventory', new URLSearchParams({ kind: 'memories' }));
+  const row = inv.groups.flatMap((g) => g.rows).find((r) => r.name === 'long-note');
+  assert.equal(row.project_id, paths.projectKey(long));
+  assert.equal(row.groupLabel, path.basename(long));
+});
+
 test('enqueue: a candidate decided meanwhile is not queued again', () => {
   const item = { op: 'create', kind: 'memory', memory_type: 'feedback', title: 'Pin the node version', description: 'Pin the node version in CI', body: 'Pin it.' };
   const id = Number(db.prepare(`INSERT INTO candidates (review_id, session_id, project, kind, scope, title, summary, confidence, outcome, payload, cwd, ts)
@@ -124,7 +158,7 @@ test('an approval the curator refuses leaves the entry waiting', () => {
     fs.writeFileSync(cfg, JSON.stringify({ limits: { memoryIndexLines: 1 } }));
     const r = curator.decideQueued(db, id, true);
     assert.equal(r.status, 'over_budget');
-    assert.ok(r.reason);
+    assert.match(r.reason, /it is still in the inbox: approve it again once there is room/);
     assert.equal(db.prepare('SELECT outcome FROM candidates WHERE id = ?').get(id).outcome, 'queued', 'until v0.25 it became approved_over_budget and left the inbox');
     // Once there is room it can be approved.
     fs.writeFileSync(cfg, JSON.stringify({ limits: { memoryIndexLines: 50 } }));
@@ -134,6 +168,21 @@ test('an approval the curator refuses leaves the entry waiting', () => {
     if (prev === null) fs.rmSync(cfg, { force: true });
     else fs.writeFileSync(cfg, prev);
   }
+});
+
+test('approving a proposal saved meanwhile settles it as already saved', () => {
+  const it = { kind: 'memory', memory_type: 'project', title: 'Use pnpm not npm', description: 'This project uses pnpm, never npm', body: 'Use pnpm for installs; npm breaks the lockfile.' };
+  const [q] = curator.apply(db, { cwd: projA, items: [it] }, { actor: 'background', autonomy: 'queue' });
+  assert.equal(q.status, 'queued');
+  assert.equal(curator.apply(db, { cwd: projA, items: [{ ...it, title: 'Use pnpm, not npm' }] }, { actor: 'manual' })[0].status, 'created');
+  const r = curator.decideQueued(db, q.candidateId, true);
+  assert.equal(r.status, 'duplicate');
+  assert.match(r.reason, /it was already saved .*the entry left the inbox/);
+  assert.doesNotMatch(r.reason, /patch it instead/, 'a reason for the user, not for Claude');
+  const row = db.prepare('SELECT outcome, decided_at FROM candidates WHERE id = ?').get(q.candidateId);
+  assert.equal(row.outcome, 'approved_duplicate', 'until v0.25 it stayed queued and every "Approve all" tried it again');
+  assert.ok(row.decided_at);
+  assert.equal(curator.decideQueued(db, q.candidateId, true).status, 'not_found');
 });
 
 test('a secret in a first preference\'s append, or completed inside a line, is stopped', () => {
@@ -188,7 +237,7 @@ test('CRLF: edits match whatever the line ending and keep the file\'s own', () =
   assert.doesNotMatch(read(m.path), /added by the editor/);
 });
 
-test('a heading\'s text cannot be rewritten', () => {
+test('a heading\'s text cannot be rewritten', async () => {
   const text = '# Rules\n\n## Never do\n\n- push to main\n';
   const r = cs.applyEdits(text, [{ old: '## Never do', new: '## Always do', corrects: true }]);
   assert.equal(r.applied.length, 0);
@@ -197,6 +246,10 @@ test('a heading\'s text cannot be rewritten', () => {
   assert.equal(cs.applyEdits(text, [{ old: '- push to main', new: '- push to main\n\n## Tools\n\n- pnpm' }]).applied.length, 1);
   assert.equal(cs.applyEdits(text, [{ old: 'push to main', new: 'push to a feature branch', corrects: true }]).applied.length, 1);
   assert.equal(cs.applyEdits('# T\n\n```bash\n# build\nnpm ci\n```\n', [{ old: '# build', new: '# build it', corrects: true }]).applied.length, 1, 'a shell comment in a fence is not a heading');
+  // The editor and the learn skill are told, so they do not spend a call on an edit that is refused.
+  const ev = await import('../scripts/evaluate.mjs');
+  assert.match(ev.editorPrompt({ file: 'F', kind: 'instructions', view: { text: '# P', partial: false }, claims: [{ id: 1, claim: 'x' }], grounding: [] }), /Never change or remove a heading line/);
+  assert.match(read(path.join(root, 'skills', 'learn', 'SKILL.md')), /Never change or remove a heading line/);
 });
 
 test('undoing an approved change brings back the stand-in memories it retired', () => {
@@ -217,6 +270,28 @@ test('undoing an approved change brings back the stand-in memories it retired', 
   assert.deepEqual(u.restored, [standIn.id]);
 });
 
+test('undoing the second of two approved changes to a file brings back only its own stand-in', () => {
+  const md = path.join(projB, 'CLAUDE.md');
+  fs.writeFileSync(md, '# P\n\n## Build\n\n- Build with make.\n');
+  const add = (title, line) => curator.apply(db, { cwd: projB, items: [{ op: 'patch', target: md, section: 'Build', append: line, title, confidence: 0.8 }] }, { actor: 'inloop', autonomy: 'auto' })[0];
+  const a = add('Run lint first', '- Run `make lint` before `make build`.');
+  const sa = curator.interimOf(db, a.candidateId);
+  assert.equal(cs.applyChangeset(db, a.changesetId, { actor: 'manual' }).status, 'patched');
+  const b = add('Clean before release', '- Run `make clean` before a release build.');
+  const sb = curator.interimOf(db, b.candidateId);
+  const rb = cs.applyChangeset(db, b.changesetId, { actor: 'manual' });
+  assert.equal(rb.status, 'patched');
+  const status = (id) => db.prepare('SELECT status FROM learnings WHERE id = ?').get(id).status;
+  assert.equal(status(sa.id), 'archived');
+  assert.equal(status(sb.id), 'archived');
+  const u = curator.undo(db, { batch: rb.batch });
+  assert.equal(u.status, 'undone', u.reason);
+  assert.match(read(md), /make lint/, 'the first change is still in the file');
+  assert.deepEqual(u.restored, [sb.id], 'until v0.25 the first change\'s stand-in came back (both share the file\'s learning) and this one stayed archived');
+  assert.equal(status(sa.id), 'archived');
+  assert.equal(status(sb.id), 'active');
+});
+
 test('two files with the same name archived on the same day do not overwrite each other', () => {
   const a = mem(projA, 'Shared name', 'from alpha');
   const b = mem(projB, 'Shared name', 'from beta');
@@ -227,4 +302,18 @@ test('two files with the same name archived on the same day do not overwrite eac
   assert.equal(archived.length, 2);
   const texts = archived.map((f) => read(path.join(process.env.OUROBOROS_HOME, 'archive', f)));
   assert.ok(texts.some((t) => t.includes('from alpha')) && texts.some((t) => t.includes('from beta')));
+});
+
+test('two rule files with the same name archived on the same day do not overwrite each other', () => {
+  const ids = [];
+  for (const text of ['Sign every release tag', 'Announce every release in the channel']) {
+    const [r] = curator.apply(db, { cwd: projA, items: [{ kind: 'preference', topic: 'releases', title: text, text, paths: ['CHANGELOG.md'] }] }, { actor: 'manual' });
+    assert.equal(r.status, 'created', r.reason);
+    assert.equal(path.basename(r.path), 'learned-releases.md');
+    assert.equal(curator.forget(db, { match: r.id }).status, 'archived');
+    ids.push(r.id);
+  }
+  const archived = fs.readdirSync(path.join(process.env.OUROBOROS_HOME, 'archive')).filter((f) => f.endsWith('learned-releases.md'));
+  assert.equal(archived.length, 2, 'the second archive of learned-releases.md kept the first');
+  assert.ok(ids.every((id) => archived.some((f) => f.includes(id))));
 });

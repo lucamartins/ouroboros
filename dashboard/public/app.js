@@ -371,17 +371,20 @@ const ACTION_LABEL = {
   pin: (r) => (r.status === 'kept' ? 'Kept: it will not be archived automatically' : r.status === 'unkept' ? 'Maintenance may archive it if it goes unused' : sentence(r)),
   forget: (r) => (r.status === 'archived' ? `Archived: ${r.title}` : sentence(r)),
   confirm: (r) => (r.status === 'confirmed' ? 'Confidence raised' : sentence(r)),
-  approve: (r) => (r.status === 'created' || r.status === 'patched' ? `Saved: ${r.title}${r.rebased ? ' (applied on top of the newer file)' : ''}` : sentence(r)),
+  approve: (r) => (r.status === 'created' || r.status === 'patched' ? `Saved: ${r.title}${r.rebased ? ' (applied on top of the newer file)' : ''}`
+    : r.status === 'duplicate' ? `Already saved${r.target ? ` in ${r.target}` : ''}: nothing new was written, and the entry left the inbox` : sentence(r)),
   reject: (r) => (r.status === 'rejected_by_user' ? (r.recompose ? 'Removed; the rest of the change was composed again' : 'Rejected') : sentence(r)),
   triage_queue: (r) => (r.status !== 'done' ? sentence(r) : `Checked ${fmt.int(r.total)}${r.recomposed ? ` and recomposed ${r.recomposed}` : ''}: ${fmt.int(r.kept)} new, ${fmt.int(r.routed)} to files, ${fmt.int(r.dropped)} dropped, ${fmt.int(r.merged)} merged, ${fmt.int(r.suggested)} fixes (${fmt.usd(r.cost)})`),
   dismiss: (r) => (r.status === 'dismissed' ? 'Dismissed' : sentence(r)),
   resolve_conflict: (r) => (r.status === 'composed' ? `Composed as a change to approve: ${r.title}` : r.status === 'rejected_by_user' ? 'The current rule stands' : sentence(r)),
   restore: (r) => (r.status === 'restored' ? 'Back in the inbox' : sentence(r)),
   approve_many: (r) => (r.status === 'changed' ? `The inbox changed: ${fmt.plural(r.total, 'entry', 'entries')} match now. Nothing was decided; check and confirm again.`
-    : `Saved ${fmt.int(r.saved)} of ${fmt.int(r.total)}${r.other ? `; ${fmt.int(r.other)} not saved (already known, stale, or over a budget)` : ''}`),
+    : `Saved ${fmt.int(r.saved)} of ${fmt.int(r.total)}${r.already ? `; ${fmt.int(r.already)} already saved` : ''}${r.other ? `; ${fmt.int(r.other)} not saved and still in the inbox (stale, over a budget, or an error)` : ''}`),
   reject_many: (r) => (r.status === 'changed' ? `The inbox changed: ${fmt.plural(r.total, 'entry', 'entries')} match now. Nothing was decided; check and confirm again.` : `Rejected ${fmt.int(r.rejected)}`),
 };
 const BAD = ['conflict', 'error', 'not_found', 'nothing', 'ambiguous', 'stale', 'rejected', 'over_budget', 'refused', 'invalid', 'changed', 'budget'];
+/** Whether an action's answer is shown as not done: a bad status, or a bulk approval that left some waiting. */
+const notDone = (action, r) => BAD.includes(r.status) || (action === 'approve_many' && r.other > 0);
 
 /** The row or card a control belongs to, and the ones after it, for focus after an action. */
 function focusCandidates(btn) {
@@ -425,7 +428,7 @@ function actionButton(label, action, id, { confirmText, title, variant = '', ico
     if (busyText) paint(busyText);
     try {
       const r = await act(action, id);
-      toast(ACTION_LABEL[action](r), BAD.includes(r.status));
+      toast(ACTION_LABEL[action](r), notDone(action, r));
       await render({ keepScroll: true, focus: { fk: ownKey, entries: candidates } });
     } catch (err) {
       toast(String(err.message), true);
@@ -1765,7 +1768,7 @@ const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').match
 
 // ---------- Activity ----------
 const OUTCOME = {
-  created: ['saved', 'good'], patched: ['saved into a file', 'good'], duplicate: ['already known', ''], dropped: ['dropped', ''],
+  created: ['saved', 'good'], patched: ['saved into a file', 'good'], duplicate: ['already known', ''], approved_duplicate: ['approved, already saved', ''], dropped: ['dropped', ''],
   merged: ['merged', ''], suggested: ['fix suggested', 'info'], dismissed: ['fix dismissed', ''], fixed: ['fixed in the project', 'good'], queued: ['in the inbox', 'info'],
   conflict: ['conflict', 'warn'], rejected_by_user: ['rejected by you', 'bad'], undone: ['undone by you', 'bad'], pending: ['being checked', 'info'], rejected: ['rejected', 'bad'], over_budget: ['over budget', 'warn'], error: ['error', 'bad'],
   measured: ['measured only', ''],
