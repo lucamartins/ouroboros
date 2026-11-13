@@ -79,7 +79,7 @@ Everything else is automatic: capture hooks record turns, tool calls, error → 
 - **Promotion:** a working rule saved in one project that shows up in another becomes a proposed addition to your global CLAUDE.md.
 - **Daily maintenance:** archives Ouroboros memories and skills unused for 60 days (unless confident), trims memory indexes and learned skills over budget, and tries again what could not be evaluated. You see what it did at the next session start.
 - **If you delete what it learned:** delete a learned memory or skill by hand (or let Claude Code tidy its own memory) and Ouroboros follows: the learning is marked as removed (*File gone* in the dashboard), leaves every count and budget, its leftover line in `MEMORY.md` is removed, and the same thing is not saved again unless you ask for it or something new comes up. Put the file back and it is active again. A project skill that is only missing because you are on another branch comes back with it, and is never treated as thrown out.
-- **Archive, never delete:** archived items move to `~/.ouroboros/archive/`; every change is undoable (`/ouroboros:undo` or the dashboard). If you edited the file since, undo reverts only the lines that change wrote and keeps your edits.
+- **Archive, never delete:** archived items move to `~/.ouroboros/archive/`; every change is undoable (`/ouroboros:undo` or the dashboard). If you edited the file since, undo reverts only the lines that change wrote and keeps your edits. Undoing an approved line brings back only the stand-in memories that approval retired.
 
 `~/.ouroboros/config.json` also takes `excludeProjects` (globs, e.g. `["**/client-*"]`): Ouroboros does nothing at all in those directories.
 
