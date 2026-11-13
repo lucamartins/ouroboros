@@ -30,6 +30,18 @@ Requires Claude Code and Node.js ≥ 22.13 on `PATH`.
 
 For a local checkout: `/plugin marketplace add /path/to/ouroboros`.
 
+## Update
+
+Claude Code keeps auto-update off for third-party marketplaces, so Ouroboros does not update on its own until you turn it on once: run `/plugin`, open **Marketplaces**, select `ouroboros` and choose **Enable auto-update**. Claude Code then checks for a new version a few minutes into each session, installs it in the background and shows `Plugin updated: ouroboros · Run /reload-plugins to apply`; the next session loads it either way.
+
+To update by hand instead, run `/plugin marketplace update ouroboros` in a session, or this in your shell:
+
+```
+claude plugin update ouroboros@ouroboros
+```
+
+Then run `/reload-plugins` or start a new session. Your learnings, settings and history live outside the plugin's install directory and are kept across updates. If you set `DISABLE_AUTOUPDATER=1` (or `DISABLE_UPDATES=1`), also set `FORCE_AUTOUPDATE_PLUGINS=1` to keep plugin updates. Changes are listed in [CHANGELOG.md](CHANGELOG.md).
+
 ## Use
 
 | Command | What it does |
