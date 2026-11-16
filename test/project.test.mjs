@@ -40,7 +40,11 @@ before(async () => {
   assert.equal(r.status, 0, r.stderr);
   curator = await import('../scripts/curator.mjs');
   paths = await import('../scripts/paths.mjs');
-  db = (await import('../scripts/db.mjs')).openDb();
+  const dbApi = await import('../scripts/db.mjs');
+  db = dbApi.openDb();
+  // SessionStart starts the daily upkeep in a detached worker when it has not run; it would
+  // still be writing into the temp folder while `after` deletes it (ENOTEMPTY on macOS).
+  dbApi.setMeta(db, 'maintenance_at', String(Date.now()));
 });
 
 after(() => {

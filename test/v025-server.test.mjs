@@ -62,10 +62,16 @@ before(async () => {
   }
 });
 
-after(() => {
-  child?.kill();
+after(async () => {
+  // `kill` only sends the signal: until the server exits it holds events.db open, and
+  // Windows refuses to delete an open file (EBUSY).
+  if (child && child.exitCode === null && child.signalCode === null) {
+    const exited = new Promise((resolve) => child.once('exit', resolve));
+    child.kill();
+    await exited;
+  }
   db?.close();
-  fs.rmSync(tmp, { recursive: true, force: true });
+  fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
 });
 
 test('M20: malformed targets and directories never stop the server', async () => {
