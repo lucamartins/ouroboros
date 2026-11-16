@@ -191,7 +191,7 @@ export function saveChangeset(db, { file, cwd, base, edits, note = null, cost = 
   const r = db.prepare(`
     INSERT INTO changesets (file, kind, cwd, project, base_hash, edits, corrects, status, note, cost_usd, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`).run(
-    target, knowledgeKind(target), cwd || null, cwd ? projectIdFor(cwd) : null, hashText(base), JSON.stringify(edits),
+    target, knowledgeKind(target, cwd), cwd || null, cwd ? projectIdFor(cwd) : null, hashText(base), JSON.stringify(edits),
     edits.some((e) => e.corrects) ? 1 : 0, note, cost, now);
   const id = Number(r.lastInsertRowid);
   const attach = db.prepare("UPDATE candidates SET changeset_id = ?, target = ?, outcome = 'queued', decided_at = NULL WHERE id = ?");
@@ -203,7 +203,7 @@ export function saveChangeset(db, { file, cwd, base, edits, note = null, cost = 
 export function changesetNeedsApproval(db, cs, actor, autonomy) {
   const claims = claimsOf(db, cs.id);
   const confidence = claims.length ? Math.min(...claims.map((c) => c.confidence ?? 0.6)) : 0.6;
-  const kind = knowledgeKind(cs.file);
+  const kind = knowledgeKind(cs.file, cs.cwd);
   // A rule file or a skill Ouroboros created is its own: adding to it is not a change to a file a person wrote.
   const ownFile = ['rules', 'skill'].includes(kind) && createdByOuroboros(db, cs.file);
   return needsApproval({ op: 'patch', target: cs.file, kind: kind === 'skill' ? 'skill' : 'memory', corrects: !!cs.corrects, confidence, ownFile, ownUntouched: ownUntouched(db, cs.file) }, actor, autonomy);

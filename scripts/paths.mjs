@@ -149,37 +149,109 @@ function expandTilde(p) {
 }
 
 /**
- * The directory `CLAUDE_COWORK_MEMORY_PATH_OVERRIDE` names, when it is one Claude Code
- * accepts: an absolute path (`~` is not expanded), not a bare drive, without NUL.
+ * A memory directory as Claude Code 2.1 accepts one, or null: a string that is an
+ * absolute path once `~/` is expanded (only with `tilde`, and never to the home folder
+ * itself or above it), not a bare drive, shorter than 3 characters or holding NUL.
+ * Trailing separators are dropped. A relative path is refused, not resolved.
  */
-export function coworkMemoryDir(env = process.env) {
-  const v = env.CLAUDE_COWORK_MEMORY_PATH_OVERRIDE;
-  if (typeof v !== 'string' || !v || v.includes('\0') || !path.isAbsolute(v)) return null;
+function acceptedMemoryDir(value, tilde) {
+  if (typeof value !== 'string' || !value) return null;
+  let v = value;
+  if (tilde && /^~[\\/]/.test(v)) {
+    const rest = path.normalize(v.slice(2) || '.');
+    if (rest === '.' || rest === '..' || /^\.\.[\\/]/.test(rest)) return null;
+    v = path.join(home, rest);
+  }
+  if (v.includes('\0') || !path.isAbsolute(v)) return null;
   const dir = path.normalize(v).replace(/[\\/]+$/, '');
   return dir.length < 3 || /^[A-Za-z]:$/.test(dir) ? null : dir;
 }
 
 /**
+ * The directory `CLAUDE_COWORK_MEMORY_PATH_OVERRIDE` names, when it is one Claude Code
+ * accepts: an absolute path (`~` is not expanded), not a bare drive, without NUL.
+ */
+export function coworkMemoryDir(env = process.env) {
+  return acceptedMemoryDir(env.CLAUDE_COWORK_MEMORY_PATH_OVERRIDE, false);
+}
+
+/**
+ * Where Claude Code looks for managed (policy) settings files. `OUROBOROS_MANAGED_SETTINGS_DIR`
+ * replaces it (tests). The registry, plist and server-managed sources are not read.
+ */
+function managedSettingsDir() {
+  if (process.env.OUROBOROS_MANAGED_SETTINGS_DIR) return process.env.OUROBOROS_MANAGED_SETTINGS_DIR;
+  if (process.platform === 'darwin') return '/Library/Application Support/ClaudeCode';
+  if (process.platform === 'win32') return 'C:\\Program Files\\ClaudeCode';
+  return '/etc/claude-code';
+}
+
+/** A key of the managed settings: `managed-settings.json`, then `managed-settings.d/*.json` in name order (the last that sets it wins). */
+function managedValue(key) {
+  const dir = managedSettingsDir();
+  let value = settingsValue(path.join(dir, 'managed-settings.json'), key);
+  let dropIns = [];
+  try { dropIns = fs.readdirSync(path.join(dir, 'managed-settings.d')).filter((f) => f.endsWith('.json')).sort(); } catch { /* none */ }
+  for (const f of dropIns) {
+    const v = settingsValue(path.join(dir, 'managed-settings.d', f), key);
+    if (v !== null) value = v;
+  }
+  return value;
+}
+
+/**
+ * The `autoMemoryDirectory` setting Claude Code 2.1 applies in `cwd`: the first source
+ * that sets it, in the order managed policy, local (`.claude/settings.local.json`),
+ * project (`.claude/settings.json`; Claude Code reads it only in a trusted folder, and
+ * hooks only run in one), user settings. `--settings` is not visible to a hook and is
+ * not read. The first value found decides: when Claude Code does not accept it (a
+ * relative path, `~` alone), the default directory is used, not the next source.
+ * Returns { dir, source, value }: dir is null when unset or not accepted.
+ */
+export function autoMemoryDirectorySetting(cwd) {
+  const root = repoRoot(cwd) || cwd || process.cwd();
+  const sources = [
+    ['managed', () => managedValue('autoMemoryDirectory')],
+    ['local', () => settingsValue(path.join(root, '.claude', 'settings.local.json'), 'autoMemoryDirectory')],
+    ['project', () => settingsValue(path.join(root, '.claude', 'settings.json'), 'autoMemoryDirectory')],
+    ['user', () => settingsValue(path.join(claudeDir(), 'settings.json'), 'autoMemoryDirectory')],
+  ];
+  for (const [source, read] of sources) {
+    const value = read();
+    if (value !== null) return { dir: acceptedMemoryDir(value, true), source, value };
+  }
+  return { dir: null, source: null, value: null };
+}
+
+/**
+ * Memory directories outside `<config>/projects/<project>/memory` that this process has
+ * resolved (`memoryDirFor`), normalized. A file under one is a memory (`classifyPath`):
+ * such a directory can be anywhere, and a path alone does not say which project's
+ * settings name it.
+ */
+const customMemoryDirs = new Set();
+
+function custom(dir) {
+  customMemoryDirs.add(normalize(dir));
+  return dir;
+}
+
+/**
  * The auto-memory directory Claude Code uses for a working directory:
  * `CLAUDE_COWORK_MEMORY_PATH_OVERRIDE` when it is a valid path, else the
- * `autoMemoryDirectory` setting (local, then project, then user settings), else
+ * `autoMemoryDirectory` setting (`autoMemoryDirectorySetting`), else
  * `<config, or CLAUDE_CODE_REMOTE_MEMORY_DIR when set>/projects/<project>/memory` where <project> is the repository's main
  * checkout (shared by its worktrees and subdirectories), `CLAUDE_CODE_PROJECT_DIR_NAME`
  * when set, or the working directory outside git, named as `projectDirName` does.
+ * A custom directory is used as is, so one set in user settings is shared by every project.
  */
 export function memoryDirFor({ memoryDir, cwd } = {}) {
   if (memoryDir) return path.resolve(expandTilde(memoryDir));
   const override = coworkMemoryDir();
-  if (override) return override;
+  if (override) return custom(override);
+  const setting = autoMemoryDirectorySetting(cwd);
+  if (setting.dir) return custom(setting.dir);
   const root = repoRoot(cwd) || cwd || process.cwd();
-  for (const file of [
-    path.join(root, '.claude', 'settings.local.json'),
-    path.join(root, '.claude', 'settings.json'),
-    path.join(claudeDir(), 'settings.json'),
-  ]) {
-    const v = settingsValue(file, 'autoMemoryDirectory');
-    if (typeof v === 'string' && v.trim()) return path.resolve(expandTilde(v.trim()));
-  }
   const name = process.env.CLAUDE_CODE_PROJECT_DIR_NAME || projectDirName(root);
   // Cloud sessions: Claude Code keeps auto memory under that directory instead of the config dir.
   const base = process.env.CLAUDE_CODE_REMOTE_MEMORY_DIR || claudeDir();
@@ -229,13 +301,33 @@ const MEMORY_RE = /\/projects\/[^/]+\/memory\/[^/]+\.md$/;
 const SKILL_RE = /\/skills\/[^/]+\/skill\.md$/i;
 const CLAUDE_MD_RE = /(^|\/)(claude|claude\.local)\.md$/i;
 
-/** Classify a file path touched by a tool: memory, skill, instructions or null. */
-export function classifyPath(filePath) {
+/**
+ * Whether `file` is inside a memory directory that is not under `<config>/projects/`:
+ * one this process resolved, the Cowork override, the managed or user setting (which
+ * apply to every project without their own), or the one `cwd` resolves to.
+ */
+function inCustomMemoryDir(p, cwd) {
+  if (!p.endsWith('.md')) return false;
+  const dirs = new Set(customMemoryDirs);
+  const add = (d) => { if (d) dirs.add(normalize(d)); };
+  add(coworkMemoryDir());
+  add(acceptedMemoryDir(managedValue('autoMemoryDirectory'), true));
+  add(acceptedMemoryDir(settingsValue(path.join(claudeDir(), 'settings.json'), 'autoMemoryDirectory'), true));
+  if (cwd) add(memoryDirFor({ cwd }));
+  for (const d of dirs) if (p.startsWith(`${d.replace(/\/+$/, '')}/`)) return true;
+  return false;
+}
+
+/**
+ * Classify a file path touched by a tool: memory, skill, instructions or null. `cwd`
+ * (the session's folder) lets a memory directory its local or project settings name be
+ * recognized even when nothing in this process resolved it yet.
+ */
+export function classifyPath(filePath, cwd) {
   const p = normalize(filePath);
   if (!p) return null;
   if (MEMORY_RE.test(p)) return 'memory';
-  const custom = settingsValue(path.join(claudeDir(), 'settings.json'), 'autoMemoryDirectory');
-  if (typeof custom === 'string' && custom.trim() && p.endsWith('.md') && p.startsWith(`${normalize(path.resolve(expandTilde(custom.trim())))}/`)) return 'memory';
+  if (inCustomMemoryDir(p, cwd)) return 'memory';
   if (SKILL_RE.test(p)) return 'skill';
   if (CLAUDE_MD_RE.test(p)) return 'instructions';
   return null;

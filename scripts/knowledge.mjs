@@ -78,9 +78,12 @@ export function projectRoots(cwd) {
   return roots.slice(0, MAX_CHILD_REPOS + 1);
 }
 
-/** Kind of a knowledge file: memory | skill | rules | instructions | source. */
-export function knowledgeKind(file) {
-  const cls = classifyPath(file);
+/**
+ * Kind of a knowledge file: memory | skill | rules | instructions | source. `cwd`, when
+ * known, lets a memory directory named in that project's settings be recognized (§ paths.classifyPath).
+ */
+export function knowledgeKind(file, cwd) {
+  const cls = classifyPath(file, cwd);
   if (cls) return cls;
   // Reference files a skill points to (skills/<name>/reference/x.md) belong to the skill.
   if (/[\\/]skills[\\/][^\\/]+[\\/].+\.md$/i.test(file)) return 'skill';
@@ -230,7 +233,7 @@ export function buildIndex(cwd, { extra = [] } = {}) {
       if (fs.statSync(file).size > MAX_SOURCE_BYTES) continue;
       text = fs.readFileSync(file, 'utf8');
     } catch { continue; }
-    const kind = knowledgeKind(file);
+    const kind = knowledgeKind(file, cwd);
     for (const c of /\.md$/i.test(file) ? chunkMarkdown(text) : chunkPlain(text)) addDoc(file, kind, c);
   }
   for (const e of extra) addDoc(e.file, e.kind || 'note', { heading: e.heading || '', text: e.text });

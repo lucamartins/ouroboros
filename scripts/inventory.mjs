@@ -2,7 +2,7 @@
 // Used by the reviewer (to spot repeats) and by the dashboard.
 import fs from 'node:fs';
 import path from 'node:path';
-import { claudeDir, memoryDirFor, ouroborosDir, projectKey, repoRoot } from './paths.mjs';
+import { claudeDir, memoryDirFor, normalize, ouroborosDir, projectIdFor, projectKey, repoRoot } from './paths.mjs';
 
 /**
  * Reads the YAML frontmatter of a memory or skill file. Not a full YAML parser, but it
@@ -253,11 +253,27 @@ export function listMemoriesIn(dir, project = path.basename(path.dirname(dir))) 
   return out;
 }
 
-/** Memory files of one project key (or all projects when key is omitted). */
-export function listMemories(key) {
+/**
+ * Memory files of one project key (or all projects when key is omitted): every
+ * `<config>/projects/<key>/memory`, plus, for all projects, the memory directory each of
+ * `cwds` resolves to when it is elsewhere (`autoMemoryDirectory`, the Cowork override).
+ * A directory shared by several projects (one set in user settings) is listed once,
+ * under the first of `cwds` that uses it: pass them most recent first.
+ */
+export function listMemories(key, cwds = []) {
   const root = path.join(claudeDir(), 'projects');
   const keys = key ? [key] : safeList(root).filter((d) => d.isDirectory()).map((d) => d.name);
-  return keys.flatMap((k) => listMemoriesIn(path.join(root, k, 'memory'), k));
+  const out = keys.flatMap((k) => listMemoriesIn(path.join(root, k, 'memory'), k));
+  if (key) return out;
+  const seen = new Set(keys.map((k) => normalize(path.join(root, k, 'memory'))));
+  for (const cwd of cwds) {
+    if (!cwd) continue;
+    const dir = memoryDirFor({ cwd });
+    if (seen.has(normalize(dir))) continue;
+    seen.add(normalize(dir));
+    out.push(...listMemoriesIn(dir, projectIdFor(cwd)));
+  }
+  return out;
 }
 
 /** Skill directories to scan: personal skills plus .claude/skills of known project dirs. */
