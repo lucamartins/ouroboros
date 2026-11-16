@@ -39,6 +39,9 @@ before(async () => {
   migrate = await import('../scripts/migrate.mjs');
   paths = await import('../scripts/paths.mjs');
   db = dbApi.openDb();
+  // SessionStart starts the daily upkeep in a detached worker when it has not run; it would
+  // still be writing into the temp folder while `after` deletes it (ENOTEMPTY on macOS).
+  dbApi.setMeta(db, 'maintenance_at', String(Date.now()));
 });
 
 after(() => {
