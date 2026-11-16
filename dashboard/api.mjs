@@ -12,7 +12,7 @@ import { getMeta, monthSpend, monthStart } from '../scripts/db.mjs';
 import { actsThroughIndex } from '../scripts/maintenance.mjs';
 import { loadSettings } from '../scripts/settings.mjs';
 import { listInstructionFiles, listMemories, listPluginSkills, listSkills } from '../scripts/inventory.mjs';
-import { claudeDir, dataDir, home, normalize, ouroborosDir, projectDirName, projectKey, repoRoot } from '../scripts/paths.mjs';
+import { claudeDir, dataDir, home, memoryDirFor, normalize, ouroborosDir, projectDirName, projectKey, repoRoot } from '../scripts/paths.mjs';
 import { inboxCounts, sessionContext } from '../scripts/hook.mjs';
 import { inboxEntries } from '../scripts/inbox.mjs';
 import { buildGraph, focusGraph } from '../scripts/graph.mjs';
@@ -312,10 +312,19 @@ export function createApi(db) {
     for (const r of db.prepare('SELECT DISTINCT project, cwd FROM candidates WHERE project IS NOT NULL UNION SELECT DISTINCT project, cwd FROM changesets WHERE project IS NOT NULL').all()) {
       if (!byKey.has(r.project)) fromCwd(r.cwd, { key: r.project });
     }
+    // Memory directories each session folder resolves to (`autoMemoryDirectory` can put one
+    // anywhere); a directory shared by several projects belongs to the most recent one.
+    const memoryDirs = new Map();
+    for (const r of db.prepare('SELECT cwd, MAX(started_at) last FROM sessions WHERE cwd IS NOT NULL GROUP BY cwd ORDER BY last DESC').all()) {
+      const dir = normalize(memoryDirFor({ cwd: r.cwd }));
+      if (!memoryDirs.has(dir)) memoryDirs.set(dir, r.cwd);
+    }
     const personal = [normalize(claudeDir()), normalize(ouroborosDir())];
     const fileProject = (file) => {
       if (!file) return null;
       const f = String(file).replace(/\\/g, '/');
+      const ownerCwd = memoryDirs.get(normalize(path.dirname(String(file))));
+      if (ownerCwd) return fromCwd(ownerCwd);
       const mem = /\/projects\/([^/]+)\/memory\/[^/]+$/.exec(f);
       if (mem && normalize(f).startsWith(`${personal[0]}/`)) return byKey.get(mem[1]) || register(null, { key: mem[1] });
       if (personal.some((p) => normalize(f).startsWith(`${p}/`))) return null;
@@ -499,7 +508,7 @@ export function createApi(db) {
       const u = usesOf(s, group);
       return { ...s, ...project(s.project), path: tilde(s.file), group, uses: u.n, lastUsed: u.last };
     });
-    const memories = listMemories().filter((m) => !m.index).map((m) => {
+    const memories = listMemories(null, cwds).filter((m) => !m.index).map((m) => {
       const r = reads.get(normalize(m.file));
       const p = project(m.project);
       return { ...m, ...p, path: tilde(m.file), group: `project:${p.project_id}`, groupLabel: p.project_name, reads: r?.n || 0, lastRead: r?.last || null };
@@ -1129,7 +1138,7 @@ export function createApi(db) {
     health() {
       const options = readOptions();
       const cwds = knownCwds(db);
-      const indexes = listMemories().filter((m) => m.index).map((m) => ({
+      const indexes = listMemories(null, cwds).filter((m) => m.index).map((m) => ({
         project: m.project, project_name: projects().nameOf(m.project), lines: m.lines, chars: m.chars,
         lineLimit: MEMORY_INDEX_LINE_LIMIT, byteLimit: MEMORY_INDEX_BYTE_LIMIT,
       }));

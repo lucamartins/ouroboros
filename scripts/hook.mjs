@@ -553,7 +553,7 @@ const handlers = {
       countSkillUse(db, ti.skill, now, input.session_id);
     }
     if (ti.file_path) {
-      const cls = classifyPath(ti.file_path);
+      const cls = classifyPath(ti.file_path, input.cwd);
       if (cls && tool === 'Read') {
         addEvent(db, input, now, `${cls}_read`, ti.file_path);
         countMemoryRead(db, ti.file_path, now, input.session_id);

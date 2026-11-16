@@ -354,7 +354,7 @@ function statements(text) {
  * The same way-of-working rule already saved in another project is really a global
  * preference: it becomes a global fact instead of a copy project by project.
  */
-function promoteToGlobal(item, payload) {
+function promoteToGlobal(db, item, payload) {
   if (item.op !== 'create' || item.kind !== 'memory' || !['feedback', 'user'].includes(item.memory_type)) return item;
   const title = String(item.title || '').trim();
   const description = String(item.description || title).replace(/\s+/g, ' ').trim();
@@ -362,7 +362,9 @@ function promoteToGlobal(item, payload) {
   const probe = `${slug(item.name || title)} ${title} ${description}`;
   const here = listMemoriesIn(dir).filter((m) => !m.index);
   if (findSimilar(here.map((m) => ({ text: `${m.name} ${m.description}` })), probe)) return item;
-  const elsewhere = findSimilar(listMemories().filter((m) => !m.index && normalize(path.dirname(m.file)) !== normalize(dir))
+  // Memory directories outside the config folder are found through the folders sessions ran in.
+  const cwds = db.prepare('SELECT cwd, MAX(started_at) last FROM sessions WHERE cwd IS NOT NULL GROUP BY cwd ORDER BY last DESC').all().map((r) => r.cwd);
+  const elsewhere = findSimilar(listMemories(null, cwds).filter((m) => !m.index && normalize(path.dirname(m.file)) !== normalize(dir))
     .map((m) => ({ text: `${m.name} ${m.description}`, project: m.project })), probe);
   if (!elsewhere) return item;
   return { ...globalFact({ ...item, kind: 'global', text: description }), promoted: elsewhere.project };
@@ -448,7 +450,7 @@ function createMemory(db, batch, item, settings, payload) {
   const id = newId();
   batch.write(file, renderMemory({ name, description, type, id, confidence: item.confidence, trigger: item.trigger, body: item.body }), { learningId: id, op: 'create' });
   batch.write(indexFile, withIndexLine(indexText, indexLine(title, fileName, description), fileName), { learningId: id, op: 'create' });
-  upsertLearning(db, { id, kind: 'memory', scope: 'project', memory_type: type, project: path.basename(path.dirname(dir)), name, title, path: file, confidence: item.confidence, trigger: item.trigger });
+  upsertLearning(db, { id, kind: 'memory', scope: 'project', memory_type: type, project: projectIdFor(item.projectDir || process.cwd()), name, title, path: file, confidence: item.confidence, trigger: item.trigger });
   return { status: 'created', id, kind: 'memory', path: file, title, warning: budgetWarning(entries, settings.limits.memoryIndexLines, settings, 'MEMORY.md') };
 }
 
@@ -866,7 +868,7 @@ export function apply(db, payload, { actor = 'manual', autonomy = 'auto', ownerC
   const results = [];
   for (const raw of items) {
     const normalized = normalizeItem(raw, payload || {});
-    const item = promote ? promoteToGlobal(normalized, payload || {}) : normalized;
+    const item = promote ? promoteToGlobal(db, normalized, payload || {}) : normalized;
     if (containsSecret(item.title, item.description, item.body, item.text, item.new, item.append, item.prefText, item.globalFact)) {
       results.push({ status: 'rejected', title: item.title, reason: 'looks like it contains a secret (token, key or password); never store secrets' });
       continue;
