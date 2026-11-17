@@ -357,6 +357,42 @@ export function monthSpend(db, now = new Date()) {
   return db.prepare('SELECT COALESCE(SUM(cost_usd), 0) AS total FROM reviews WHERE ts >= ?').get(monthStart(now)).total;
 }
 
+/** A review that failed is tried again after this long; one stopped by the budget, as soon as there is budget. */
+export const RETRY_AFTER_MS = 30 * 60 * 1000;
+
+/**
+ * Sessions left to finish later (`waiting`, §6.3) that can be taken now, newest first:
+ * those whose last try ran out of budget at once, the others once RETRY_AFTER_MS has passed.
+ */
+export function resumableSessions(db, now = Date.now(), limit = 1000) {
+  return db.prepare(`
+    SELECT s.id FROM sessions s
+    WHERE s.queue_state = 'waiting' AND (
+      COALESCE(s.reviewed_at, s.last_event_at) < ? OR
+      (SELECT r.detail FROM reviews r WHERE r.session_id = s.id ORDER BY r.id DESC LIMIT 1) = 'monthly budget reached' OR
+      (SELECT r.detail FROM reviews r WHERE r.session_id = s.id ORDER BY r.id DESC LIMIT 1) LIKE '%the month''s budget ran out%'
+    )
+    ORDER BY s.started_at DESC LIMIT ?
+  `).all(now - RETRY_AFTER_MS, limit).map((r) => r.id);
+}
+
+/**
+ * Sessions an older version gave up on because the month's budget was spent (before v0.23
+ * a budget skip was final): they wait again, so a raised budget reviews them. Only reviews
+ * of a session that ended (not a backfill, which is run again by hand), from the last 31
+ * days. Returns how many.
+ */
+export function requeueBudgetSkips(db, now = Date.now()) {
+  return db.prepare(`
+    UPDATE sessions SET queue_state = 'waiting'
+    WHERE queue_state = 'skipped' AND started_at >= ? AND id IN (
+      SELECT r.session_id FROM reviews r
+      WHERE r.id = (SELECT MAX(r2.id) FROM reviews r2 WHERE r2.session_id = r.session_id)
+        AND r.detail = 'monthly budget reached' AND r.trigger IN ('session_end', 'orphan')
+    )
+  `).run(now - 31 * 86_400_000).changes;
+}
+
 export class BudgetError extends Error {
   constructor(spent, budget) {
     super(`monthly budget reached (US$ ${spent.toFixed(2)} of ${budget})`);
