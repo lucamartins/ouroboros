@@ -11,6 +11,7 @@ import { changesetView, fileDisplayName, getChangeset } from '../scripts/changes
 import { getMeta, monthSpend, monthStart } from '../scripts/db.mjs';
 import { actsThroughIndex } from '../scripts/maintenance.mjs';
 import { loadSettings } from '../scripts/settings.mjs';
+import { storedOptions } from '../scripts/config.mjs';
 import { listInstructionFiles, listMemories, listPluginSkills, listSkills } from '../scripts/inventory.mjs';
 import { claudeDir, dataDir, home, memoryDirFor, normalize, ouroborosDir, projectDirName, projectKey, repoRoot } from '../scripts/paths.mjs';
 import { inboxCounts, sessionContext } from '../scripts/hook.mjs';
@@ -74,8 +75,17 @@ function fallbackTitle(files, learning) {
   return learning?.title || (files[0] ? path.basename(files[0].file) : 'change');
 }
 
+/**
+ * The plugin options (`config.storedOptions`: the settings when edited since the last
+ * session start, else the snapshot) plus what the SessionStart hook recorded beside them
+ * (`autoMemory`). Until v0.25.2 only the snapshot was read: a budget raised in `/plugin`
+ * showed the old value until the next session started.
+ */
 function readOptions() {
-  try { return JSON.parse(fs.readFileSync(path.join(dataDir(), 'options.json'), 'utf8')); } catch { return null; }
+  let snap = null;
+  try { snap = JSON.parse(fs.readFileSync(path.join(dataDir(), 'options.json'), 'utf8')); } catch { /* none yet */ }
+  const current = storedOptions();
+  return snap || current ? { ...snap, ...current } : null;
 }
 
 function dayKey(ts) {

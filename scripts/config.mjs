@@ -2,7 +2,7 @@
 // CLAUDE_PLUGIN_OPTION_<KEY>; the review worker inherits them from the hook.
 import fs from 'node:fs';
 import path from 'node:path';
-import { dataDir } from './paths.mjs';
+import { claudeDir, dataDir } from './paths.mjs';
 
 const DEFAULTS = {
   learning: true,
@@ -18,7 +18,7 @@ const DEFAULTS = {
   inloop_review_max_context: 150000,
 };
 
-function raw(key) {
+function envRaw(key) {
   return process.env[`CLAUDE_PLUGIN_OPTION_${key.toUpperCase()}`];
 }
 
@@ -41,7 +41,35 @@ function snapshot() {
   }
 }
 
+/**
+ * The options as Claude Code stores them: `pluginConfigs["ouroboros@<marketplace>"].options`
+ * in the user settings, where `/plugin` saves them. Read by tools that run outside hooks
+ * (the dashboard, the worker started by hand), so a value changed there shows up without
+ * waiting for the next session start to refresh the snapshot. Returns { values, mtimeMs }
+ * or null. Project and local settings are not read (a dashboard has no project).
+ */
+export function settingsOptions() {
+  const file = path.join(claudeDir(), 'settings.json');
+  try {
+    const configs = JSON.parse(fs.readFileSync(file, 'utf8'))?.pluginConfigs;
+    if (!configs || typeof configs !== 'object') return null;
+    let values = null;
+    for (const [id, conf] of Object.entries(configs)) {
+      if ((id === 'ouroboros' || id.startsWith('ouroboros@')) && conf?.options && typeof conf.options === 'object') {
+        values = { ...values, ...conf.options };
+      }
+    }
+    return values ? { values, mtimeMs: fs.statSync(file).mtimeMs } : null;
+  } catch {
+    return null;
+  }
+}
+
 function fromEnv() {
+  return parse(envRaw);
+}
+
+function parse(raw) {
   return {
     learning: asBool(raw('learning'), DEFAULTS.learning),
     autonomy: ['auto', 'hybrid', 'queue'].includes(raw('autonomy')) ? raw('autonomy') : DEFAULTS.autonomy,
@@ -73,10 +101,25 @@ export function optionsFromEnvOnly() {
 
 export function options() {
   const hasEnv = Object.keys(process.env).some((k) => k.startsWith('CLAUDE_PLUGIN_OPTION_'));
-  const base = fromEnv();
-  if (hasEnv || inHook) return base;
+  if (hasEnv || inHook) return fromEnv();
+  return storedOptions() || fromEnv();
+}
+
+/**
+ * The options as last set, for a process that is not a hook and may run for days (the
+ * dashboard): the plugin settings when they changed after the snapshot was taken (an
+ * option edited since the last session start), else the snapshot. Null when neither exists.
+ */
+export function storedOptions() {
+  const base = parse(() => undefined);
   const snap = snapshot();
-  if (!snap) return base;
-  const { updatedAt, measureReview, ...rest } = snap;
+  // The settings are what Claude Code exports to the next hook: an option they do not set
+  // is its default there, as here.
+  const settings = settingsOptions();
+  if (settings && (!snap || settings.mtimeMs > (Number(snap.updatedAt) || 0))) {
+    return parse((key) => (settings.values[key] === undefined || settings.values[key] === null ? undefined : String(settings.values[key])));
+  }
+  if (!snap) return null;
+  const { updatedAt, measureReview, autoMemory, ...rest } = snap;
   return { ...base, ...(measureReview !== undefined && rest.backgroundReview === undefined ? { backgroundReview: measureReview } : {}), ...rest };
 }

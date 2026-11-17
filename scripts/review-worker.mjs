@@ -15,7 +15,7 @@ import { options } from './config.mjs';
 import { destinationsText } from './router.mjs';
 import { rubricText } from './rubric.mjs';
 import { isExcluded, significantRecoveries, skipInherited } from './hook.mjs';
-import { logError, monthSpend, openDb } from './db.mjs';
+import { logError, monthSpend, openDb, resumableSessions } from './db.mjs';
 import { inventoryForPrompt, parseFrontmatter } from './inventory.mjs';
 import { tokenize } from './knowledge.mjs';
 import { claudeDir, dataDir, projectIdFor } from './paths.mjs';
@@ -645,6 +645,31 @@ export async function reviewSession(db, sessionId, trigger, overrides = {}) {
   }
 }
 
+/**
+ * Finish the reviews left for later (`waiting`), newest first, one at a time, until none
+ * is left or the month's budget runs out. Started by the session-start sweep when there is
+ * budget, so raising the budget catches up on every session it held back, not three per
+ * session start as until v0.25.1. Each session is claimed (`waiting` → `queued`) before it
+ * is reviewed, so two workers never take the same one. Returns { reviewed, statuses }.
+ */
+export async function resumeWaiting(db) {
+  const statuses = [];
+  const tried = new Set();
+  for (;;) {
+    const opts = options();
+    if (opts.monthlyBudgetUsd <= 0 || monthSpend(db) >= opts.monthlyBudgetUsd) break;
+    const id = resumableSessions(db, Date.now()).find((s) => !tried.has(s));
+    if (!id) break;
+    tried.add(id);
+    const claimed = db.prepare("UPDATE sessions SET queue_state = 'queued', last_event_at = ? WHERE id = ? AND queue_state = 'waiting'").run(Date.now(), id);
+    if (!claimed.changes) continue;
+    const status = await reviewSession(db, id, 'orphan');
+    statuses.push(status);
+    if (status === 'budget') break;
+  }
+  return { reviewed: statuses.length, statuses };
+}
+
 /** Past transcripts not yet recorded, newest first. */
 export function backfillCandidates(db, { days = 30, limit = 20, learn = false } = {}) {
   const root = path.join(claudeDir(), 'projects');
@@ -737,6 +762,8 @@ async function main() {
         // Learning from the past defaults to the approval queue: many items at once, some possibly stale.
         autonomy: args.learn ? (args.autonomy || 'queue') : undefined,
       });
+    } else if (args['resume-waiting']) {
+      await resumeWaiting(db);
     } else if (args.session) {
       await reviewSession(db, args.session, args.trigger || 'session_end');
     } else if (args['triage-queue'] || args.drain) {

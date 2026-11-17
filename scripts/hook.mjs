@@ -19,8 +19,6 @@ export const LONG_TURN_TOOL_CALLS = 15;
 /** Early (recovery) reviews are at least this many user turns apart from any review. */
 export const EARLY_REVIEW_MIN_TURNS = 5;
 export const MAINTENANCE_EVERY_MS = 20 * 60 * 60 * 1000;
-/** A review left to finish later is tried again after this long. */
-const RETRY_AFTER_MS = 30 * 60 * 1000;
 /** A session with no event for this long and no SessionEnd is taken as ended. */
 export const IDLE_AS_ENDED_MS = 6 * 60 * 60 * 1000;
 /** ...unless its last event is older than this: then it is left to a backfill. */
@@ -484,9 +482,6 @@ const handlers = {
     // Sessions whose SessionEnd never ran a worker (crash, killed terminal) or whose
     // worker died: queue them again, at most a few per start.
     const stale = now - 10 * 60 * 1000;
-    // Also reviews left to finish later (a part of a long session failed, the model
-    // call failed, the month's budget ran out): tried again once there is budget.
-    const canSpend = dbApi.monthSpend(db) < options().monthlyBudgetUsd;
     // And sessions whose SessionEnd never ran at all (a crash, a killed terminal, the hook
     // cut short): nothing queued them, so they were never reviewed or measured. Long idle
     // is taken as the end; if one goes on later, its cursors make the next review read
@@ -497,11 +492,22 @@ const handlers = {
       WHERE id != ? AND (
         (queue_state = 'queued' AND COALESCE(ended_at, last_event_at) < ?) OR
         (queue_state = 'running' AND last_event_at < ?) OR
-        (queue_state = 'waiting' AND ? AND COALESCE(reviewed_at, last_event_at) < ?) OR
         (queue_state IS NULL AND ended_at IS NULL AND turns >= 2 AND last_event_at < ? AND last_event_at >= ?)
       )
       ORDER BY started_at DESC LIMIT 3
-    `).all(input.session_id, stale, stale, canSpend ? 1 : 0, now - RETRY_AFTER_MS, now - IDLE_AS_ENDED_MS, now - IDLE_AS_ENDED_MAX_AGE_MS);
+    `).all(input.session_id, stale, stale, now - IDLE_AS_ENDED_MS, now - IDLE_AS_ENDED_MAX_AGE_MS);
+    // Also reviews left to finish later (a part of a long session failed, the model call
+    // failed, the month's budget ran out): one worker finishes them all, newest first,
+    // while there is budget (`resumeWaiting`). Until v0.25.1 they were three per session
+    // start among the orphans, so a raised budget took dozens of sessions to catch up, and
+    // sessions an older version skipped for the budget were never taken again.
+    const budget = options().monthlyBudgetUsd;
+    const canSpend = budget > 0 && dbApi.monthSpend(db) < budget;
+    if (canSpend && options().backgroundReview && dbApi.getMeta(db, 'budget_skips_requeued') !== '1') {
+      dbApi.requeueBudgetSkips(db, now);
+      dbApi.setMeta(db, 'budget_skips_requeued', '1');
+    }
+    const resumable = canSpend && options().backgroundReview && dbApi.resumableSessions(db, now, 1).length > 0;
     // v0.12: the old global profile becomes proposals for the global CLAUDE.md.
     try {
       if (retireProfile(db, now) && options().learning) spawnWorker(['--drain']);
@@ -525,6 +531,7 @@ const handlers = {
         spawnWorker(['--session', id, '--trigger', 'orphan']);
       }
     }
+    if (resumable) spawnWorker(['--resume-waiting']);
   },
 
   UserPromptSubmit(db, input, now) {
