@@ -4,7 +4,7 @@ All notable changes to Ouroboros. Versions follow [semantic versioning](https://
 
 ## 0.26.0 — 2026-11-23
 
-- New autonomy setting `full`: Ouroboros approves nothing on your behalf. Corrections, changes to your CLAUDE.md files, rule files and skills, and new skills from the end-of-session review are written right away, through the same checks, and each can be undone (`/ouroboros:undo` or the dashboard). A conflict you settle as a new rule is written without a second approval. Still waiting for you in `full`: conflicts, learnings the end-of-session review cannot tie to something you said (the guard against instructions hidden in tool output), backfilled learnings, and learnings whose owner file could not be told apart. Changes already waiting when you switch stay in the inbox. `auto` remains the default and is unchanged.
+- New autonomy setting `full`: Ouroboros approves nothing on your behalf. Corrections, changes to your CLAUDE.md files, rule files and skills, and new skills from the end-of-session review are written right away, through the same checks, and each can be undone (`/ouroboros:undo` or the dashboard). A conflict you settle as a new rule is written without a second approval. Learnings the end-of-session review cannot tie to something you said are written too: in `full` nothing guards against instructions hidden in tool output (a web page, a file) beyond the secret filter and undo. Still waiting for you in `full`: conflicts, backfilled learnings (unless you run the backfill with `--autonomy full`), and learnings whose owner file could not be told apart. Changes already waiting when you switch stay in the inbox. `auto` remains the default and is unchanged.
 
 ## 0.25.0 — 2026-11-12
 

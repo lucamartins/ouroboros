@@ -20,7 +20,7 @@
     "autonomy": {
       "type": "string",
       "title": "Autonomy",
-      "description": "full: everything is written right away, including corrections and changes to your CLAUDE.md files, rule files and skills (undoable); only conflicts and learnings that cite nothing you said wait. auto: learnings are written right away (undoable), but corrections and changes to CLAUDE.md, rule files or your skills wait. hybrid: only high-confidence facts are written; skills and the rest wait for approval in the dashboard. queue: everything Claude or the reviewer proposes waits for approval. Explicit requests (\"remember that…\") skip the auto/hybrid/queue choice.",
+      "description": "full: everything is written right away, including corrections and changes to your CLAUDE.md files, rule files and skills (undoable); even learnings that cite nothing you said (no guard against instructions in tool output); only conflicts wait. auto: learnings are written right away (undoable), but corrections and changes to CLAUDE.md, rule files or your skills wait. hybrid: only high-confidence facts are written; skills and the rest wait for approval in the dashboard. queue: everything Claude or the reviewer proposes waits for approval. Explicit requests (\"remember that…\") skip the auto/hybrid/queue choice.",
       "options": ["full", "auto", "hybrid", "queue"],
       "default": "auto"
     },

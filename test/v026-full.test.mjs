@@ -169,3 +169,16 @@ test('a payload cannot ask for full: the CLI uses the user\'s option', () => {
   assert.ok(stored.length);
   for (const p of stored) assert.notEqual(p.autonomy, 'full');
 });
+
+test('an item citing no user turn is held in every setting but full, and written in full', async () => {
+  const { recordedAutonomy } = await import('../scripts/review-worker.mjs');
+  for (const a of ['auto', 'hybrid', 'queue']) assert.equal(recordedAutonomy(false, a), 'queue');
+  assert.equal(recordedAutonomy(false, 'full'), 'full');
+  assert.equal(recordedAutonomy(true, 'auto'), 'auto');
+
+  const { db, proj, rules } = sandbox('queue-unanchored');
+  const id = pending(proj, 'Unanchored', 'Announce the deploy in the channel.', rules, { autonomy: recordedAutonomy(false, 'full') });
+  await ev.drainQueue(db);
+  assert.match(read(rules), /Announce the deploy in the channel\./);
+  assert.notEqual(row(id).outcome, 'queued');
+});
