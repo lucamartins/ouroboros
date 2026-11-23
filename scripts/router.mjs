@@ -15,7 +15,7 @@ export const DESTINATIONS = [
   { id: 'memory', text: 'A fact that only holds in one project: a project memory (kind "memory").' },
   { id: 'preference-paths', text: 'A preference or fact valid on every project that only matters when working on certain files (a language, a file type): kind "preference" with "topic" and "paths" (globs such as "**/*.py"). It loads only with those files.' },
   { id: 'preference-topic', text: 'A preference or fact valid on every project that only matters for one topic (commits, code review, testing, a tool): kind "preference" with "topic". It loads only when the topic comes up.' },
-  { id: 'global', text: 'Who the user is or how they work, relevant in EVERY session whatever the task (language of answers, OS and shell, how much to ask before acting): kind "global", an addition to the global CLAUDE.md, which costs context in every session and always waits for the user\'s approval. Use it only when no narrower destination fits.' },
+  { id: 'global', text: 'Who the user is or how they work, relevant in EVERY session whatever the task (language of answers, OS and shell, how much to ask before acting): kind "global", an addition to the global CLAUDE.md, which costs context in every session and waits for the user\'s approval unless the autonomy setting is "full". Use it only when no narrower destination fits.' },
 ];
 
 export function destinationsText() {

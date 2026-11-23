@@ -259,9 +259,14 @@ function fromBackfill(db, c) {
   return !!c.review_id && db.prepare('SELECT trigger FROM reviews WHERE id = ?').get(c.review_id)?.trigger === 'backfill-learn';
 }
 
+/** The mark the end-of-session review leaves on an item that cites no user turn (review-worker.mjs). */
+const UNANCHORED = /\[cites no user turn of the session: held for you\]/;
+
 /** Why an entry waited for the user instead of being written. */
-function waitedBecause({ corrects, file, kind, confidence, autonomy, backfill }) {
+function waitedBecause({ corrects, file, kind, confidence, autonomy, backfill, unanchored }) {
   if (backfill) return 'it was learned from a past session (backfill), and those always wait for you';
+  if (unanchored) return 'it cites nothing you said in its session, and such learnings always wait for you';
+  if (currentAutonomy() === 'full') return `it was proposed before your autonomy setting became "full" (it was "${autonomy || 'auto'}")`;
   if (corrects) return 'it rewrites existing text, and corrections always wait for you';
   if (file && ['rules', 'instructions'].includes(knowledgeKind(file))) return 'changes to rule files and CLAUDE.md always wait for you';
   if (autonomy === 'queue') return 'your autonomy setting is "queue": every learning waits for you';
@@ -323,7 +328,7 @@ export function showEntry(db, key, { project } = {}) {
       `${pos}${key} · Change to a file · ${cs.corrects ? 'rewrites existing text' : 'adds text'}${cs.status === 'stale' ? ' · STALE (the file changed since)' : ''}`,
       `File: ${shortPath(cs.file)}`,
       `What it is: ${describeFile(cs.file)}`,
-      `Waited because: ${waitedBecause({ corrects: cs.corrects, file: cs.file, kind: cs.kind, confidence, autonomy, backfill })}`,
+      `Waited because: ${waitedBecause({ corrects: cs.corrects, file: cs.file, kind: cs.kind, confidence, autonomy, backfill, unanchored: claims.some((c) => UNANCHORED.test(c.evidence || '')) })}`,
       claims.some((c) => interimOf(db, c.id)) ? `Meanwhile: already active as a project memory (${claims.map((c) => interimOf(db, c.id)).filter(Boolean).map((l) => shortPath(l.path)).join(', ')}). Approving writes the line here and retires the memory; rejecting keeps the memory.` : null,
       cs.note && cs.status === 'stale' ? `Note: ${oneLine(cs.note, 300)}` : null,
       '',
@@ -403,7 +408,7 @@ export function showEntry(db, key, { project } = {}) {
     `Lands in: ${lands}`,
     `From: ${originOf(c)}`,
     ...evidence,
-    `Waited because: ${unhandledReason(c.note, item) || waitedBecause({ corrects: item.corrects, file: item.op === 'patch' ? item.target : null, kind: item.kind, confidence: c.confidence ?? item.confidence, autonomy: p.autonomy || currentAutonomy(), backfill: fromBackfill(db, c) })}`,
+    `Waited because: ${unhandledReason(c.note, item) || waitedBecause({ corrects: item.corrects, file: item.op === 'patch' ? item.target : null, kind: item.kind, confidence: c.confidence ?? item.confidence, autonomy: p.autonomy || currentAutonomy(), backfill: fromBackfill(db, c), unanchored: UNANCHORED.test(c.evidence || '') })}`,
     standIns.length ? `Meanwhile: already active as a project memory (${standIns.map((l) => shortPath(l.path)).join(', ')}). Approving writes the line here and retires ${standIns.length > 1 ? 'them' : 'it'}; rejecting keeps ${standIns.length > 1 ? 'them' : 'the memory'}.` : null,
     c.triaged_at ? null : 'Not checked against existing knowledge yet: look for duplicates before approving.',
     c.note ? `Note: ${oneLine(c.note, 400)}` : null,

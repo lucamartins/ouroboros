@@ -156,7 +156,7 @@ const MAX_SCREEN_MISSES = 2;
 /** Editor calls that may fail or leave a learning unanswered before it waits for the user. */
 const MAX_EDITOR_MISSES = 2;
 /** Autonomy settings, from the one that lets most through to the one that holds everything. */
-const STRICTNESS = ['auto', 'hybrid', 'queue'];
+const STRICTNESS = ['full', 'auto', 'hybrid', 'queue'];
 const ELSEWHERE_PER_CLAIM = 2;
 const ELSEWHERE_MAX = 8;
 
@@ -768,7 +768,10 @@ export async function tidyQueue(db, { force = false, autonomy = 'queue', tick = 
     }).rows.push(r);
   }
   for (const cs of staleSets) group(`${cs.cwd || ''}|${autonomy}|`, { cwd: cs.cwd || '', autonomy }).stale.push(cs);
-  for (const r of confirmed) group(`${r.cwd || ''}|${autonomy}|`, { cwd: r.cwd || '', autonomy }).confirmed.push(r);
+  // In `full` the user's "it is a new rule" is the last word: the correction is written,
+  // unless the learning itself is held (it cites no user turn).
+  const settled = opts.autonomy === 'full' ? 'full' : autonomy;
+  for (const r of confirmed) group(`${r.cwd || ''}|${settled}|`, { cwd: r.cwd || '', autonomy: settled }).confirmed.push(r);
 
   for (const g of groups.values()) {
     assertBudget(db, opts.monthlyBudgetUsd);
