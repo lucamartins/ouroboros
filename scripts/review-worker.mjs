@@ -409,6 +409,15 @@ export function missFromQuote(db, session, quote, reviewId = 0, now = Date.now()
  * consumer; if another process is evaluating, it picks these up before it stops. The
  * notice for the session is written when they are evaluated.
  */
+/**
+ * The autonomy a review item is recorded with. One that cites no user turn waits for the
+ * user (`queue`), unless the user chose `full` (v0.26), where it is written like the rest:
+ * that also lets through what tool output (a web page, a file) told the assistant to keep.
+ */
+export function recordedAutonomy(anchored, autonomy) {
+  return anchored || autonomy === 'full' ? autonomy : 'queue';
+}
+
 async function applyLearnings(db, session, reviewId, items, opts, { notify = true, userTurns = [] } = {}) {
   const ts = Date.now();
   const insert = db.prepare(`
@@ -420,8 +429,8 @@ async function applyLearnings(db, session, reviewId, items, opts, { notify = tru
     // cites no user turn of what was reviewed is never written on its own. It waits for
     // the user, whatever the autonomy (`isAnchored`).
     const anchored = isAnchored(item.evidence, userTurns);
-    if (!anchored) item.evidence = `${String(item.evidence || '').trim()} [cites no user turn of the session: held for you]`.trim();
-    const autonomy = anchored ? opts.autonomy : 'queue';
+    const autonomy = recordedAutonomy(anchored, opts.autonomy);
+    if (!anchored) item.evidence = `${String(item.evidence || '').trim()} [cites no user turn of the session: ${autonomy === 'full' ? 'written under full autonomy' : 'held for you'}]`.trim();
     insert.run(reviewId, session.id, session.project, item.kind, item.scope, item.memory_type ?? null,
       String(item.title || item.text || '').slice(0, 200), String(item.text || item.body || item.description || '').slice(0, 1500),
       String(item.evidence || '').slice(0, 800), item.confidence ?? null, item.repeats || null,

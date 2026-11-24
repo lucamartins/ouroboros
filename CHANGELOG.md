@@ -2,6 +2,10 @@
 
 All notable changes to Ouroboros. Versions follow [semantic versioning](https://semver.org/) (pre-1.0: a minor version may change behavior). The reasoning behind each change is in [DESIGN.md](DESIGN.md).
 
+## 0.26.0 — 2026-11-23
+
+- New autonomy setting `full`: Ouroboros approves nothing on your behalf. Corrections, changes to your CLAUDE.md files, rule files and skills, and new skills from the end-of-session review are written right away, through the same checks, and each can be undone (`/ouroboros:undo` or the dashboard). A conflict you settle as a new rule is written without a second approval. Learnings the end-of-session review cannot tie to something you said are written too: in `full` nothing guards against instructions hidden in tool output (a web page, a file) beyond the secret filter and undo. Still waiting for you in `full`: conflicts, backfilled learnings (unless you run the backfill with `--autonomy full`), and learnings whose owner file could not be told apart. Changes already waiting when you switch stay in the inbox. `auto` remains the default and is unchanged.
+
 ## 0.25.0 — 2026-11-12
 
 A third review of the mechanisms, each problem reproduced (in a throwaway directory or in a live session with the real CLI) before it was fixed (DESIGN.md §7.7). The fixes were also checked in six live sessions on Claude Code 2.1.323 (auto memory off: the rule saved in one session was applied in the next; `/compact` and a fork were measured by their own turns only); the last code commit was not run live and is covered by the 242 tests.

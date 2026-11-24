@@ -72,7 +72,7 @@ function fromEnv() {
 function parse(raw) {
   return {
     learning: asBool(raw('learning'), DEFAULTS.learning),
-    autonomy: ['auto', 'hybrid', 'queue'].includes(raw('autonomy')) ? raw('autonomy') : DEFAULTS.autonomy,
+    autonomy: ['full', 'auto', 'hybrid', 'queue'].includes(raw('autonomy')) ? raw('autonomy') : DEFAULTS.autonomy,
     learningLanguage: ['en', 'pt-BR', 'auto'].includes(raw('learning_language')) ? raw('learning_language') : DEFAULTS.learning_language,
     inloopReview: asBool(raw('inloop_review'), DEFAULTS.inloop_review),
     reviewEveryTurns: Math.max(1, asNumber(raw('review_every_turns'), DEFAULTS.review_every_turns)),

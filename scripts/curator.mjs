@@ -716,6 +716,11 @@ function commitText(db, batch, t, after, item) {
  */
 export function needsApproval(item, actor, autonomy) {
   if (actor === 'manual') return false;
+  // `full` (v0.26): the user chose to approve nothing. Corrections, changes to files a
+  // person wrote and the reviewer's new skills are written too; the ledger undoes them.
+  // What is held for where it came from (an item citing no user turn, a learning
+  // backfill) arrives here as `queue`, so it still waits.
+  if (autonomy === 'full') return false;
   // Corrections of existing knowledge, and changes to rule files or CLAUDE.md (written
   // by people, versioned with the project), always wait for the user. One exception, in
   // `auto` only: a memory Ouroboros created and nobody edited since (`ownUntouched`, set
